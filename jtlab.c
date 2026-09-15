@@ -4107,6 +4107,13 @@ struct ws_popup {
     int open;
     double x, y, w, h;
     int hover_row;
+    /* Night light (blue filter) */
+    int blue_on;
+    int blue_pct;       /* 0-100 filter intensity */
+    int blue_dragging;
+    GSource *blue_src;  /* debounced wlsunset respawn timer */
+    double blue_toggle_x, blue_toggle_y;
+    double blue_sx, blue_sxmax, blue_sy;   /* slider track geometry */
 };
 
 static struct ws_popup g_wspop = { 0 };
@@ -4123,14 +4130,23 @@ wspop_width(void)
     int n = wspop_rows();
     double ws_w = MENU_PADDING * 2 + n * WS_BTN_SIZE + (n - 1) * WS_BTN_GAP;
     double wp_w = MENU_PADDING * 2 + 8 + WS_WP_ICON + 8 + 80;
-    return ws_w > wp_w ? ws_w : wp_w;
+    double blue_w = MENU_PADDING * 2 + 8 + 64 + 16 + 46 +
+                    BLUE_TOGGLE_W + BLUE_TOGGLE_RPAD;
+    double m = ws_w > wp_w ? ws_w : wp_w;
+    return m > blue_w ? m : blue_w;
 }
 
 static int
 wspop_height(void)
 {
     return MENU_FLOAT_GAP + MENU_PADDING + WS_WP_BTN_H + MENU_PADDING +
-           WS_BTN_SIZE + MENU_PADDING;
+           BLUE_BOX_H + MENU_PADDING + WS_BTN_SIZE + MENU_PADDING;
+}
+
+static double
+wspop_blue_y(void)
+{
+    return g_wspop.y + MENU_PADDING + WS_WP_BTN_H + MENU_PADDING;
 }
 
 static void
@@ -4141,7 +4157,7 @@ wspop_open(void)
 
     double pw = wspop_width();
     double body_h = MENU_PADDING + WS_WP_BTN_H + MENU_PADDING +
-                    WS_BTN_SIZE + MENU_PADDING;
+                    BLUE_BOX_H + MENU_PADDING + WS_BTN_SIZE + MENU_PADDING;
     double icon_center = workspace_icon_x() + WS_ICON_SIZE / 2.0;
     double px = icon_center - pw / 2.0;
     if (px < 0) px = 0;
@@ -4153,6 +4169,20 @@ wspop_open(void)
     g_wspop.w = pw;
     g_wspop.h = body_h;
 
+    /* Night light block geometry */
+    double bl_y = wspop_blue_y();
+    double box_right = px + pw - MENU_PADDING;
+
+    g_wspop.blue_toggle_x = box_right - BLUE_TOGGLE_RPAD - BLUE_TOGGLE_W;
+    g_wspop.blue_toggle_y = bl_y + (BLUE_HEADER_H - BLUE_TOGGLE_H) / 2.0;
+
+    g_wspop.blue_sy = bl_y + BLUE_HEADER_H + BLUE_SLIDER_TOP +
+                      BLUE_SLIDER_H / 2.0;
+    g_wspop.blue_sx = px + MENU_PADDING + 8.0;
+    g_wspop.blue_sxmax = box_right - 8.0 - 46.0;
+    if (g_wspop.blue_sxmax < g_wspop.blue_sx)
+        g_wspop.blue_sxmax = g_wspop.blue_sx;
+
     popup_size_changed();
 }
 
@@ -4162,6 +4192,7 @@ wspop_close(void)
     if (!g_wspop.open) return;
     g_wspop.open = 0;
     g_wspop.hover_row = -1;
+    g_wspop.blue_dragging = 0;
     popup_size_changed();
 }
 
@@ -4175,8 +4206,18 @@ wspop_hit_test(double px, double py)
     if (in_rect(px, py, g_wspop.x, wp_y, g_wspop.w, WS_WP_BTN_H))
         return -2;
 
+    /* Night light toggle (returned as -3) */
+    if (in_rect(px, py, g_wspop.blue_toggle_x, g_wspop.blue_toggle_y,
+                BLUE_TOGGLE_W, BLUE_TOGGLE_H))
+        return -3;
+
+    /* Night light header box (returned as -4; slider drag handled separately) */
+    double bl_y = wspop_blue_y();
+    if (in_rect(px, py, g_wspop.x, bl_y, g_wspop.w, BLUE_BOX_H))
+        return -4;
+
     /* Workspace button row */
-    double btn_y = wp_y + WS_WP_BTN_H + MENU_PADDING;
+    double btn_y = bl_y + BLUE_BOX_H + MENU_PADDING;
     if (!in_rect(px, py, g_wspop.x, btn_y, g_wspop.w, WS_BTN_SIZE)) return -1;
     double step = WS_BTN_SIZE + WS_BTN_GAP;
     double rel = px - g_wspop.x - MENU_PADDING;
@@ -4184,6 +4225,175 @@ wspop_hit_test(double px, double py)
     if (col < 0 || col >= g_ws.ws_count) return -1;
     if (rel - col * step >= WS_BTN_SIZE) return -1;
     return col;
+}
+
+/* ---------------------------------------------------------------------------
+ * Night light (blue filter) helpers
+ * ------------------------------------------------------------------------- */
+
+static int
+blue_cur_temp(void)
+{
+    int pct = g_wspop.blue_pct;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    return BLUE_TEMP_OFF - (pct * (BLUE_TEMP_OFF - BLUE_TEMP_MIN)) / 100;
+}
+
+static char *
+blue_state_path(void)
+{
+    static char path[512];
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    snprintf(path, sizeof(path), "%s/.cache/jtlab/night-light.txt", home);
+    return path;
+}
+
+static void
+blue_kill(void)
+{
+    DIR *proc = opendir("/proc");
+    if (!proc) return;
+    struct dirent *de;
+    char ppath[512], comm[64];
+    while ((de = readdir(proc)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        snprintf(ppath, sizeof(ppath), "/proc/%s/comm", de->d_name);
+        int fd = open(ppath, O_RDONLY);
+        if (fd < 0) continue;
+        ssize_t n = read(fd, comm, 63);
+        close(fd);
+        if (n > 0) {
+            comm[n] = '\0';
+            char *nl = strchr(comm, '\n');
+            if (nl) *nl = '\0';
+            if (strcmp(comm, "wlsunset") == 0)
+                kill((pid_t)atoi(de->d_name), SIGTERM);
+        }
+    }
+    closedir(proc);
+}
+
+static void
+blue_apply(void)
+{
+    blue_kill();
+    if (!g_wspop.blue_on) return;
+
+    int temp = blue_cur_temp();
+    int lo = temp - 1;
+    if (lo < 1000) lo = 1000;
+    char cmd[256];
+    /* Manual fill-color mode: -S/-s pin the whole day to "day" so the applied
+     * color is exactly the -T (high) temperature set by the slider. */
+    snprintf(cmd, sizeof(cmd),
+             "wlsunset -t %d -T %d -S 00:00 -s 23:59 -d 0", lo, temp);
+    run_cmd(cmd, 0);
+}
+
+static void
+blue_save(void)
+{
+    const char *sp = blue_state_path();
+    FILE *f = fopen(sp, "w");
+    if (f) { fprintf(f, "%d\n%d\n", g_wspop.blue_on, g_wspop.blue_pct); fclose(f); }
+}
+
+static void
+blue_cancel_pending(void)
+{
+    if (g_wspop.blue_src) {
+        g_source_destroy(g_wspop.blue_src);
+        g_wspop.blue_src = NULL;
+    }
+}
+
+/* Debounce the wlsunset respawn so fast slider/scroll input does not kill and
+ * relaunch the daemon on every tick (screen flicker). Fires 250ms after the
+ * last change; mouse release flushes immediately. */
+static gboolean
+blue_apply_cb(void *data)
+{
+    (void)data;
+    g_wspop.blue_src = NULL;
+    blue_apply();
+    blue_save();
+    return G_SOURCE_REMOVE;
+}
+
+static void
+blue_schedule_apply(void)
+{
+    blue_cancel_pending();
+    GSource *src = g_timeout_source_new(250);
+    g_source_set_callback(src, (GSourceFunc)blue_apply_cb, NULL, NULL);
+    g_source_attach(src, g_sni.glib_ctx);
+    g_wspop.blue_src = src;
+    g_source_unref(src);
+}
+
+static void
+blue_load(void)
+{
+    FILE *f = fopen(blue_state_path(), "r");
+    if (!f) return;
+    if (fscanf(f, "%d %d", &g_wspop.blue_on, &g_wspop.blue_pct) != 2) {
+        g_wspop.blue_on = 0;
+        g_wspop.blue_pct = 0;
+    }
+    fclose(f);
+    if (g_wspop.blue_pct < 0) g_wspop.blue_pct = 0;
+    if (g_wspop.blue_pct > 100) g_wspop.blue_pct = 100;
+    if (g_wspop.blue_on)
+        blue_apply();
+}
+
+static void
+blue_toggle(void)
+{
+    g_wspop.blue_on = !g_wspop.blue_on;
+    blue_cancel_pending();
+    blue_apply();
+    blue_save();
+}
+
+/* Slider drag: only records the new value; the change is applied when the
+ * pointer button is released (or via the debounce for scroll). */
+static void
+blue_set_from_x(double px)
+{
+    double range = g_wspop.blue_sxmax - g_wspop.blue_sx;
+    if (range <= 0) return;
+    double f = (px - g_wspop.blue_sx) / range;
+    if (f < 0) f = 0;
+    if (f > 1) f = 1;
+    int np = (int)lround(f * 100.0);
+    if (np == g_wspop.blue_pct) return;
+    g_wspop.blue_pct = np;
+    render_request();
+}
+
+static void
+blue_scroll(int d)
+{
+    int np = g_wspop.blue_pct + d;
+    if (np < 0) np = 0;
+    if (np > 100) np = 100;
+    if (np == g_wspop.blue_pct) return;
+    g_wspop.blue_pct = np;
+    if (g_wspop.blue_on)
+        blue_schedule_apply();
+    render_request();
+}
+
+static int
+blue_slider_hit_test(double px, double py)
+{
+    if (!g_wspop.open) return 0;
+    if (px < g_wspop.blue_sx || px > g_wspop.blue_sxmax) return 0;
+    double reach = BLUE_SLIDER_H / 2.0 + 8;
+    return py >= g_wspop.blue_sy - reach && py <= g_wspop.blue_sy + reach;
 }
 
 /* ---------------------------------------------------------------------------
@@ -5081,7 +5291,7 @@ wlp_save_wallpaper(const char *path)
 {
     const char *sp = wlp_state_path();
     FILE *f = fopen(sp, "w");
-    if (f) { fprintf(f, "%s\n", path); fclose(f); }
+    if (f) { fprintf(f, "%d\n%s\n", g_wlp.enabled, path); fclose(f); }
 }
 
 static void
@@ -5138,14 +5348,17 @@ wlp_load_wallpaper(void)
 {
     FILE *f = fopen(wlp_state_path(), "r");
     if (!f) return;
-    char line[512];
-    if (fgets(line, sizeof(line), f)) {
-        char *nl = strchr(line, '\n');
+    char flag[16], path[512];
+    if (fgets(flag, sizeof(flag), f) && fgets(path, sizeof(path), f)) {
+        char *nl = strchr(flag, '\n');
         if (nl) *nl = '\0';
-        if (line[0] && access(line, R_OK) == 0) {
-            g_wlp.enabled = 1;
-            wlp_set_wallpaper(line);
-        }
+        nl = strchr(path, '\n');
+        if (nl) *nl = '\0';
+        g_wlp.enabled = (flag[0] == '1');
+        if (g_wlp.enabled && path[0] && access(path, R_OK) == 0)
+            wlp_set_wallpaper(path);
+        else if (path[0])
+            strncpy(g_wlp.cur_wallpaper, path, sizeof(g_wlp.cur_wallpaper) - 1);
     }
     fclose(f);
 }
@@ -5206,6 +5419,7 @@ wlp_toggle_power(void)
         wlp_kill_wbg();
         run_cmd("notify-send 'Wallpaper' 'Disabled'", 0);
     }
+    wlp_save_wallpaper(g_wlp.cur_wallpaper);
     render_request();
 }
 
@@ -7466,11 +7680,138 @@ bar_draw(struct bar *b)
                           PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_LEFT);
         }
 
+        /* Night light box (blue filter) -- header + slider, wallpaper-button style */
+        {
+            double bl_y = wspop_blue_y();
+            double box_x = px + MENU_PADDING;
+            double box_w = pw - MENU_PADDING * 2;
+            double hc = bl_y + BLUE_HEADER_H / 2.0;
+            int bl_hover = (g_wspop.hover_row == -3 || g_wspop.hover_row == -4);
+            int ton = g_wspop.blue_on;
+
+            if (bl_hover) {
+                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
+                cairo_new_path(cr);
+                rounded_rect(cr, box_x, bl_y, box_w, BLUE_BOX_H, WS_WP_BTN_R);
+                cairo_fill(cr);
+                cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.8);
+                cairo_set_line_width(cr, 1.2);
+                cairo_new_path(cr);
+                rounded_rect(cr, box_x, bl_y, box_w, BLUE_BOX_H, WS_WP_BTN_R);
+                cairo_stroke(cr);
+            } else {
+                cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.45);
+                cairo_set_line_width(cr, 1.2);
+                cairo_new_path(cr);
+                rounded_rect(cr, box_x, bl_y, box_w, BLUE_BOX_H, WS_WP_BTN_R);
+                cairo_stroke(cr);
+            }
+
+            /* Moon icon (crescent) */
+            double mr = 7.0;
+            double mx = box_x + 10 + mr;
+            cairo_set_source_rgba(cr, COLOR(FG_HEX), ton ? 0.95 : 0.6);
+            cairo_new_path(cr);
+            cairo_arc(cr, mx, hc, mr, 0, 2 * M_PI);
+            cairo_fill(cr);
+            if (bl_hover) {
+                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
+            } else {
+                cairo_set_source_rgba(cr, COLOR(MENU_BG_HEX), MENU_BG_A);
+            }
+            cairo_new_path(cr);
+            cairo_arc(cr, mx + mr * 0.45, hc - mr * 0.15, mr * 0.72, 0, 2 * M_PI);
+            cairo_fill(cr);
+
+            /* Header label */
+            double label_x = box_x + 10 + 2 * mr + 8;
+            double label_w = g_wspop.blue_toggle_x - 8 - label_x;
+            if (label_w < 0) label_w = 0;
+            sys_draw_text(cr, label_x, bl_y, label_w, BLUE_HEADER_H,
+                          "Night light", FONT_SIZE,
+                          COLOR(FG_HEX), ton ? 0.95 : 0.7,
+                          PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_LEFT);
+
+            /* On/off toggle */
+            double tx = g_wspop.blue_toggle_x;
+            double ty = g_wspop.blue_toggle_y;
+            int thover = (g_wspop.hover_row == -3);
+            cairo_set_source_rgba(cr, COLOR(MENU_BORDER_HEX), 1.0);
+            cairo_set_line_width(cr, 1);
+            cairo_new_path(cr);
+            rounded_rect(cr, tx, ty, BLUE_TOGGLE_W, BLUE_TOGGLE_H,
+                         BLUE_TOGGLE_H / 2.0);
+            cairo_stroke(cr);
+            if (ton) {
+                cairo_set_source_rgba(cr, COLOR(BLUE_ACCENT_HEX),
+                                      thover ? 1.0 : 0.9);
+            } else {
+                cairo_set_source_rgba(cr, 0.12, 0.2, 0.2, thover ? 1.0 : 0.9);
+            }
+            cairo_new_path(cr);
+            rounded_rect(cr, tx + 1, ty + 1, BLUE_TOGGLE_W - 2,
+                         BLUE_TOGGLE_H - 2, (BLUE_TOGGLE_H - 2) / 2.0);
+            cairo_fill(cr);
+            double kd = BLUE_TOGGLE_H - 6;
+            double kx2 = ton ? tx + BLUE_TOGGLE_W - kd - 3 : tx + 3;
+            double ky2 = ty + 3;
+            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, thover ? 1.0 : 0.85);
+            cairo_new_path(cr);
+            cairo_arc(cr, kx2 + kd / 2.0, ky2 + kd / 2.0, kd / 2.0, 0, 2 * M_PI);
+            cairo_fill(cr);
+        }
+
+        /* Night light slider row (blue filter) */
+        {
+            double sx = g_wspop.blue_sx;
+            double sw = g_wspop.blue_sxmax - g_wspop.blue_sx;
+            double sy = g_wspop.blue_sy;
+            double sr = BLUE_SLIDER_H / 2.0;
+            int ton = g_wspop.blue_on;
+            double fill_w = sw * (g_wspop.blue_pct / 100.0);
+            fill_w = clampd(fill_w, 0, sw);
+
+            /* track background */
+            cairo_set_source_rgba(cr, COLOR(VOL_SLIDER_BG_HEX), VOL_SLIDER_BG_A);
+            cairo_new_path(cr);
+            rounded_rect(cr, sx, sy - sr, sw, BLUE_SLIDER_H, sr);
+            cairo_fill(cr);
+
+            if (fill_w > 0) {
+                cairo_set_source_rgba(cr, COLOR(BLUE_ACCENT_HEX),
+                                      ton ? 1.0 : 0.45);
+                if (fill_w >= sr * 2) {
+                    cairo_new_path(cr);
+                    rounded_rect(cr, sx, sy - sr, fill_w, BLUE_SLIDER_H, sr);
+                } else {
+                    cairo_rectangle(cr, sx, sy - sr, fill_w, BLUE_SLIDER_H);
+                }
+                cairo_fill(cr);
+            }
+
+            double kx = clampd(sx + fill_w, sx, sx + sw);
+            cairo_set_source_rgba(cr, COLOR(FG_HEX), ton ? 1.0 : 0.7);
+            if (g_wspop.blue_dragging)
+                cairo_set_source_rgba(cr, COLOR(BLUE_ACCENT_HEX), 1.0);
+            cairo_new_path(cr);
+            cairo_arc(cr, kx, sy, BLUE_KNOB_R, 0, 2 * M_PI);
+            cairo_fill(cr);
+
+            /* Temperature label */
+            char tlab[16];
+            snprintf(tlab, sizeof(tlab), "%dK", blue_cur_temp());
+            sys_draw_text(cr, g_wspop.blue_sxmax, sy - 10, 46, 20,
+                          tlab, FONT_SIZE,
+                          COLOR(FG_HEX), ton ? 0.95 : 0.55,
+                          PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_RIGHT);
+        }
+
         /* Workspace buttons (bottom row) */
         for (int i = 0; i < g_ws.ws_count; i++) {
             double step = WS_BTN_SIZE + WS_BTN_GAP;
             double bx = px + MENU_PADDING + i * step;
-            double by = py + MENU_PADDING + WS_WP_BTN_H + MENU_PADDING;
+            double by = py + MENU_PADDING + WS_WP_BTN_H + MENU_PADDING +
+                        BLUE_BOX_H + MENU_PADDING;
             int active = g_workspaces[i].active;
             int hover = (g_wspop.hover_row == i);
             const char *name = g_workspaces[i].name;
@@ -8582,6 +8923,8 @@ pointer_refresh_hover(void)
     changed |= ctx_hover_refresh(on_menu);
     changed |= menu_hover_refresh(on_menu);
     changed |= bar_hover_refresh(on_bar);
+    if (g_wspop.blue_dragging)
+        blue_set_from_x(g_pointer.x);
 
     if (trace_on()) {
         static unsigned long last_log;
@@ -8655,8 +8998,17 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
     (void)data; (void)pointer; (void)serial; (void)time;
 
     if (state != WL_POINTER_BUTTON_STATE_PRESSED) {
-        if (button == BTN_LEFT)
+        if (button == BTN_LEFT) {
             g_volpop.dragging = 0;
+            if (g_wspop.blue_dragging) {
+                g_wspop.blue_dragging = 0;
+                blue_cancel_pending();
+                if (g_wspop.blue_on)
+                    blue_apply();
+                blue_save();
+                render_request();
+            }
+        }
         return;
     }
 
@@ -8731,6 +9083,16 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
             wspop_close();
             wlp_open();
             render_request();
+            return;
+        }
+        if (button == BTN_LEFT && row == -3) {
+            blue_toggle();
+            render_request();
+            return;
+        }
+        if (button == BTN_LEFT && blue_slider_hit_test(g_pointer.x, g_pointer.y)) {
+            g_wspop.blue_dragging = 1;
+            blue_set_from_x(g_pointer.x);
             return;
         }
         if (row >= 0) {
@@ -9117,6 +9479,13 @@ pointer_handle_axis(void *d, struct wl_pointer *p, uint32_t t,
                    wlp_hit_test(g_pointer.x, g_pointer.y) >= 0;
     if (over_wlp) {
         wlp_scroll(delta < 0 ? -40.0 : 40.0);
+        return;
+    }
+
+    int over_blue = on_bar && popup_coords_safe(t) && g_wspop.open &&
+                    blue_slider_hit_test(g_pointer.x, g_pointer.y);
+    if (over_blue) {
+        blue_scroll(delta < 0 ? -5 : 5);
         return;
     }
 
@@ -9887,6 +10256,7 @@ main(int argc, char *argv[])
 
     bar_init();
     wlp_load_wallpaper();
+    blue_load();
     poll_init();
     ctl_init();
     main_loop();

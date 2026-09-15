@@ -88,14 +88,14 @@
 
 /* Pinned apps on bar */
 #define PINNED_GAP      12
-#define PINNED_ICON     20
+#define PINNED_ICON     18
 #define PINNED_SPACING  8
 
 /* Terminal */
 #define TERMINAL_CMD    "footclient"
 
 /* Running app taskbar */
-#define TASKBAR_ICON    20
+#define TASKBAR_ICON    18
 #define TASKBAR_GAP     (PINNED_SPACING * 2)
 
 /* Window-count badge */
@@ -114,7 +114,7 @@
 /* Right-side status pill (tray / audio / net / clock / bell) */
 #define PILL_PAD_X      8
 #define PILL_PAD_Y      4
-#define PILL_HEX        0x111111
+#define PILL_HEX        0x0F1011
 #define PILL_A          1.0  /*Turn up to enable*/
 
 /* System tray (StatusNotifierItems) */
@@ -131,6 +131,25 @@
 #define WS_WP_BTN_H     30
 #define WS_WP_BTN_R     6
 #define WS_WP_ICON      14
+
+/* Night light (blue light filter) block inside the workspace popup.
+ * A header box (same height/border style as the wallpaper button) holds the
+ * moon icon, the "Night light" label and the on/off toggle; the temperature
+ * slider sits in its own row directly below. The slider maps 0-100% intensity
+ * to a color temperature from BLUE_TEMP_OFF (no filter, 6500K) down to
+ * BLUE_TEMP_MIN (max filter), driving an external wlsunset daemon. */
+#define BLUE_HEADER_H     (WS_WP_BTN_H)
+#define BLUE_SLIDER_TOP   8
+#define BLUE_SLIDER_BOT   12
+#define BLUE_BOX_H        (BLUE_HEADER_H + BLUE_SLIDER_TOP + BLUE_SLIDER_H + BLUE_SLIDER_BOT)
+#define BLUE_SLIDER_H     4
+#define BLUE_KNOB_R       5
+#define BLUE_TOGGLE_W     34
+#define BLUE_TOGGLE_H     18
+#define BLUE_TOGGLE_RPAD  8
+#define BLUE_ACCENT_HEX   0xE8A03C
+#define BLUE_TEMP_OFF     6500
+#define BLUE_TEMP_MIN     2500
 
 /* Wallpaper browser popup (click Wallpaper button in workspace popup).
  * Scans WALLPAPER_DIR for images, shows a scrollable grid of thumbnails. */
