@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -125,6 +126,7 @@ struct pointer_state {
     int hover_audio;
     int hover_tray;
     int hover_ws;
+    int hover_wx;
 };
 
 static struct pointer_state g_pointer = { .hover_tray = -1 };
@@ -215,6 +217,13 @@ pool_cairo_init(struct shm_pool *pool, cairo_surface_t **sf, cairo_t **cr,
     cairo_scale(*cr, scale, scale);
 }
 
+/* The bar proper and the flyout strip above it are separate layer surfaces.
+ * They used to be one tall buffer, which meant opening a flyout reallocated
+ * the bar's shm pool and made every flyout animation frame re-upload the full
+ * output width. Keeping them apart means the bar's buffer is allocated once at
+ * BAR_HEIGHT and never changes, and a flyout frame only touches its own small
+ * buffer. The flyout surface is shared by all nine flyouts, which is sound
+ * because close_sibling_popups() guarantees only one is ever open. */
 struct bar {
     struct wl_surface *surface;
     struct zwlr_layer_surface_v1 *layer_surface;
@@ -227,6 +236,16 @@ struct bar {
     int frame_pending;
     int resize_pending;
     int size_dirty;
+
+    struct wl_surface *fly_surface;
+    struct zwlr_layer_surface_v1 *fly_layer;
+    int fly_surf_width, fly_surf_height, fly_surf_configured;
+    struct shm_pool fly_pool;
+    cairo_surface_t *fly_cairo;
+    cairo_t *fly_cr;
+    _Atomic int fly_needs_render;
+    struct wl_callback *fly_frame_cb;
+    int fly_frame_pending;
 
     int menu_open;
     int menu_height;
@@ -253,6 +272,7 @@ static void
 render_request(void)
 {
     g_bar.needs_render = 1;
+    g_bar.fly_needs_render = 1;
     if (g_bar.menu_open)
         g_bar.menu_needs_render = 1;
 }
@@ -422,6 +442,16 @@ clock_layout(cairo_t *cr)
     return pl;
 }
 
+/* Text drawn from a fractional origin gets re-hinted by cairo and its stems
+ * come out visibly uneven, which reads as broken text. Every text origin goes
+ * through this so it lands on a whole pixel; centring maths that divides an odd
+ * number by two is off by half a pixel more often than not. */
+static double
+snap_px(double v)
+{
+    return lround(v);
+}
+
 static double
 text_width_px(const char *text)
 {
@@ -454,6 +484,142 @@ time_text_width(void)
         bound_cr = g_bar.cr;
     }
     return prev_w;
+}
+
+/* ---------------------------------------------------------------------------
+ * Weather
+ *
+ * Current conditions live in the bar just outside the left edge of the
+ * right-hand status pill; the forecast popup hangs off a click on it. Data
+ * comes from Open-Meteo, which needs no API key -- see the WEATHER_* block in
+ * config.h.
+ * ------------------------------------------------------------------------- */
+
+enum {
+    WX_CLEAR, WX_PARTLY, WX_CLOUDY, WX_FOG, WX_DRIZZLE,
+    WX_RAIN, WX_SHOWERS, WX_SNOW, WX_STORM, WX_UNKNOWN
+};
+
+struct wx_day {
+    char name[8];
+    int cond;
+    double tmax, tmin;
+    int rain;
+};
+
+#define WX_MAX_DAYS 8
+
+static struct {
+    int have;                    /* current conditions are usable */
+    int cond;
+    double temp;
+    char place[64];
+    struct wx_day day[WX_MAX_DAYS];
+    int n_days;
+    time_t fetched;
+    time_t retry_at;             /* backoff gate after a failure */
+    int pending;                 /* a request is in flight */
+    double lat, lon;
+    int have_loc;
+    SoupSession *session;
+} g_wx;
+
+/* WMO weather interpretation codes, as published by Open-Meteo. */
+static int
+wx_code_to_cond(int code)
+{
+    if (code == 0) return WX_CLEAR;
+    if (code <= 2) return WX_PARTLY;
+    if (code == 3) return WX_CLOUDY;
+    if (code <= 48) return WX_FOG;
+    if (code <= 57) return WX_DRIZZLE;
+    if (code <= 67) return WX_RAIN;
+    if (code <= 77) return WX_SNOW;
+    if (code <= 82) return WX_SHOWERS;
+    if (code <= 86) return WX_SNOW;
+    if (code <= 99) return WX_STORM;
+    return WX_UNKNOWN;
+}
+
+static const char *
+wx_cond_label(int cond)
+{
+    switch (cond) {
+    case WX_CLEAR:   return "Clear";
+    case WX_PARTLY:  return "Partly cloudy";
+    case WX_CLOUDY:  return "Overcast";
+    case WX_FOG:     return "Fog";
+    case WX_DRIZZLE: return "Drizzle";
+    case WX_RAIN:    return "Rain";
+    case WX_SHOWERS: return "Showers";
+    case WX_SNOW:    return "Snow";
+    case WX_STORM:   return "Thunderstorm";
+    default:         return "Unknown";
+    }
+}
+
+static void
+wx_deg_str(double t, char *out, size_t n)
+{
+    snprintf(out, n, "%d°", (int)(t < 0 ? t - 0.5 : t + 0.5));
+}
+
+/* The bar item reads as a bare temperature; the unit suffix only has room in
+ * the popup, so keep the glyph to the degree sign here. */
+static void
+wx_bar_text(char *out, size_t n)
+{
+    wx_deg_str(g_wx.temp, out, n);
+}
+
+static double
+wx_text_width(void)
+{
+    static char prev[16] = "";
+    static double prev_w;
+    static cairo_t *bound_cr;
+    char buf[16];
+    if (!g_bar.cr) return 0;
+    wx_bar_text(buf, sizeof(buf));
+    if (bound_cr != g_bar.cr || strcmp(prev, buf) != 0) {
+        prev_w = text_width_px(buf);
+        snprintf(prev, sizeof(prev), "%s", buf);
+        bound_cr = g_bar.cr;
+    }
+    return prev_w;
+}
+
+/* Width of the condition word that follows the temperature. Cached on its own
+ * rather than sharing wx_text_width's slot, because the layout asks for both
+ * every pass and one shared cache would just re-measure them both each time. */
+static double
+wx_cond_width(void)
+{
+    static char prev[32] = "";
+    static double prev_w;
+    static cairo_t *bound_cr;
+    const char *s = wx_cond_label(g_wx.cond);
+    if (!g_bar.cr) return 0;
+    if (bound_cr != g_bar.cr || strcmp(prev, s) != 0) {
+        prev_w = text_width_px(s);
+        snprintf(prev, sizeof(prev), "%s", s);
+        bound_cr = g_bar.cr;
+    }
+    return prev_w;
+}
+
+static int
+wx_visible(void)
+{
+    return WEATHER_ENABLED && g_wx.have;
+}
+
+static double
+wx_width(void)
+{
+    if (!wx_visible()) return 0;
+    return WEATHER_PAD_X * 2 + WEATHER_ICON + WEATHER_ICON_GAP
+           + wx_text_width() + WEATHER_ICON_GAP + wx_cond_width();
 }
 
 enum { NET_NONE, NET_WIFI, NET_ETHERNET };
@@ -1076,7 +1242,7 @@ pinned_recalc_layout(void)
 
 static void gpopup_close(void);
 static void cpop_clear_hover(void);
-static void cpop_open(int app_idx, int window_idx, double x, double y);
+static void cpop_open(int app_idx, int window_idx, double x);
 static void cpop_close(void);
 static int cpop_hit_test(double px, double py);
 static int app_match(const char *desktop_id, const char *app_id);
@@ -1170,6 +1336,7 @@ toplevel_recalc_layout(void)
 }
 
 static double right_cluster_limit(void);
+static double wx_x(void);
 
 static void
 center_taskbar_items(void)
@@ -1198,7 +1365,9 @@ center_taskbar_items(void)
         if (lmost + shift < min_x) shift = min_x - lmost;
     }
     {
-        double max_r = right_cluster_limit();
+        /* The weather item lives outside the pill on its left, so when it is
+         * showing it becomes the new right-hand bound for the taskbar block. */
+        double max_r = wx_visible() ? wx_x() - TRAY_GAP : right_cluster_limit();
         if (rmost + shift > max_r) shift = max_r - rmost;
     }
 
@@ -1215,13 +1384,19 @@ center_taskbar_items(void)
 
 static void bar_draw(struct bar *b);
 static void bar_render(struct bar *b);
+static void flyout_draw(cairo_t *cr, PangoLayout *pl);
+static void flyout_update_size(struct bar *b);
 static const struct wl_callback_listener frame_listener;
 static void bar_update_size(struct bar *b);
+static double popup_place_x(double anchor_x, double w, double edge);
 static void
 popup_size_changed(void)
 {
+    /* A flyout opening or closing no longer resizes the bar -- only the strip
+     * above it. The bar's own content is unaffected, so it only needs a repaint
+     * when something else already asked for one. */
     if (g_bar.configured)
-        bar_update_size(&g_bar);
+        flyout_update_size(&g_bar);
 }
 static void menu_close(struct bar *b);
 static void menu_toggle_ctl(void);
@@ -1999,8 +2174,9 @@ in_rect(double px, double py, double x, double y, double w, double h)
 static int
 bar_icon_hit_test(double px, double py, double x, double w, double h)
 {
-    int bar_y = bar_y_offset();
-    double cy = bar_y + (BAR_HEIGHT - h) / 2.0;
+    /* The bar's own surface is exactly BAR_HEIGHT tall, so the bar starts at
+     * y=0 -- there is no flyout above it to offset by any more. */
+    double cy = (BAR_HEIGHT - h) / 2.0;
     return in_rect(px, py, x, cy, w, h);
 }
 
@@ -2142,6 +2318,24 @@ static double
 workspace_icon_x(void)
 {
     return right_cluster_limit() + 4;
+}
+
+/* Centre of the notification bell. The volume and notification panels anchor
+ * here so they line up with the calendar, which anchors on the clock. */
+static double
+bell_center_x(void)
+{
+    return g_bar.width - TRAY_EDGE_PAD - NOTIF_ICON_SIZE / 2.0;
+}
+
+/* Left edge of the weather item. It sits outside the status pill, so the pill
+ * and everything anchored to the right edge of the bar are unaffected -- only
+ * the taskbar clamp in center_taskbar_items() has to make room for it. */
+static double
+wx_x(void)
+{
+    if (!wx_visible()) return 0;
+    return workspace_icon_x() - PILL_PAD_X - TRAY_GAP - wx_width();
 }
 
 static int
@@ -2373,15 +2567,12 @@ tray_menu_layout(void)
     if (w > TRAY_MENU_MAX_W) w = TRAY_MENU_MAX_W;
     if (w < 120) w = 120;
     g_tm.w = w;
-    g_tm.height = (int)y + MENU_FLOAT_GAP;
+    g_tm.height = (int)y + PPADDING;
 
     double ix = 0;
     if (g_tm.tray_idx >= 0 && g_tm.tray_idx < g_sni.n_tray)
         ix = tray_icon_x(g_tm.tray_idx) + TRAY_ICON_SIZE / 2.0;
-    double x = ix - w / 2.0;
-    if (x < 8) x = 8;
-    if (x + w > g_bar.width - 8) x = g_bar.width - 8 - w;
-    g_tm.x = x;
+    g_tm.x = popup_place_x(ix, w, PPADDING);
     g_tm.y = 0;
 }
 
@@ -3235,15 +3426,27 @@ run_cmd_child_cleanup(void)
     }
 }
 
+/* hold: after the command finishes, exec an interactive shell in the same
+ * terminal so the window stays open and usable. Meant for commands that print
+ * and exit immediately (fastfetch), where the terminal would otherwise close
+ * before the output can be read. Note the terminal's own hold flag is not
+ * enough: foot's -H/--hold only keeps the pane on screen with no process
+ * behind it to read input, so the window looks alive but cannot be typed into.
+ * Leave hold at 0 for commands that run long enough to read as they go. */
 static void
-run_cmd(const char *cmd, int terminal)
+run_cmd_ex(const char *cmd, int terminal, int hold)
 {
     if (!cmd || !cmd[0]) return;
     char clean[512];
     exec_clean(cmd, clean, sizeof(clean));
     if (!clean[0]) return;
     char buf[1024];
-    if (terminal)
+    if (terminal && hold)
+        /* single quotes keep the outer sh from expanding the shell reference,
+         * so it resolves inside the terminal where $SHELL is meaningful */
+        snprintf(buf, sizeof(buf), "%s sh -c '%s; exec %s'",
+                 TERMINAL_CMD, clean, TERMINAL_HOLD_SHELL);
+    else if (terminal)
         snprintf(buf, sizeof(buf), "%s %s", TERMINAL_CMD, clean);
     else
         snprintf(buf, sizeof(buf), "%s", clean);
@@ -3254,6 +3457,40 @@ run_cmd(const char *cmd, int terminal)
         execl("/bin/sh", "sh", "-c", buf, NULL);
         _exit(127);
     }
+}
+
+static void
+run_cmd(const char *cmd, int terminal)
+{
+    run_cmd_ex(cmd, terminal, 0);
+}
+
+/* SIGTERM every process whose comm matches name. Used to take ownership of the
+ * wallpaper (wbg) and night-light (wlsunset) daemons, both of which this bar
+ * restarts itself; pkill is not an option for matching on comm alone. */
+static void
+kill_comm(const char *name)
+{
+    DIR *proc = opendir("/proc");
+    if (!proc) return;
+    struct dirent *de;
+    char ppath[512], comm[64];
+    while ((de = readdir(proc)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        snprintf(ppath, sizeof(ppath), "/proc/%s/comm", de->d_name);
+        int fd = open(ppath, O_RDONLY);
+        if (fd < 0) continue;
+        ssize_t n = read(fd, comm, 63);
+        close(fd);
+        if (n > 0) {
+            comm[n] = '\0';
+            char *nl = strchr(comm, '\n');
+            if (nl) *nl = '\0';
+            if (strcmp(comm, name) == 0)
+                kill((pid_t)atoi(de->d_name), SIGTERM);
+        }
+    }
+    closedir(proc);
 }
 
 /* The scrollable app list region for a given menu body height. Single source of
@@ -3285,7 +3522,7 @@ menu_vis_rows(double mh_body)
 static int
 menu_max_scroll(void)
 {
-    double mh_body = g_bar.menu_height - MENU_FLOAT_GAP;
+    double mh_body = g_bar.menu_height - PPADDING;
     int vis = menu_vis_rows(mh_body);
     return g_app.menu_n - vis;
 }
@@ -3414,7 +3651,7 @@ menu_sel_move(int dir)
     if (g_app.menu_sel < 0) g_app.menu_sel = 0;
     if (g_app.menu_sel >= g_app.menu_n) g_app.menu_sel = g_app.menu_n - 1;
     if (g_app.menu_sel != old) {
-        double mh_body = g_bar.menu_height - MENU_FLOAT_GAP;
+        double mh_body = g_bar.menu_height - PPADDING;
         int vis = menu_vis_rows(mh_body);
         if (g_app.menu_sel < g_bar.menu_scroll)
             menu_scroll_set_row(g_app.menu_sel);
@@ -3445,6 +3682,34 @@ menu_search_area(double mh_body)
     return MENU_SEARCH_H + 2 * menu_vert_pad(mh_body);
 }
 
+/* Top inset of the profile photo. Deliberately the same expression that
+ * menu_list_area() uses for the app list's first row, so the photo lines up
+ * with the top of the app rows rather than sitting closer to the panel edge. */
+static double
+menu_avatar_top(double mh_body)
+{
+    return 2 * menu_vert_pad(mh_body);
+}
+
+/* Vertical band at the top of the power column that the profile photo
+ * occupies: that top inset, the circle, then a gap that keeps it clear of the
+ * power icons below. */
+static double
+menu_avatar_band(double mh_body)
+{
+    return menu_avatar_top(mh_body) + PROFILE_PHOTO_SIZE + 12;
+}
+
+/* First power row's y offset within the menu body. Normally bottom-anchored,
+ * but never above the profile-photo band so the two cannot overlap. */
+static double
+menu_power_row_base(double mh_body)
+{
+    double bottom = mh_body - MENU_PADDING - 4 * POWER_ROW_H;
+    double top = menu_avatar_band(mh_body);
+    return bottom > top ? bottom : top;
+}
+
 static int
 calc_menu_height(void)
 {
@@ -3453,7 +3718,7 @@ calc_menu_height(void)
     for (int i = 0; i < 10; i++) {
         double apps_h = 2 * menu_vert_pad(body) + rows * MENU_ROW_HEIGHT
                         + 2 * menu_search_area(body);
-        double power_h = MENU_PADDING + 4 * POWER_ROW_H + 2 * menu_vert_pad(body);
+        double power_h = menu_avatar_band(body) + 4 * POWER_ROW_H + MENU_PADDING;
         double sys_h = sys_column_height();
         double b = apps_h > power_h ? apps_h : power_h;
         if (sys_h > b) b = sys_h;
@@ -3462,8 +3727,8 @@ calc_menu_height(void)
         if (fabs(b - body) < 0.5) { body = b; break; }
         body = b;
     }
-    int h = MENU_FLOAT_GAP + (int)(body + 0.5);
-    int max_h = MENU_FLOAT_GAP + POPUP_BODY_H;
+    int h = PPADDING + (int)(body + 0.5);
+    int max_h = PPADDING + POPUP_BODY_H;
     return h > max_h ? max_h : h;
 }
 
@@ -3478,15 +3743,15 @@ ctx_open(int app_idx, double x, double y)
     double ch = g_ctx.n_items * CTX_ROW_HEIGHT;
     double mx = MENU_MARGIN_L;
     double mw = MENU_WIDTH + POWER_COL_W + SYS_COL_W;
-    double mh_body = g_bar.menu_height - MENU_FLOAT_GAP;
+    double mh_body = g_bar.menu_height - PPADDING;
 
     double cx = x + 4;
     cx = clampd(cx, mx, mx + mw - cw);
-    g_ctx.x = cx;
+    g_ctx.x = snap_px(cx);
 
     double cy = y;
     cy = clampd(cy, 0, mh_body - ch);
-    g_ctx.y = cy;
+    g_ctx.y = snap_px(cy);
 }
 
 static void
@@ -3513,24 +3778,30 @@ gpopup_clear_hover(void)
     g_gpopup.hover_close = -1;
 }
 
+/* Left edge for a popup of width w centred on anchor_x and kept inside the
+ * bar, `edge` pixels clear of whichever end it hits first. A popup wider than
+ * the bar minus both edges is pinned to the left edge. Every popup goes
+ * through here so they all keep the same margin, and the result is snapped to
+ * a whole pixel: a half-pixel edge puts every glyph inside the popup half a
+ * pixel off, which is what makes text look unevenly hinted. */
 static double
-popup_x_clamp(double x, double w)
+popup_place_x(double anchor_x, double w, double edge)
 {
-    double lo = 8, hi = g_bar.width - 8 - w;
+    double lo = edge, hi = g_bar.width - edge - w;
     if (hi < lo) hi = lo;
-    return clampd(x, lo, hi);
+    return snap_px(clampd(anchor_x - w / 2.0, lo, hi));
 }
 
 static void
-gpopup_fill(int count, const int *windows, double cx, double y)
+gpopup_fill(int count, const int *windows, double cx)
 {
     g_gpopup.open = 1;
     g_gpopup.n_windows = count;
     for (int i = 0; i < count; i++)
         g_gpopup.windows[i] = windows[i];
-    g_gpopup.x = popup_x_clamp(cx - GROUP_POPUP_W / 2.0, GROUP_POPUP_W);
-    g_gpopup.y = y;
-    g_gpopup.height = MENU_FLOAT_GAP + MENU_PADDING * 2 + count * MENU_ROW_HEIGHT;
+    g_gpopup.x = popup_place_x(cx, GROUP_POPUP_W, PPADDING);
+    g_gpopup.y = 0;
+    g_gpopup.height = PPADDING + MENU_PADDING * 2 + count * MENU_ROW_HEIGHT;
     gpopup_clear_hover();
     popup_size_changed();
 }
@@ -3538,21 +3809,21 @@ gpopup_fill(int count, const int *windows, double cx, double y)
 static void close_sibling_popups(void);
 
 static void
-gpopup_open(int group_idx, double x, double y)
+gpopup_open(int group_idx, double x)
 {
     close_sibling_popups();
     struct taskbar_group *g = &g_box.taskbar_groups[group_idx];
-    gpopup_fill(g->n_windows, g->windows, x + g->w / 2.0, y);
+    gpopup_fill(g->n_windows, g->windows, x + g->w / 2.0);
 }
 
 static void
-gpopup_open_pinned(int pinned_idx, double x, double y)
+gpopup_open_pinned(int pinned_idx, double x)
 {
     const struct app_entry *a = &g_app.apps[g_app.pinned[pinned_idx]];
     int count = windows_of_app(a, g_gpopup.windows, MAX_WINDOWS_PER_GROUP);
     if (count < 2) return;
     close_sibling_popups();
-    gpopup_fill(count, g_gpopup.windows, x + g_box.pl[pinned_idx].w / 2.0, y);
+    gpopup_fill(count, g_gpopup.windows, x + g_box.pl[pinned_idx].w / 2.0);
 }
 
 static void
@@ -3571,7 +3842,7 @@ cpop_label(int i)
 }
 
 static void
-cpop_open(int app_idx, int window_idx, double x, double y)
+cpop_open(int app_idx, int window_idx, double x)
 {
     g_cpop.app_idx = app_idx;
     g_cpop.window_idx = window_idx;
@@ -3581,7 +3852,7 @@ cpop_open(int app_idx, int window_idx, double x, double y)
     if (g_cpop.n_items == 0) return;
 
     g_cpop.open = 1;
-    g_cpop.y = y;
+    g_cpop.y = 0;
     cpop_clear_hover();
 
     double tw = 90;
@@ -3592,8 +3863,8 @@ cpop_open(int app_idx, int window_idx, double x, double y)
         }
     }
     g_cpop.w = tw * 1.2;
-    g_cpop.x = popup_x_clamp(x - g_cpop.w / 2.0, g_cpop.w);
-    g_cpop.h = MENU_FLOAT_GAP + MENU_PADDING * 2 + CTX_ROW_HEIGHT * g_cpop.n_items;
+    g_cpop.x = popup_place_x(x, g_cpop.w, PPADDING);
+    g_cpop.h = PPADDING + MENU_PADDING * 2 + CTX_ROW_HEIGHT * g_cpop.n_items;
     popup_size_changed();
 }
 
@@ -3616,7 +3887,7 @@ static int
 cpop_hit_test(double px, double py)
 {
     if (!g_cpop.open) return -1;
-    double ch = g_cpop.h - MENU_FLOAT_GAP;
+    double ch = g_cpop.h - PPADDING;
     if (!in_rect(px, py, g_cpop.x, g_cpop.y, g_cpop.w, ch)) return -1;
     int row = (int)((py - g_cpop.y - MENU_PADDING) / CTX_ROW_HEIGHT);
     if (row < 0 || row >= g_cpop.n_items) return -1;
@@ -3642,6 +3913,7 @@ static struct vol_popup g_volpop = { 0 };
 
 static void pw_set_volume(float vol_pct);
 static void pw_set_mute(int muted);
+static double popup_panel_width(void);
 
 static int
 volpop_list_rows(void)
@@ -3669,8 +3941,12 @@ volpop_height(void)
 static void
 volpop_recalc_layout(void)
 {
-    double pw = VOL_POPUP_WIDTH;
-    double px = g_bar.width - TRAY_EDGE_PAD - pw;
+    double pw = popup_panel_width();
+    /* Anchor on the bell's centre and let popup_place_x() clamp to PPADDING,
+     * same as every other panel. Handing it a pre-divided right edge used to
+     * subtract pw/2 twice, which pinned the panel TRAY_EDGE_PAD from the
+     * screen edge and ignored PPADDING entirely. */
+    double px = popup_place_x(bell_center_x(), pw, PPADDING);
     double tab_y = MENU_PADDING;
     double list_y = tab_y + VOL_TAB_H + 4;
     int n_rows = volpop_max_rows();
@@ -3681,7 +3957,7 @@ volpop_recalc_layout(void)
     g_volpop.x = px;
     g_volpop.y = 0;
     g_volpop.w = pw;
-    g_volpop.h = body_h + MENU_FLOAT_GAP;
+    g_volpop.h = body_h + PPADDING;
     g_volpop.tab_y = tab_y;
     g_volpop.list_y = list_y;
     g_volpop.mute_x = px + MENU_PADDING;
@@ -4103,10 +4379,21 @@ static const struct ext_workspace_manager_v1_listener ws_mgr_listener = {
     .finished = ws_mgr_finished,
 };
 
+/* Quick-action row indices. Buttons sharing a row sit side by side; a button
+ * alone in its row spans the full width. */
+enum {
+    WS_ACT_ROW_MAIN = 0,   /* Speedtest + Screenshot */
+    WS_ACT_ROW_FASTFETCH,  /* Fastfetch, on its own row */
+    WS_ACT_ROWS,
+};
+
 struct ws_popup {
     int open;
     double x, y, w, h;
     int hover_row;
+    /* act_w[r] is the button width in row r, so rows holding different numbers
+     * of buttons can differ */
+    double act_w[WS_ACT_ROWS];
     /* Night light (blue filter) */
     int blue_on;
     int blue_pct;       /* 0-100 filter intensity */
@@ -4117,6 +4404,50 @@ struct ws_popup {
 };
 
 static struct ws_popup g_wspop = { 0 };
+
+/* Quick-action buttons, in display order. Each index maps to hit-test code
+ * WS_ACT_HIT_BASE - index and draws the label from here. */
+enum {
+    WS_ACT_SPEEDTEST = 0,
+    WS_ACT_SCREENSHOT,
+    WS_ACT_FASTFETCH,
+    WS_ACT_COUNT,
+};
+
+#define WS_ACT_HIT_BASE (-5)
+
+static const char *const ws_act_label[WS_ACT_COUNT] = {
+    "Speedtest", "Screenshot", "Fastfetch",
+};
+
+/* Which row each action sits in, top to bottom. */
+static const unsigned char ws_act_row[WS_ACT_COUNT] = {
+    [WS_ACT_SPEEDTEST]  = WS_ACT_ROW_MAIN,
+    [WS_ACT_SCREENSHOT] = WS_ACT_ROW_MAIN,
+    [WS_ACT_FASTFETCH]  = WS_ACT_ROW_FASTFETCH,
+};
+
+/* Actions in the given row. */
+static int
+ws_act_row_n(int row)
+{
+    int n = 0;
+    for (int i = 0; i < WS_ACT_COUNT; i++)
+        if (ws_act_row[i] == row) n++;
+    return n;
+}
+
+/* Most buttons in any single row -- the row that sets the popup's width. */
+static int
+ws_act_row_max(void)
+{
+    int m = 0;
+    for (int r = 0; r < WS_ACT_ROWS; r++) {
+        int n = ws_act_row_n(r);
+        if (n > m) m = n;
+    }
+    return m;
+}
 
 static int
 wspop_rows(void)
@@ -4132,21 +4463,95 @@ wspop_width(void)
     double wp_w = MENU_PADDING * 2 + 8 + WS_WP_ICON + 8 + 80;
     double blue_w = MENU_PADDING * 2 + 8 + 64 + 16 + 46 +
                     BLUE_TOGGLE_W + BLUE_TOGGLE_RPAD;
+    /* Set by the row with the most buttons: each needs room for its icon and
+     * label, and the buttons in a row are separated by WS_ACT_BTN_GAP. */
+    int row_max = ws_act_row_max();
+    double act_w = MENU_PADDING * 2 +
+                   row_max * (WS_ACT_PAD + WS_WP_ICON + 8 + WS_ACT_LABEL_W) +
+                   (row_max - 1) * WS_ACT_BTN_GAP;
     double m = ws_w > wp_w ? ws_w : wp_w;
-    return m > blue_w ? m : blue_w;
+    if (blue_w > m) m = blue_w;
+    if (act_w > m) m = act_w;
+    return m;
+}
+
+/* The bar's top-row popups (workspaces, volume, weather, calendar) all share
+ * one width, so they line up as a single column instead of four ragged ones.
+ * The workspaces popup has the most content, so its computed width is the one
+ * that drives all of them; every popup derives its own internal layout from the
+ * width it is handed, so nothing needs a per-popup override. */
+static double
+popup_panel_width(void)
+{
+    return wspop_width();
+}
+
+/* Content height, excluding the gap the panel adds above the bar. */
+static double
+wspop_body_h(void)
+{
+    return MENU_PADDING + WS_WP_BTN_H + MENU_PADDING +
+           WS_ACT_ROWS * (WS_WP_BTN_H + MENU_PADDING) +
+           BLUE_BOX_H + MENU_PADDING + WS_BTN_SIZE + MENU_PADDING;
 }
 
 static int
 wspop_height(void)
 {
-    return MENU_FLOAT_GAP + MENU_PADDING + WS_WP_BTN_H + MENU_PADDING +
-           BLUE_BOX_H + MENU_PADDING + WS_BTN_SIZE + MENU_PADDING;
+    return PPADDING + wspop_body_h();
+}
+
+/* Row tops, all derived so drawing and hit-testing cannot drift apart. */
+static double
+wspop_wall_y(void)
+{
+    return g_wspop.y + MENU_PADDING;
+}
+
+/* Top of quick-action row r (0 = Speedtest/Screenshot, 1 = Fastfetch). */
+static double
+wspop_act_row_y(int r)
+{
+    return wspop_wall_y() + WS_WP_BTN_H + MENU_PADDING +
+           r * (WS_WP_BTN_H + MENU_PADDING);
 }
 
 static double
 wspop_blue_y(void)
 {
-    return g_wspop.y + MENU_PADDING + WS_WP_BTN_H + MENU_PADDING;
+    return wspop_act_row_y(WS_ACT_ROWS - 1) + WS_WP_BTN_H + MENU_PADDING;
+}
+
+static double
+wspop_ws_y(void)
+{
+    return wspop_blue_y() + BLUE_BOX_H + MENU_PADDING;
+}
+
+/* Geometry of quick-action button i. Buttons in a row share the inner width
+ * evenly; a button alone in its row spans all of it. Col is the button's
+ * position within its own row. */
+static double
+wspop_act_x(int i)
+{
+    int r = ws_act_row[i];
+    int col = 0;
+    for (int k = 0; k < i; k++)
+        if (ws_act_row[k] == r) col++;
+    return g_wspop.x + MENU_PADDING +
+           col * (g_wspop.act_w[ws_act_row[i]] + WS_ACT_BTN_GAP);
+}
+
+static double
+wspop_act_w(int i)
+{
+    return g_wspop.act_w[ws_act_row[i]];
+}
+
+static double
+wspop_act_y(int i)
+{
+    return wspop_act_row_y(ws_act_row[i]);
 }
 
 static void
@@ -4155,30 +4560,31 @@ wspop_open(void)
     g_wspop.open = 1;
     g_wspop.hover_row = -1;
 
-    double pw = wspop_width();
-    double body_h = MENU_PADDING + WS_WP_BTN_H + MENU_PADDING +
-                    BLUE_BOX_H + MENU_PADDING + WS_BTN_SIZE + MENU_PADDING;
+    double pw = popup_panel_width();
     double icon_center = workspace_icon_x() + WS_ICON_SIZE / 2.0;
-    double px = icon_center - pw / 2.0;
-    if (px < 0) px = 0;
-    if (px + pw > g_bar.width) px = g_bar.width - pw;
-    if (px < 0) px = 0;
-
-    g_wspop.x = px;
+    g_wspop.x = popup_place_x(icon_center, pw, PPADDING);
     g_wspop.y = 0;
     g_wspop.w = pw;
-    g_wspop.h = body_h;
+    g_wspop.h = wspop_body_h();
+
+    /* Quick-action rows: split each row's share of the inner width evenly
+     * between that row's buttons */
+    for (int r = 0; r < WS_ACT_ROWS; r++) {
+        int n = ws_act_row_n(r);
+        g_wspop.act_w[r] = (pw - MENU_PADDING * 2 -
+                            (n - 1) * WS_ACT_BTN_GAP) / n;
+    }
 
     /* Night light block geometry */
     double bl_y = wspop_blue_y();
-    double box_right = px + pw - MENU_PADDING;
+    double box_right = g_wspop.x + pw - MENU_PADDING;
 
     g_wspop.blue_toggle_x = box_right - BLUE_TOGGLE_RPAD - BLUE_TOGGLE_W;
     g_wspop.blue_toggle_y = bl_y + (BLUE_HEADER_H - BLUE_TOGGLE_H) / 2.0;
 
     g_wspop.blue_sy = bl_y + BLUE_HEADER_H + BLUE_SLIDER_TOP +
                       BLUE_SLIDER_H / 2.0;
-    g_wspop.blue_sx = px + MENU_PADDING + 8.0;
+    g_wspop.blue_sx = g_wspop.x + MENU_PADDING + 8.0;
     g_wspop.blue_sxmax = box_right - 8.0 - 46.0;
     if (g_wspop.blue_sxmax < g_wspop.blue_sx)
         g_wspop.blue_sxmax = g_wspop.blue_sx;
@@ -4202,9 +4608,16 @@ wspop_hit_test(double px, double py)
     if (!g_wspop.open) return -1;
 
     /* Wallpaper button row (returned as -2) */
-    double wp_y = g_wspop.y + MENU_PADDING;
+    double wp_y = wspop_wall_y();
     if (in_rect(px, py, g_wspop.x, wp_y, g_wspop.w, WS_WP_BTN_H))
         return -2;
+
+    /* Quick-action buttons (returned as -5, -6, -7) */
+    for (int i = 0; i < WS_ACT_COUNT; i++) {
+        if (in_rect(px, py, wspop_act_x(i), wspop_act_y(i),
+                    wspop_act_w(i), WS_WP_BTN_H))
+            return WS_ACT_HIT_BASE - i;
+    }
 
     /* Night light toggle (returned as -3) */
     if (in_rect(px, py, g_wspop.blue_toggle_x, g_wspop.blue_toggle_y,
@@ -4217,7 +4630,7 @@ wspop_hit_test(double px, double py)
         return -4;
 
     /* Workspace button row */
-    double btn_y = bl_y + BLUE_BOX_H + MENU_PADDING;
+    double btn_y = wspop_ws_y();
     if (!in_rect(px, py, g_wspop.x, btn_y, g_wspop.w, WS_BTN_SIZE)) return -1;
     double step = WS_BTN_SIZE + WS_BTN_GAP;
     double rel = px - g_wspop.x - MENU_PADDING;
@@ -4251,34 +4664,9 @@ blue_state_path(void)
 }
 
 static void
-blue_kill(void)
-{
-    DIR *proc = opendir("/proc");
-    if (!proc) return;
-    struct dirent *de;
-    char ppath[512], comm[64];
-    while ((de = readdir(proc)) != NULL) {
-        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
-        snprintf(ppath, sizeof(ppath), "/proc/%s/comm", de->d_name);
-        int fd = open(ppath, O_RDONLY);
-        if (fd < 0) continue;
-        ssize_t n = read(fd, comm, 63);
-        close(fd);
-        if (n > 0) {
-            comm[n] = '\0';
-            char *nl = strchr(comm, '\n');
-            if (nl) *nl = '\0';
-            if (strcmp(comm, "wlsunset") == 0)
-                kill((pid_t)atoi(de->d_name), SIGTERM);
-        }
-    }
-    closedir(proc);
-}
-
-static void
 blue_apply(void)
 {
-    blue_kill();
+    kill_comm("wlsunset");
     if (!g_wspop.blue_on) return;
 
     int temp = blue_cur_temp();
@@ -4453,7 +4841,7 @@ cal_first_weekday(int year, int mon)
 static int
 calpop_height(void)
 {
-    return MENU_FLOAT_GAP + MENU_PADDING * 2 +
+    return PPADDING + MENU_PADDING * 2 +
            CAL_HEADER_H + CAL_DOW_H + 6 * CAL_CELL_H;
 }
 
@@ -4470,16 +4858,11 @@ calpop_open(void)
     g_calpop.view_year = tm.tm_year + 1900;
     g_calpop.view_mon = tm.tm_mon;
 
-    double pw = CAL_WIDTH;
+    double pw = popup_panel_width();
     double ph = calpop_height();
     double bell_left = g_bar.width - TRAY_EDGE_PAD - NOTIF_ICON_SIZE;
     double clock_cx = bell_left - TRAY_GAP - time_text_width() / 2.0;
-    double px = clock_cx - pw / 2.0;
-    if (px + pw > g_bar.width - TRAY_EDGE_PAD)
-        px = g_bar.width - TRAY_EDGE_PAD - pw;
-    if (px < 0) px = 0;
-
-    g_calpop.x = px;
+    g_calpop.x = popup_place_x(clock_cx, pw, PPADDING);
     g_calpop.y = 0;
     g_calpop.w = pw;
     g_calpop.h = ph;
@@ -4508,6 +4891,80 @@ calpop_step(int dir)
         g_calpop.view_year++;
     }
     render_request();
+}
+
+/* ---------------------------------------------------------------------------
+ * Weather forecast popup (weather click)
+ * ------------------------------------------------------------------------- */
+
+static struct {
+    int open;
+    double x, y;
+    double w, h;
+} g_wxpop;
+
+static PangoFontDescription *
+wx_font(void)
+{
+    static PangoFontDescription *fd = NULL;
+    if (!fd) {
+        fd = pango_font_description_from_string(FONT_FAMILY);
+        pango_font_description_set_absolute_size(fd, WX_FONT_SIZE * PANGO_SCALE);
+    }
+    return fd;
+}
+
+static PangoFontDescription *
+wx_head_font(void)
+{
+    static PangoFontDescription *fd = NULL;
+    if (!fd) {
+        fd = pango_font_description_from_string(FONT_FAMILY);
+        pango_font_description_set_absolute_size(fd, WX_FONT_HEAD * PANGO_SCALE);
+    }
+    return fd;
+}
+
+static PangoFontDescription *
+wx_small_font(void)
+{
+    static PangoFontDescription *fd = NULL;
+    if (!fd) {
+        fd = pango_font_description_from_string(FONT_FAMILY);
+        pango_font_description_set_absolute_size(fd, WX_FONT_SMALL * PANGO_SCALE);
+    }
+    return fd;
+}
+
+/* Fixed row count, so the popup does not resize the layer surface as data
+ * arrives -- the empty rows just stay blank. */
+static int
+wxpop_height(void)
+{
+    return PPADDING + MENU_PADDING * 2 + WX_HEAD_H + WEATHER_DAYS * WX_ROW_H;
+}
+
+static void
+wxpop_open(void)
+{
+    g_wxpop.open = 1;
+
+    double pw = popup_panel_width();
+    double ph = wxpop_height();
+    /* Centred on the weather item, then pulled inside the bar's edges. */
+    g_wxpop.x = popup_place_x(wx_x() + wx_width() / 2.0, pw, PPADDING);
+    g_wxpop.y = 0;
+    g_wxpop.w = pw;
+    g_wxpop.h = ph;
+    popup_size_changed();
+}
+
+static void
+wxpop_close(void)
+{
+    if (!g_wxpop.open) return;
+    g_wxpop.open = 0;
+    popup_size_changed();
 }
 
 static int
@@ -4612,6 +5069,13 @@ static struct wall_popup g_wlp = { 0 };
 
 static void rounded_rect(cairo_t *cr, double x, double y, double w,
                          double h, double r);
+static void draw_hover_row(cairo_t *cr, double x, double y, double w, double h,
+                           double r, double a);
+static void draw_toggle(cairo_t *cr, double x, double y, double w, double h,
+                        int on, int on_hex, int hover);
+static void draw_slider(cairo_t *cr, double x, double y, double w, double h,
+                        double pct, double knob_r, int accent, double fill_a,
+                        double knob_a, int drag);
 static void draw_hover_circle(cairo_t *cr, double cx, double cy,
                               double icon_sz, double pad);
 static PangoFontDescription *notif_font(void);
@@ -4752,14 +5216,14 @@ static void
 notifpop_recalc_layout(void)
 {
     double pw = NOTIF_POPUP_WIDTH;
-    double px = g_bar.width - TRAY_EDGE_PAD - pw;
+    double px = popup_place_x(bell_center_x(), pw, PPADDING);
     g_npop.x = px;
     g_npop.y = 0;
     g_npop.w = pw;
     g_npop.list_y = NOTIF_HEADER_H + 1 + 4;
     g_npop.list_h = NOTIF_VISIBLE_ROWS * NOTIF_ROW_H;
     g_npop.h = g_npop.list_y + g_npop.list_h + NOTIF_LIST_BOTTOM_PAD +
-               MENU_FLOAT_GAP;
+               PPADDING;
     g_npop.max_scroll = fmax(0.0, g_n_notifs * NOTIF_ROW_H - g_npop.list_h);
     if (g_npop.scroll > g_npop.max_scroll) g_npop.scroll = g_npop.max_scroll;
     if (g_npop.scroll < 0) g_npop.scroll = 0;
@@ -5162,10 +5626,10 @@ wlp_height(void)
 {
     int rows = wlp_rows();
     if (rows >= WALL_VISIBLE_ROWS)
-        return MENU_FLOAT_GAP + POPUP_BODY_H;
+        return PPADDING + POPUP_BODY_H;
     int content = WALL_HEADER_H + MENU_PADDING +
                   rows * (WALL_THUMB_H + WALL_LABEL_H + WALL_THUMB_GAP) +
-                  MENU_PADDING + MENU_FLOAT_GAP;
+                  MENU_PADDING + PPADDING;
     return content;
 }
 
@@ -5184,10 +5648,7 @@ wlp_open(void)
 
     double pw = wlp_width();
     double ph = wlp_height();
-    double px = (g_bar.width - pw) / 2.0;
-    if (px < 0) px = 0;
-
-    g_wlp.x = px;
+    g_wlp.x = popup_place_x(g_bar.width / 2.0, pw, PPADDING);
     g_wlp.y = 0;
     g_wlp.w = pw;
     g_wlp.h = ph;
@@ -5258,7 +5719,7 @@ static int
 wlp_hit_test(double px, double py)
 {
     if (!g_wlp.open) return -1;
-    double body_h = g_wlp.h - MENU_FLOAT_GAP;
+    double body_h = g_wlp.h - PPADDING;
     if (!in_rect(px, py, g_wlp.x, g_wlp.y, g_wlp.w, body_h)) return -1;
 
     double gy = g_wlp.y + WALL_HEADER_H + MENU_PADDING - g_wlp.scroll;
@@ -5298,27 +5759,7 @@ static void
 wlp_set_wallpaper(const char *path)
 {
     /* Kill old wbg */
-    DIR *proc = opendir("/proc");
-    if (proc) {
-        struct dirent *de;
-        char ppath[512], comm[64];
-        while ((de = readdir(proc)) != NULL) {
-            if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
-            snprintf(ppath, sizeof(ppath), "/proc/%s/comm", de->d_name);
-            int fd = open(ppath, O_RDONLY);
-            if (fd < 0) continue;
-            ssize_t n = read(fd, comm, 63);
-            close(fd);
-            if (n > 0) {
-                comm[n] = '\0';
-                char *nl = strchr(comm, '\n');
-                if (nl) *nl = '\0';
-                if (strcmp(comm, "wbg") == 0)
-                    kill((pid_t)atoi(de->d_name), SIGTERM);
-            }
-        }
-        closedir(proc);
-    }
+    kill_comm("wbg");
 
     /* Launch new wbg */
     char wbg_cmd[600];
@@ -5383,31 +5824,6 @@ wlp_toggle_hit_test(double px, double py)
 }
 
 static void
-wlp_kill_wbg(void)
-{
-    DIR *proc = opendir("/proc");
-    if (!proc) return;
-    struct dirent *de;
-    char ppath[512], comm[64];
-    while ((de = readdir(proc)) != NULL) {
-        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
-        snprintf(ppath, sizeof(ppath), "/proc/%s/comm", de->d_name);
-        int fd = open(ppath, O_RDONLY);
-        if (fd < 0) continue;
-        ssize_t n = read(fd, comm, 63);
-        close(fd);
-        if (n > 0) {
-            comm[n] = '\0';
-            char *nl = strchr(comm, '\n');
-            if (nl) *nl = '\0';
-            if (strcmp(comm, "wbg") == 0)
-                kill((pid_t)atoi(de->d_name), SIGTERM);
-        }
-    }
-    closedir(proc);
-}
-
-static void
 wlp_toggle_power(void)
 {
     g_wlp.enabled = !g_wlp.enabled;
@@ -5416,7 +5832,7 @@ wlp_toggle_power(void)
             wlp_set_wallpaper(g_wlp.cur_wallpaper);
         run_cmd("notify-send 'Wallpaper' 'Enabled'", 0);
     } else {
-        wlp_kill_wbg();
+        kill_comm("wbg");
         run_cmd("notify-send 'Wallpaper' 'Disabled'", 0);
     }
     wlp_save_wallpaper(g_wlp.cur_wallpaper);
@@ -5432,26 +5848,7 @@ wlp_draw_power_toggle(cairo_t *cr)
     int on = g_wlp.enabled;
     int hover = g_wlp.hover_power;
 
-    cairo_set_source_rgba(cr, COLOR(MENU_BORDER_HEX), 1.0);
-    cairo_set_line_width(cr, 1);
-    cairo_new_path(cr);
-    rounded_rect(cr, rx, ry, WLP_TOGGLE_W, WLP_TOGGLE_H, WLP_TOGGLE_H / 2.0);
-    cairo_stroke(cr);
-
-    cairo_set_source_rgba(cr, on ? 0.25 : 0.12, on ? 0.5 : 0.2, on ? 0.4 : 0.2,
-                          hover ? 1.0 : 0.9);
-    cairo_new_path(cr);
-    rounded_rect(cr, rx + 1, ry + 1, WLP_TOGGLE_W - 2, WLP_TOGGLE_H - 2,
-                 (WLP_TOGGLE_H - 2) / 2.0);
-    cairo_fill(cr);
-
-    double knob_d = WLP_TOGGLE_H - 6;
-    double kx = on ? rx + WLP_TOGGLE_W - knob_d - 3 : rx + 3;
-    double ky = ry + 3;
-    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, hover ? 1.0 : 0.85);
-    cairo_new_path(cr);
-    cairo_arc(cr, kx + knob_d / 2.0, ky + knob_d / 2.0, knob_d / 2.0, 0, 2 * M_PI);
-    cairo_fill(cr);
+    draw_toggle(cr, rx, ry, WLP_TOGGLE_W, WLP_TOGGLE_H, on, 0x408066, hover);
 }
 
 static void
@@ -5474,8 +5871,8 @@ wlp_draw(cairo_t *cr, PangoLayout *pl)
     double px = g_wlp.x;
     double py = g_wlp.y;
     double pw = g_wlp.w;
-    double body_h = g_wlp.h - MENU_FLOAT_GAP;
-    double r = MENU_CORNER_R;
+    double body_h = g_wlp.h - PPADDING;
+    double r = PRADIUS;
 
     panel_begin(cr, px, py, pw, body_h, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
 
@@ -5521,10 +5918,8 @@ wlp_draw(cairo_t *cr, PangoLayout *pl)
 
         /* Thumbnail background */
         if (hover) {
-            cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-            cairo_new_path(cr);
-            rounded_rect(cr, cx, cy, WALL_THUMB_W, WALL_THUMB_H, 4);
-            cairo_fill(cr);
+            draw_hover_row(cr, cx, cy, WALL_THUMB_W, WALL_THUMB_H,
+                           4, MENU_HOVER_A);
         }
 
         /* Thumbnail image */
@@ -5613,9 +6008,8 @@ notif_draw_row(cairo_t *cr, PangoLayout *pl, int row)
     cairo_fill(cr);
 
     if (g_npop.hover_row == row) {
-        cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A * 0.5);
-        rounded_rect(cr, g_npop.rows_x, box_y, row_w, box_h, 6);
-        cairo_fill(cr);
+        draw_hover_row(cr, g_npop.rows_x, box_y, row_w, box_h,
+                       6, MENU_HOVER_A * 0.5);
     }
 
     GString *t = g_string_new("<b>");
@@ -5850,6 +6244,70 @@ rounded_rect(cairo_t *cr, double x, double y, double w, double h, double r)
     cairo_close_path(cr);
 }
 
+/* An on/off pill: border, tinted fill, knob. Both toggles share the off tint;
+ * only the lit colour differs (the wallpaper toggle's is a muted green rather
+ * than the night light's amber), so `on_hex` is passed in per call site. */
+static void
+draw_toggle(cairo_t *cr, double x, double y, double w, double h, int on,
+            int on_hex, int hover)
+{
+    cairo_set_source_rgba(cr, COLOR(PBCOLOR), PBALPHA);
+    cairo_set_line_width(cr, 1);
+    cairo_new_path(cr);
+    rounded_rect(cr, x, y, w, h, h / 2.0);
+    cairo_stroke(cr);
+
+    cairo_set_source_rgba(cr, COLOR(on ? on_hex : 0x1F3333), hover ? 1.0 : 0.9);
+    cairo_new_path(cr);
+    rounded_rect(cr, x + 1, y + 1, w - 2, h - 2, (h - 2) / 2.0);
+    cairo_fill(cr);
+
+    double kd = h - 6;
+    double kx = on ? x + w - kd - 3 : x + 3;
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, hover ? 1.0 : 0.85);
+    cairo_new_path(cr);
+    cairo_arc(cr, kx + kd / 2.0, y + 3 + kd / 2.0, kd / 2.0, 0, 2 * M_PI);
+    cairo_fill(cr);
+}
+
+/* Track, fill and knob, shared by the volume and night-light sliders. x is the
+ * left end of the track and y its centre line, so the knob lands on y. pct is
+ * 0-100 and is clamped, so callers can pass a raw value. The fill is the
+ * accent when accent is non-zero and the neutral fill colour otherwise; drag
+ * repaints the knob in the accent while the slider is being dragged. */
+static void
+draw_slider(cairo_t *cr, double x, double y, double w, double h, double pct,
+            double knob_r, int accent, double fill_a, double knob_a, int drag)
+{
+    double r = h / 2.0;
+    double fw = clampd(w * (pct > 100 ? 1.0 : pct / 100.0), 0, w);
+
+    cairo_set_source_rgba(cr, COLOR(VOL_SLIDER_BG_HEX), VOL_SLIDER_BG_A);
+    cairo_new_path(cr);
+    rounded_rect(cr, x, y - r, w, h, r);
+    cairo_fill(cr);
+
+    if (accent)
+        cairo_set_source_rgba(cr, COLOR(accent), fill_a);
+    else
+        cairo_set_source_rgba(cr, COLOR(VOL_SLIDER_FILL_HEX), VOL_SLIDER_FILL_A);
+    cairo_new_path(cr);
+    /* Below one knob diameter the fill would poke out past the track's rounded
+     * cap, so it is drawn square there instead. */
+    if (fw >= r * 2)
+        rounded_rect(cr, x, y - r, fw, h, r);
+    else
+        cairo_rectangle(cr, x, y - r, fw, h);
+    cairo_fill(cr);
+
+    cairo_set_source_rgba(cr, COLOR(FG_HEX), knob_a);
+    if (drag)
+        cairo_set_source_rgba(cr, COLOR(accent), 1.0);
+    cairo_new_path(cr);
+    cairo_arc(cr, x + fw, y, knob_r, 0, 2 * M_PI);
+    cairo_fill(cr);
+}
+
 static void
 draw_shadow(cairo_t *cr, double x, double y, double w, double h, double r, double sw, double sa)
 {
@@ -5869,17 +6327,17 @@ panel_begin(cairo_t *cr, double x, double y, double w, double h, double r,
     draw_shadow(cr, x, y, w, h, r, sh_w, sh_a);
 
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-    cairo_set_source_rgba(cr, COLOR(MENU_BG_HEX), MENU_BG_A);
+    cairo_set_source_rgba(cr, COLOR(BG_HEX), BG_A);
     cairo_new_path(cr);
     rounded_rect(cr, x, y, w, h, r);
     cairo_fill(cr);
 
-    cairo_set_source_rgba(cr, COLOR(MENU_BORDER_HEX), MENU_BORDER_A);
-    cairo_set_line_width(cr, MENU_BORDER_W);
+    cairo_set_source_rgba(cr, COLOR(PBCOLOR), PBALPHA);
+    cairo_set_line_width(cr, PBWIDTH);
     cairo_new_path(cr);
     if (inset_border) {
-        rounded_rect(cr, x + MENU_BORDER_W / 2.0, y + MENU_BORDER_W / 2.0,
-                     w - MENU_BORDER_W, h - MENU_BORDER_W, r);
+        rounded_rect(cr, x + PBWIDTH / 2.0, y + PBWIDTH / 2.0,
+                     w - PBWIDTH, h - PBWIDTH, r);
     } else {
         rounded_rect(cr, x, y, w, h, r);
     }
@@ -5917,15 +6375,14 @@ draw_icon_fit(cairo_t *cr, cairo_surface_t *sf, double x, double y,
 static void
 draw_active_indicator(cairo_t *cr, double px_x, double item_w, int focused)
 {
-    double by = bar_y_offset();
     cairo_set_source_rgba(cr, COLOR(FG_HEX), 1.0);
     cairo_new_path(cr);
     if (focused) {
         double lw = 18, lh = 2;
-        cairo_rectangle(cr, px_x + (item_w - lw) / 2.0, by + BAR_HEIGHT - 4, lw, lh);
+        cairo_rectangle(cr, px_x + (item_w - lw) / 2.0, BAR_HEIGHT - 4, lw, lh);
     } else {
         double dw = 4, dh = 2;
-        cairo_rectangle(cr, px_x + (item_w - dw) / 2.0, by + BAR_HEIGHT - 4, dw, dh);
+        cairo_rectangle(cr, px_x + (item_w - dw) / 2.0, BAR_HEIGHT - 4, dw, dh);
     }
     cairo_fill(cr);
 }
@@ -5963,24 +6420,13 @@ draw_launcher_item(cairo_t *cr, cairo_surface_t *icon, double px_x, double item_
                    int hovered, int focused, int draw_active, int badge_count)
 {
     double row_y = bar_y + (bar_h - icon_size) / 2.0;
+    double hx = px_x + (item_w - icon_size) / 2.0 - 4;
+    double hw = icon_size + 8, hh = bar_h - 4;
 
-    if (focused) {
-        double hx = px_x + (item_w - icon_size) / 2.0 - 4;
-        cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), FOCUS_HOVER_A);
-        cairo_new_path(cr);
-        rounded_rect(cr, hx, bar_y + 2, icon_size + 8, bar_h - 4,
-                     (bar_h - 4) / 2.0);
-        cairo_fill(cr);
-    }
-
-    if (hovered) {
-        double hx = px_x + (item_w - icon_size) / 2.0 - 4;
-        cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-        cairo_new_path(cr);
-        rounded_rect(cr, hx, bar_y + 2, icon_size + 8, bar_h - 4,
-                     (bar_h - 4) / 2.0);
-        cairo_fill(cr);
-    }
+    if (focused)
+        draw_hover_row(cr, hx, bar_y + 2, hw, hh, hh / 2.0, FOCUS_HOVER_A);
+    if (hovered)
+        draw_hover_row(cr, hx, bar_y + 2, hw, hh, hh / 2.0, MENU_HOVER_A);
 
     draw_icon_fit(cr, icon, px_x, row_y, item_w, icon_size, icon_size, 1);
     if (draw_active)
@@ -6014,6 +6460,193 @@ draw_speaker(cairo_t *cr, double cx, double cy, double a, double b,
     cairo_stroke(cr);
 }
 
+/* Weather glyphs, in the solid style the Windows tray uses: filled silhouettes
+ * rather than hairline outlines, which is what keeps them readable in a 14px
+ * box. Everything is drawn on the unit grid the other icons here use -- the box
+ * is (x, y, sz) and the ink stays inside it.
+ *
+ * The cloud is a filled three-arc silhouette, small-big-small, with a flat
+ * foot for the precipitation to hang off. Where a sun peeks out from behind the
+ * cloud it is drawn first, so the cloud simply paints over it and the visible
+ * part of it reads as an occluded disc. */
+
+static void
+wx_sun(cairo_t *cr, double cx, double cy, double sz,
+       double r, double ray_in, double ray_out)
+{
+    cairo_new_path(cr);
+    cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
+    cairo_fill(cr);
+
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_width(cr, sz * WEATHER_STROKE_W);
+    for (int i = 0; i < 8; i++) {
+        double a = i * M_PI / 4.0;
+        cairo_move_to(cr, cx + cos(a) * ray_in, cy + sin(a) * ray_in);
+        cairo_line_to(cr, cx + cos(a) * ray_out, cy + sin(a) * ray_out);
+    }
+    cairo_stroke(cr);
+}
+
+/* Filled cloud, flat foot at y + sz*base_f. cx_f is the middle of the silhouette
+ * and w_f its width, both as fractions of the box, so a cloud can be shifted
+ * aside to leave room for a sun. */
+static void
+wx_cloud(cairo_t *cr, double x, double y, double sz,
+         double cx_f, double w_f, double base_f)
+{
+    double cw = sz * w_f;
+    double cl = x + sz * cx_f - cw / 2.0;
+    double base = y + sz * base_f;
+    double r2 = cw / 2.5;
+    /* Derived so the three arcs always sum to exactly cw, which keeps the
+     * silhouette inside the box whatever widths it is asked for. */
+    double r1 = (cw - 2.0 * r2) / 4.0;
+    double c1 = cl + r1;
+    double c2 = c1 + r1 + r2;
+    double c3 = c2 + r2 + r1;
+
+    cairo_new_path(cr);
+    cairo_move_to(cr, cl, base);
+    cairo_arc(cr, c1, base, r1, M_PI, 2 * M_PI);
+    cairo_arc(cr, c2, base, r2, M_PI, 2 * M_PI);
+    cairo_arc(cr, c3, base, r1, M_PI, 2 * M_PI);
+    cairo_close_path(cr);
+    cairo_fill(cr);
+}
+
+/* Slanted rain streaks, n of them spread across the middle of the box. */
+static void
+wx_rain(cairo_t *cr, double x, double y, double sz,
+        double top_f, double bot_f, int n)
+{
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_width(cr, sz * WEATHER_STROKE_W);
+    for (int i = 0; i < n; i++) {
+        double px = x + sz * (n == 1 ? 0.5 : 0.32 + i * (0.36 / (n - 1)));
+        cairo_new_path(cr);
+        cairo_move_to(cr, px, y + sz * top_f);
+        cairo_line_to(cr, px - sz * 0.07, y + sz * bot_f);
+        cairo_stroke(cr);
+    }
+}
+
+static void
+wx_snow(cairo_t *cr, double cx, double cy, double sz, double r)
+{
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_width(cr, sz * WEATHER_STROKE_W);
+    for (int i = 0; i < 3; i++) {
+        double a = i * M_PI / 3.0;
+        cairo_move_to(cr, cx - cos(a) * r, cy - sin(a) * r);
+        cairo_line_to(cr, cx + cos(a) * r, cy + sin(a) * r);
+    }
+    cairo_stroke(cr);
+}
+
+/* Filled lightning bolt. */
+static void
+wx_bolt(cairo_t *cr, double x, double y, double sz)
+{
+    double bw = sz * 0.30, bh = sz * 0.27;
+    double bx = x + sz * 0.35, by = y + sz * 0.68;
+
+    cairo_new_path(cr);
+    cairo_move_to(cr, bx + bw * 0.60, by);
+    cairo_line_to(cr, bx, by + bh * 0.52);
+    cairo_line_to(cr, bx + bw * 0.32, by + bh * 0.52);
+    cairo_line_to(cr, bx + bw * 0.20, by + bh);
+    cairo_line_to(cr, bx + bw, by + bh * 0.40);
+    cairo_line_to(cr, bx + bw * 0.64, by + bh * 0.40);
+    cairo_close_path(cr);
+    cairo_fill(cr);
+}
+
+static void
+draw_wx_icon(cairo_t *cr, double x, double y, double sz, int cond)
+{
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+    cairo_set_source_rgba(cr, COLOR(FG_HEX), FG_A);
+
+    switch (cond) {
+    case WX_CLEAR:
+        wx_sun(cr, x + sz * 0.50, y + sz * 0.50, sz, sz * 0.19,
+               sz * 0.27, sz * 0.42);
+        break;
+    case WX_PARTLY:
+        /* Sun up-left with short stubby rays, cloud shifted down and right so
+         * the disc is only clipped at its lower right. */
+        wx_sun(cr, x + sz * 0.28, y + sz * 0.27, sz, sz * 0.115,
+               sz * 0.145, sz * 0.205);
+        wx_cloud(cr, x, y, sz, 0.58, 0.78, 0.86);
+        break;
+    case WX_FOG:
+        /* No cloud, as on the Windows icon: stacked bars standing in for haze. */
+        for (int i = 0; i < 4; i++) {
+            double fy = y + sz * (0.16 + i * 0.22);
+            double inset = (i % 2) ? sz * 0.10 : 0;
+            cairo_new_path(cr);
+            rounded_rect(cr, x + sz * 0.05 + inset, fy,
+                         sz * 0.90 - inset * 2, sz * 0.075, sz * 0.0375);
+            cairo_fill(cr);
+        }
+        break;
+    default: {
+        /* A bare cloud sits centred; one that also has precipitation rides
+         * higher to leave the bottom third of the box free for it. A shower
+         * gets a sun tucked behind it, drawn first so the cloud paints over. */
+        if (cond == WX_SHOWERS) {
+            wx_sun(cr, x + sz * 0.27, y + sz * 0.27, sz, sz * 0.115,
+                   sz * 0.145, sz * 0.19);
+            wx_cloud(cr, x, y, sz, 0.55, 0.84, 0.60);
+        } else if (cond == WX_CLOUDY || cond == WX_UNKNOWN) {
+            wx_cloud(cr, x, y, sz, 0.50, 0.88, 0.68);
+        } else {
+            wx_cloud(cr, x, y, sz, 0.50, 0.88, 0.60);
+        }
+
+        switch (cond) {
+        case WX_DRIZZLE:
+            wx_rain(cr, x, y, sz, 0.70, 0.90, 2);
+            break;
+        case WX_RAIN:
+        case WX_SHOWERS:
+            wx_rain(cr, x, y, sz, 0.70, 0.92, 3);
+            break;
+        case WX_SNOW: {
+            double cy = y + sz * 0.80, r = sz * 0.12;
+            wx_snow(cr, x + sz * 0.34, cy, sz, r);
+            wx_snow(cr, x + sz * 0.66, cy, sz, r);
+            break;
+        }
+        case WX_STORM:
+            wx_bolt(cr, x, y, sz);
+            break;
+        default:
+            break;
+        }
+        break;
+    }
+    }
+}
+
+/* The hover highlight behind a list row, tab or bar item. A radius of 0 gives
+ * a square row, anything else a rounded box. `a` is normally MENU_HOVER_A; the
+ * notification rows sit on a box of their own and take half that. */
+static void
+draw_hover_row(cairo_t *cr, double x, double y, double w, double h,
+               double r, double a)
+{
+    cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), a);
+    cairo_new_path(cr);
+    if (r > 0)
+        rounded_rect(cr, x, y, w, h, r);
+    else
+        cairo_rectangle(cr, x, y, w, h);
+    cairo_fill(cr);
+}
+
 static void
 draw_hover_circle(cairo_t *cr, double cx, double cy, double icon_sz, double pad)
 {
@@ -6038,7 +6671,10 @@ draw_vcenter_text(cairo_t *cr, PangoLayout *pl, const char *text,
     }
     int tw, th;
     pango_layout_get_pixel_size(pl, &tw, &th);
-    cairo_move_to(cr, x, y + (box_h - th) / 2.0);
+    /* Snap the origin to a whole pixel. On a fractional origin cairo re-hints
+     * every glyph and the stems come out visibly uneven, which reads as broken
+     * text; the half-pixel drift is invisible but the softness is not. */
+    cairo_move_to(cr, x, snap_px(y + (box_h - th) / 2.0));
     pango_cairo_show_layout(cr, pl);
     if (max_w > 0) {
         pango_layout_set_width(pl, -1);
@@ -6095,6 +6731,85 @@ draw_power_icon(int action, cairo_t *cr, double cx, double cy)
         cairo_fill(cr);
         break;
     }
+}
+
+/* Profile photo: a circle at the top of the power column, above the power
+ * icons. Falls back to a drawn avatar when PROFILE_PHOTO is unset or the file
+ * cannot be read, so the column always has something to show. */
+static cairo_surface_t *g_avatar;
+static int g_avatar_tried;
+
+static void
+avatar_load(void)
+{
+    if (g_avatar_tried) return;
+    g_avatar_tried = 1;
+    if (!PROFILE_PHOTO[0]) return;
+    cairo_surface_t *sf = png_load(PROFILE_PHOTO);
+    if (!sf) sf = icon_load_svg(PROFILE_PHOTO, PROFILE_PHOTO_SIZE);
+    g_avatar = sf;
+}
+
+static void
+avatar_ring(cairo_t *cr, double cx, double cy, double r)
+{
+    cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 0.16);
+    cairo_set_line_width(cr, 1);
+    cairo_new_path(cr);
+    cairo_arc(cr, cx, cy, r - 0.5, 0, 2 * M_PI);
+    cairo_stroke(cr);
+}
+
+static void
+avatar_default_draw(cairo_t *cr, double cx, double cy, double r)
+{
+    cairo_save(cr);
+    cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
+    cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), 1.0);
+    cairo_fill_preserve(cr);
+    cairo_clip(cr);
+
+    cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 0.5);
+    cairo_new_path(cr);
+    cairo_arc(cr, cx, cy - r * 0.2, r * 0.3, 0, 2 * M_PI);
+    cairo_fill(cr);
+    cairo_new_path(cr);
+    cairo_arc(cr, cx, cy + r * 0.9, r * 0.6, M_PI, 2 * M_PI);
+    cairo_fill(cr);
+    cairo_restore(cr);
+    avatar_ring(cr, cx, cy, r);
+}
+
+static void
+avatar_draw(cairo_t *cr, double mh_body)
+{
+    double cx = MENU_MARGIN_L + POWER_COL_W / 2.0;
+    double cy = menu_avatar_top(mh_body) + PROFILE_PHOTO_SIZE / 2.0;
+    double r = PROFILE_PHOTO_SIZE / 2.0;
+
+    avatar_load();
+    if (g_avatar) {
+        int iw = cairo_image_surface_get_width(g_avatar);
+        int ih = cairo_image_surface_get_height(g_avatar);
+        if (iw > 0 && ih > 0) {
+            /* scale by the SHORTER side so the image covers the whole circle
+             * and the overflow is cropped by the clip, rather than scaling by
+             * the longer side which would leave the circle part-filled */
+            double mn = iw < ih ? iw : ih;
+            cairo_save(cr);
+            cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
+            cairo_clip(cr);
+            cairo_translate(cr, cx - r, cy - r);
+            cairo_scale(cr, 2 * r / mn, 2 * r / mn);
+            cairo_set_source_surface(cr, g_avatar,
+                                     (mn - iw) / 2.0, (mn - ih) / 2.0);
+            cairo_paint(cr);
+            cairo_restore(cr);
+            avatar_ring(cr, cx, cy, r);
+            return;
+        }
+    }
+    avatar_default_draw(cr, cx, cy, r);
 }
 
 
@@ -6248,6 +6963,377 @@ art_download_start(const char *url, const char *cache)
     if (!msg) return;
     soup_session_send_and_read_async(g_sni.art_session, msg, G_PRIORITY_DEFAULT,
                                      NULL, art_download_finish, g_strdup(cache));
+}
+
+/* ---- weather fetching ----
+ *
+ * Open-Meteo needs no API key, so this is two plain GETs over the same
+ * libsoup session the album art already uses. The geocoding reply is cached
+ * under $XDG_CACHE_HOME/jtlab next to the art, keyed on the city name, so only
+ * a change to WEATHER_CITY costs a second request. */
+
+static const char *
+json_key(const char *js, const char *key)
+{
+    size_t klen = strlen(key);
+    for (const char *p = js; (p = strchr(p, '"')) != NULL; p++) {
+        if (strncmp(p + 1, key, klen) != 0 || p[1 + klen] != '"') continue;
+        const char *q = p + 2 + klen;
+        while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+        if (*q == ':') return q + 1;
+    }
+    return NULL;
+}
+
+static int
+json_num(const char *p, double *out)
+{
+    if (!p) return 0;
+    char *end;
+    double v = strtod(p, &end);
+    if (end == p) return 0;
+    *out = v;
+    return 1;
+}
+
+static int
+json_str(const char *p, char *out, size_t n)
+{
+    if (!p || *p != '"' || n == 0) return 0;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) p++;
+        if (i + 1 < n) out[i++] = *p;
+        p++;
+    }
+    if (*p != '"') return 0;
+    out[i] = '\0';
+    return 1;
+}
+
+/* Pointer to element i of the array whose '[' follows p, skipping over nested
+ * containers and strings. The daily forecast arrives as several parallel
+ * arrays, so this is how their entries are lined back up. */
+static const char *
+json_arr_at(const char *p, int i)
+{
+    if (!p) return NULL;
+    while (*p && *p != '[') p++;
+    if (*p != '[') return NULL;
+    p++;
+    while (i-- > 0) {
+        int depth = 0;
+        while (*p) {
+            if (*p == '"') {
+                p++;
+                while (*p && *p != '"') {
+                    if (*p == '\\' && p[1]) p++;
+                    p++;
+                }
+                if (!*p) return NULL;
+            } else if (*p == '[' || *p == '{') {
+                depth++;
+            } else if (*p == ']' || *p == '}') {
+                if (depth == 0) return NULL;
+                depth--;
+            } else if (*p == ',' && depth == 0) {
+                break;
+            }
+            p++;
+        }
+        if (*p != ',') return NULL;
+        p++;
+    }
+    return p;
+}
+
+static void
+wx_url_encode(const char *in, char *out, size_t n)
+{
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
+        if (o + 4 >= n) break;
+        if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' || *p == '~')
+            out[o++] = *p;
+        else
+            o += (size_t)snprintf(out + o, n - o, "%%%02X", *p);
+    }
+    out[o] = '\0';
+}
+
+static void
+wx_cache_path(char *out, size_t n)
+{
+    const char *cache = getenv("XDG_CACHE_HOME");
+    char dir[480];
+    if (cache && cache[0]) {
+        snprintf(dir, sizeof(dir), "%s/jtlab", cache);
+    } else {
+        const char *home = getenv("HOME");
+        snprintf(dir, sizeof(dir), "%s/.cache/jtlab", home ? home : "/tmp");
+    }
+    mkdir(dir, 0700);
+    snprintf(out, n, "%s/weather-loc", dir);
+}
+
+/* The cache records the city it was resolved for, so editing WEATHER_CITY
+ * invalidates it without anyone having to remember to delete a file. */
+static void
+wx_loc_load(void)
+{
+    char path[512];
+    wx_cache_path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[256];
+    if (!fgets(line, sizeof(line), f)) {
+        fclose(f);
+        return;
+    }
+    fclose(f);
+
+    /* A city name can contain spaces ("Cape Town"), so the two coordinates are
+     * located from the end of the line and the city is whatever precedes
+     * them, rather than scanning three fields positionally. */
+    char *p = line + strlen(line);
+    while (p > line && strchr(" \t\r\n", p[-1])) p--;
+
+    while (p > line && !strchr(" \t", p[-1])) p--;
+    char *p_lon = p;
+    while (p > line && strchr(" \t", p[-1])) p--;
+    while (p > line && !strchr(" \t", p[-1])) p--;
+    char *p_lat = p;
+    if (p_lat == line) return;
+
+    char *stop;
+    double la = strtod(p_lat, &stop);
+    if (stop == p_lat) return;
+    double lo = strtod(p_lon, &stop);
+    if (stop == p_lon) return;
+
+    char *cend = p_lat;
+    while (cend > line && strchr(" \t", cend[-1])) cend--;
+    *cend = '\0';
+    char *city = line;
+    while (*city == ' ' || *city == '\t') city++;
+
+    if (strcmp(city, WEATHER_CITY) == 0) {
+        g_wx.lat = la;
+        g_wx.lon = lo;
+        g_wx.have_loc = 1;
+    }
+}
+
+static void
+wx_loc_save(void)
+{
+    char path[512];
+    wx_cache_path(path, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%s %.6f %.6f\n", WEATHER_CITY, g_wx.lat, g_wx.lon);
+    fclose(f);
+}
+
+static void
+wx_get(const char *url, GAsyncReadyCallback cb)
+{
+    /* A SoupSession binds to the thread-default context when it is created, and
+     * only g_sni.glib_ctx is ever iterated by the main loop. tray_init() sets
+     * that up, but wx can be reached before it, so guarantee it here rather
+     * than depend on the caller's ordering. */
+    if (!g_sni.glib_ctx) {
+        g_sni.glib_ctx = g_main_context_new();
+        g_main_context_push_thread_default(g_sni.glib_ctx);
+    }
+    if (!g_wx.session) {
+        g_wx.session = soup_session_new_with_options("timeout", 15, NULL);
+        if (g_wx.session)
+            soup_session_set_user_agent(g_wx.session, WEATHER_UA);
+    }
+    if (!g_wx.session) return;
+    SoupMessage *msg = soup_message_new("GET", url);
+    if (!msg) return;
+    soup_session_send_and_read_async(g_wx.session, msg, G_PRIORITY_DEFAULT,
+                                     NULL, cb, NULL);
+}
+
+static void wx_fetch_forecast(void);
+
+/* "2026-09-26" -> "Sat", taken from the date Open-Meteo sends rather than
+ * recomputed, so the rows always line up with the numbers beside them. */
+static void
+wx_day_name(const char *iso, char *out, size_t n)
+{
+    static const char *abbr[] = { "Sun", "Mon", "Tue", "Wed",
+                                   "Thu", "Fri", "Sat" };
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%s", iso);
+    if (strptime(buf, "%Y-%m-%d", &tm) && tm.tm_wday >= 0 && tm.tm_wday < 7)
+        snprintf(out, n, "%s", abbr[tm.tm_wday]);
+    else
+        snprintf(out, n, "--");
+}
+
+static void
+wx_parse_forecast(const char *js)
+{
+    const char *cur = json_key(js, "current");
+    double temp = 0, code = 0;
+    if (!cur) return;
+    if (!json_num(json_key(cur, "temperature_2m"), &temp)) return;
+    if (!json_num(json_key(cur, "weather_code"), &code)) return;
+
+    g_wx.temp = temp;
+    g_wx.cond = wx_code_to_cond((int)code);
+    g_wx.have = 1;
+    g_wx.fetched = time(NULL);
+    g_wx.retry_at = 0;
+    snprintf(g_wx.place, sizeof(g_wx.place), "%s", WEATHER_CITY);
+
+    g_wx.n_days = 0;
+    const char *daily = json_key(js, "daily");
+    if (daily) {
+        const char *a_time = json_key(daily, "time");
+        const char *a_code = json_key(daily, "weather_code");
+        const char *a_max = json_key(daily, "temperature_2m_max");
+        const char *a_min = json_key(daily, "temperature_2m_min");
+        const char *a_rain = json_key(daily, "precipitation_probability_max");
+        for (int i = 0; i < WX_MAX_DAYS && g_wx.n_days < WEATHER_DAYS; i++) {
+            char iso[16];
+            if (!json_str(json_arr_at(a_time, i), iso, sizeof(iso))) break;
+            struct wx_day *d = &g_wx.day[g_wx.n_days];
+            wx_day_name(iso, d->name, sizeof(d->name));
+            double v;
+            d->cond = WX_UNKNOWN;
+            if (json_num(json_arr_at(a_code, i), &v))
+                d->cond = wx_code_to_cond((int)v);
+            d->tmax = json_num(json_arr_at(a_max, i), &v) ? v : 0;
+            d->tmin = json_num(json_arr_at(a_min, i), &v) ? v : 0;
+            d->rain = json_num(json_arr_at(a_rain, i), &v) ? (int)v : -1;
+            g_wx.n_days++;
+        }
+    }
+}
+
+static void
+wx_forecast_finish(GObject *src, GAsyncResult *res, gpointer data)
+{
+    (void)data;
+    GError *err = NULL;
+    GBytes *body = soup_session_send_and_read_finish(SOUP_SESSION(src), res, &err);
+    g_wx.pending = 0;
+    if (body) {
+        gsize len = 0;
+        const char *js = g_bytes_get_data(body, &len);
+        if (js) {
+            char *copy = g_strndup(js, len);
+            wx_parse_forecast(copy);
+            g_free(copy);
+        }
+        g_bytes_unref(body);
+    } else {
+        /* Hold off before retrying so a missing network does not turn the
+         * refresh timer into a request loop. */
+        g_wx.retry_at = time(NULL) + WEATHER_RETRY_SEC;
+    }
+    if (err) g_error_free(err);
+    render_request();
+}
+
+static void
+wx_fetch_forecast(void)
+{
+    char url[768];
+    snprintf(url, sizeof(url),
+             "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+             "&current=temperature_2m,weather_code"
+             "&daily=weather_code,temperature_2m_max,temperature_2m_min,"
+             "precipitation_probability_max"
+             "&timezone=auto&forecast_days=%d",
+             g_wx.lat, g_wx.lon, WEATHER_DAYS);
+    g_wx.pending = 1;
+    wx_get(url, wx_forecast_finish);
+}
+
+static void
+wx_geocode_finish(GObject *src, GAsyncResult *res, gpointer data)
+{
+    (void)data;
+    GError *err = NULL;
+    GBytes *body = soup_session_send_and_read_finish(SOUP_SESSION(src), res, &err);
+    g_wx.pending = 0;
+
+    int resolved = 0;
+    if (body) {
+        gsize len = 0;
+        const char *js = g_bytes_get_data(body, &len);
+        if (js) {
+            char *copy = g_strndup(js, len);
+            double lat, lon;
+            /* results is an array of places; count=1 means at most one. */
+            const char *hit = json_arr_at(json_key(copy, "results"), 0);
+            if (hit && json_num(json_key(hit, "latitude"), &lat) &&
+                json_num(json_key(hit, "longitude"), &lon)) {
+                g_wx.lat = lat;
+                g_wx.lon = lon;
+                g_wx.have_loc = 1;
+                resolved = 1;
+            }
+            g_free(copy);
+        }
+        g_bytes_unref(body);
+    }
+    if (err) g_error_free(err);
+
+    if (resolved) {
+        wx_loc_save();
+        wx_fetch_forecast();
+    } else {
+        g_wx.retry_at = time(NULL) + WEATHER_RETRY_SEC;
+    }
+}
+
+static void
+wx_fetch_geocode(void)
+{
+    char enc[192];
+    char url[512];
+    wx_url_encode(WEATHER_CITY, enc, sizeof(enc));
+    snprintf(url, sizeof(url),
+             "https://geocoding-api.open-meteo.com/v1/search?name=%s"
+             "&count=1&language=en&format=json", enc);
+    g_wx.pending = 1;
+    wx_get(url, wx_geocode_finish);
+}
+
+/* Called from the periodic tick. Resolves the city on the first run and after
+ * any failure, and otherwise re-pulls the forecast once the interval is up. */
+static void
+wx_maybe_refresh(void)
+{
+    if (!WEATHER_ENABLED) return;
+    if (g_wx.pending) return;
+
+    time_t now = time(NULL);
+    if (now < g_wx.retry_at) return;
+
+    if (!g_wx.have_loc) {
+        wx_loc_load();
+        if (g_wx.have_loc) {
+            if (!g_wx.have || now - g_wx.fetched >= WEATHER_REFRESH_MIN * 60)
+                wx_fetch_forecast();
+            return;
+        }
+        wx_fetch_geocode();
+        return;
+    }
+
+    if (!g_wx.have || now - g_wx.fetched >= WEATHER_REFRESH_MIN * 60)
+        wx_fetch_forecast();
 }
 
 static void
@@ -6597,7 +7683,7 @@ sys_draw_text(cairo_t *cr, double x, double y, double w, double h,
     pango_layout_get_pixel_size(pl, NULL, &th);
     cairo_new_path(cr);
     cairo_set_source_rgba(cr, r, g, b, a);
-    cairo_move_to(cr, x, y + (h - th) / 2.0);
+    cairo_move_to(cr, x, snap_px(y + (h - th) / 2.0));
     pango_cairo_show_layout(cr, pl);
     g_object_unref(pl);
     pango_font_description_free(fd);
@@ -6734,7 +7820,7 @@ sys_draw(cairo_t *cr, double mx, double my, double mh_body, double apad)
     }
 
     double sy = cy + btn_w + 8;
-    cairo_set_source_rgba(cr, COLOR(MENU_BORDER_HEX), 0.2);
+    cairo_set_source_rgba(cr, COLOR(PBCOLOR), PBALPHA * 0.7);
     cairo_set_line_width(cr, 1);
     cairo_move_to(cr, sx + SYS_PAD, sy);
     cairo_line_to(cr, sx + SYS_COL_W - SYS_PAD, sy);
@@ -6787,6 +7873,7 @@ static void
 sys_tick(void)
 {
     pw_reconnect_check();
+    wx_maybe_refresh();
     if (!g_sni.dbus_conn) {
         tray_init();
         if (g_sni.dbus_conn)
@@ -6816,26 +7903,25 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
     if (!g_bar.menu_open || mh <= 0) return;
 
     int mw = MENU_WIDTH + POWER_COL_W + SYS_COL_W;
-    double r = MENU_CORNER_R;
+    double r = PRADIUS;
     double mx = MENU_MARGIN_L;
     double my = 0;
-    double mh_body = mh - MENU_FLOAT_GAP;
+    double mh_body = mh - PPADDING;
 
         panel_begin(cr, mx, my, mw, mh_body, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
 
     static const char *power_labels[4] = {
         "Power off", "Reboot", "Log out", "Suspend",
     };
-    int power_h = 4 * POWER_ROW_H;
     double apad = menu_vert_pad(mh_body) * 2;
-    double row_base = mh_body - MENU_PADDING - power_h;
+    double row_base = menu_power_row_base(mh_body);
+    avatar_draw(cr, mh_body);
     for (int i = 0; i < 4; i++) {
         double row_y = my + row_base + i * POWER_ROW_H;
 
         if (g_pmenu.hover == i) {
-            cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-            cairo_rectangle(cr, mx, row_y, POWER_COL_W, POWER_ROW_H);
-            cairo_fill(cr);
+            draw_hover_row(cr, mx, row_y, POWER_COL_W, POWER_ROW_H,
+                           0, MENU_HOVER_A);
         }
 
         draw_power_icon(i, cr, mx + POWER_COL_W / 2.0, row_y + POWER_ROW_H / 2.0);
@@ -6871,9 +7957,8 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
         }
 
         if (g_pointer.hover_menu_idx == i) {
-            cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-            cairo_rectangle(cr, mx + POWER_COL_W, row_y, MENU_WIDTH, MENU_ROW_HEIGHT);
-            cairo_fill(cr);
+            draw_hover_row(cr, mx + POWER_COL_W, row_y, MENU_WIDTH,
+                           MENU_ROW_HEIGHT, 0, MENU_HOVER_A);
         }
 
         double text_x = mx + POWER_COL_W + MENU_PADDING + 4;
@@ -6910,7 +7995,7 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
     cairo_rectangle(cr, stx + 2, sby + 6, 2, MENU_SEARCH_H - 12);
     cairo_fill(cr);
 
-    cairo_set_source_rgba(cr, COLOR(MENU_BORDER_HEX), 0.2);
+    cairo_set_source_rgba(cr, COLOR(PBCOLOR), PBALPHA * 0.7);
     cairo_set_line_width(cr, 1);
     cairo_move_to(cr, mx + POWER_COL_W, my + apad);
     cairo_line_to(cr, mx + POWER_COL_W, my + mh_body - MENU_PADDING);
@@ -6926,7 +8011,7 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
         double cr2_y = g_ctx.y;
         double cw = CTX_WIDTH;
         double ch = g_ctx.n_items * CTX_ROW_HEIGHT;
-        double r = CTX_CORNER_R;
+        double r = PRADIUS;
 
         panel_begin(cr, cr2_x, cr2_y, cw, ch, r, CTX_SHADOW_W, CTX_SHADOW_A, 0);
 
@@ -6936,9 +8021,8 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
             double row_y = cr2_y + i * CTX_ROW_HEIGHT;
 
             if (g_pointer.hover_ctx_idx == i) {
-                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-                cairo_rectangle(cr, cr2_x, row_y, cw, CTX_ROW_HEIGHT);
-                cairo_fill(cr);
+                draw_hover_row(cr, cr2_x, row_y, cw, CTX_ROW_HEIGHT,
+                               0, MENU_HOVER_A);
             }
 
             draw_vcenter_text(cr, pl, i == 0 ? pin_label : "Launch", cr2_x + 10,
@@ -6965,13 +8049,13 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
         cairo_new_path(cr);
         rounded_rect(cr, tx, ty, tw_w, tw_h, 4);
         cairo_fill(cr);
-        cairo_set_source_rgba(cr, COLOR(MENU_BORDER_HEX), 1.0);
+        cairo_set_source_rgba(cr, COLOR(PBCOLOR), PBALPHA);
         cairo_set_line_width(cr, 1);
         cairo_new_path(cr);
         rounded_rect(cr, tx, ty, tw_w, tw_h, 4);
         cairo_stroke(cr);
         cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 1.0);
-        cairo_move_to(cr, tx + 6, ty + 4);
+        cairo_move_to(cr, snap_px(tx + 6), snap_px(ty + 4));
         pango_cairo_show_layout(cr, pl);
     }
 
@@ -7024,6 +8108,930 @@ ws_button_draw(cairo_t *cr, double bx, double by, const char *label,
                   PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_CENTER);
 }
 
+/* Outline/hover box shared by every full-width row button in the workspace
+ * popup (wallpaper, quick actions). Returns the x for the row's content. */
+static double
+wspop_row_box_draw(cairo_t *cr, double bx, double by, double bw, int hover)
+{
+    if (hover) {
+        draw_hover_row(cr, bx, by, bw, WS_WP_BTN_H, WS_WP_BTN_R,
+                       MENU_HOVER_A);
+        cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.8);
+    } else {
+        cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.45);
+    }
+    cairo_set_line_width(cr, 1.2);
+    cairo_new_path(cr);
+    rounded_rect(cr, bx, by, bw, WS_WP_BTN_H, WS_WP_BTN_R);
+    cairo_stroke(cr);
+    return bx + WS_ACT_PAD;
+}
+
+/* Every icon in the workspace popup occupies exactly the WS_WP_ICON square, so
+ * the icons in a row line up. The two below are drawn on a unit grid (0..1 in
+ * both axes, origin at the top-left of that square) and scaled by isz; each one
+ * is built to touch all four edges. Keep it that way when editing them, and
+ * mirror it in the wallpaper and night-light icons above. */
+
+/* Speedtest icon: four ascending signal bars filling the unit square. */
+static void
+wspop_speedtest_icon(cairo_t *cr, double ix, double iy, double isz)
+{
+    enum { NBARS = 4 };
+    static const double frac_h[NBARS] = { 0.34, 0.56, 0.78, 1.0 };
+    const double bar_w = 0.15;
+    /* Spread the bars so the first starts at 0 and the last ends at 1 */
+    const double step = (1.0 - bar_w) / (NBARS - 1);
+
+    for (int i = 0; i < NBARS; i++) {
+        double w = isz * bar_w;
+        double h = isz * frac_h[i];
+        cairo_new_path(cr);
+        rounded_rect(cr, ix + i * step * isz, iy + isz - h, w, h, w / 2.0);
+        cairo_fill(cr);
+    }
+}
+
+/* Screenshot icon: camera body with a viewfinder bump and a lens ring, filling
+ * the unit square (bump occupies the top fifth, body the rest). The body and
+ * lens are stroked, so they are inset by WS_ICON_INSET to keep their ink on the
+ * same square as the filled bump. */
+static void
+wspop_camera_icon(cairo_t *cr, double ix, double iy, double isz)
+{
+    const double bump_h  = 0.20;   /* top of square to top of body */
+    const double bump_x0 = 0.28, bump_x1 = 0.72;
+    const double lens_r  = 0.24;
+    const double body_y  = bump_h * isz;
+
+    /* viewfinder bump (filled: no inset needed) */
+    cairo_new_path(cr);
+    cairo_move_to(cr, ix + bump_x0 * isz, iy + body_y);
+    cairo_line_to(cr, ix + (bump_x0 + 0.07) * isz, iy);
+    cairo_line_to(cr, ix + (bump_x1 - 0.07) * isz, iy);
+    cairo_line_to(cr, ix + bump_x1 * isz, iy + body_y);
+    cairo_close_path(cr);
+    cairo_fill(cr);
+
+    /* body */
+    cairo_new_path(cr);
+    rounded_rect(cr, ix + WS_ICON_INSET, iy + body_y + WS_ICON_INSET,
+                 isz - WS_ICON_LW, isz - body_y - WS_ICON_LW, isz * 0.16);
+    cairo_stroke(cr);
+
+    /* lens */
+    cairo_new_path(cr);
+    cairo_arc(cr, ix + isz * 0.5, iy + body_y + (isz - body_y) / 2.0,
+              isz * lens_r - WS_ICON_INSET, 0, 2 * M_PI);
+    cairo_stroke(cr);
+}
+
+/* Fastfetch icon: a terminal prompt (chevron plus cursor bar) filling the unit
+ * square -- chevron touches the left, top and bottom edges, the bar reaches the
+ * right edge. Both are stroked, so the path is inset by WS_ICON_INSET to keep
+ * the ink on the same square as the other icons. */
+static void
+wspop_terminal_icon(cairo_t *cr, double ix, double iy, double isz)
+{
+    const double x0  = WS_ICON_INSET;              /* left edge of ink */
+    const double x1  = isz - WS_ICON_INSET;        /* right edge of ink */
+    const double y0  = WS_ICON_INSET;              /* top edge of ink */
+    const double y1  = isz - WS_ICON_INSET;        /* bottom edge of ink */
+    const double xm  = isz * 0.40;                 /* chevron point */
+    const double ym  = isz / 2.0;
+    const double bx  = isz * 0.56;                 /* cursor bar start */
+
+    /* chevron */
+    cairo_new_path(cr);
+    cairo_move_to(cr, ix + x0, iy + y0);
+    cairo_line_to(cr, ix + xm, iy + ym);
+    cairo_line_to(cr, ix + x0, iy + y1);
+    cairo_stroke(cr);
+
+    /* cursor bar */
+    cairo_new_path(cr);
+    cairo_move_to(cr, ix + bx, iy + y1);
+    cairo_line_to(cr, ix + x1, iy + y1);
+    cairo_stroke(cr);
+}
+
+/* One quick-action button of the workspace popup. */
+static void
+wspop_action_draw(cairo_t *cr, int i)
+{
+    double bx = wspop_act_x(i);
+    double bw = wspop_act_w(i);
+    double by = wspop_act_y(i);
+    int hover = (g_wspop.hover_row == WS_ACT_HIT_BASE - i);
+
+    double ix = wspop_row_box_draw(cr, bx, by, bw, hover);
+    double isz = WS_WP_ICON;
+    double iy = by + (WS_WP_BTN_H - isz) / 2.0;
+
+    cairo_set_source_rgba(cr, COLOR(FG_HEX), hover ? 1.0 : 0.7);
+    cairo_set_line_width(cr, WS_ICON_LW);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+    switch (i) {
+    case WS_ACT_SCREENSHOT:
+        wspop_camera_icon(cr, ix, iy, isz);
+        break;
+    case WS_ACT_FASTFETCH:
+        wspop_terminal_icon(cr, ix, iy, isz);
+        break;
+    default:
+        wspop_speedtest_icon(cr, ix, iy, isz);
+        break;
+    }
+
+    sys_draw_text(cr, ix + isz + 8, by, bw - (isz + 8) - WS_ACT_PAD, WS_WP_BTN_H,
+                  ws_act_label[i], FONT_SIZE,
+                  COLOR(FG_HEX), hover ? 1.0 : 0.8,
+                  PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_LEFT);
+}
+
+/* Screenshot: slurp picks a region, grim captures it, and the PNG is saved as
+ * screenshot-<unix-time>.png in ~/Screenshots. The geometry comes back as a
+ * command substitution, so the region selection stays interactive.
+ *
+ * grim is chained to notify-send with && rather than notified unconditionally,
+ * so backing out of slurp stays silent and only a capture that actually landed
+ * is announced. mkdir -p first, or a missing ~/Screenshots would fail the save
+ * and swallow the notification that would have explained why. */
+static void
+wspop_action_screenshot(void)
+{
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+
+    char cmd[768];
+    snprintf(cmd, sizeof(cmd),
+             "mkdir -p \"%s/Screenshots\"; f=\"%s/Screenshots/screenshot-%lld.png\"; "
+             "grim -g \"$(slurp)\" \"$f\" && notify-send 'Screenshot' \"Saved to $f\"",
+             home, home, (long long)time(NULL));
+    run_cmd(cmd, 0);
+}
+
+/* Runs the action behind quick-action button i. */
+static void
+wspop_action_activate(int i)
+{
+    switch (i) {
+    case WS_ACT_SCREENSHOT:
+        wspop_action_screenshot();
+        break;
+    case WS_ACT_FASTFETCH:
+        /* Held: fastfetch prints its report and exits immediately, so the
+         * terminal would vanish before the output could be read. */
+        run_cmd_ex("fastfetch", 1, 1);
+        break;
+    case WS_ACT_SPEEDTEST:
+        /* Not held: the run takes long enough to read as it happens, and the
+         * window closing on its own signals it finished. */
+        run_cmd("speedtest-cli", 1);
+        break;
+    default:
+        break;
+    }
+}
+
+/* The nine flyouts that hang off the top of the bar. They live on their
+ * own layer surface rather than being stacked into the bar's buffer, so
+ * opening one no longer reallocates the bar or makes it repaint. Exactly
+ * one is open at a time (close_sibling_popups), which is what lets them
+ * share the single strip; bar_y_offset() is what sizes it. */
+static void
+flyout_draw(cairo_t *cr, PangoLayout *pl)
+{
+    if (g_gpopup.open) {
+        double pw = GROUP_POPUP_W;
+        double ph = g_gpopup.height - PPADDING;
+        double px = g_gpopup.x;
+        double py = g_gpopup.y;
+        double r = PRADIUS;
+
+        panel_begin(cr, px, py, pw, ph, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
+
+        for (int i = 0; i < g_gpopup.n_windows; i++) {
+            double row_y = py + MENU_PADDING + i * MENU_ROW_HEIGHT;
+            if (g_gpopup.hover_idx == i) {
+                draw_hover_row(cr, px, row_y, pw, MENU_ROW_HEIGHT,
+                               0, MENU_HOVER_A);
+            }
+            int tl_idx = g_gpopup.windows[i];
+            struct toplevel_entry *t = &g_toplevels[tl_idx];
+            double text_x = px + MENU_PADDING;
+            text_x += draw_icon_fit(cr, t->icon, text_x, row_y,
+                                    0, MENU_ROW_HEIGHT, MENU_ROW_ICON, 0);
+            double xc = px + pw - MENU_PADDING - 8;
+            double yc = row_y + MENU_ROW_HEIGHT / 2.0;
+
+            const char *title = t->title;
+            double max_text_w = xc - text_x - 10;
+            draw_vcenter_text(cr, pl, title && title[0] ? title : "(untitled)",
+                              text_x, row_y, MENU_ROW_HEIGHT,
+                              COLOR(MENU_FG_HEX), 1.0,
+                              max_text_w, 1);
+            if (g_gpopup.hover_close == i) {
+                cairo_set_source_rgba(cr, 0.85, 0.2, 0.2, 0.9);
+                cairo_new_path(cr);
+                cairo_arc(cr, xc, yc, 8, 0, 2 * M_PI);
+                cairo_fill(cr);
+                cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
+            } else {
+                cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 0.55);
+            }
+            cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+            cairo_set_line_width(cr, 1.5);
+            cairo_move_to(cr, xc - 3, yc - 3);
+            cairo_line_to(cr, xc + 3, yc + 3);
+            cairo_stroke(cr);
+            cairo_move_to(cr, xc + 3, yc - 3);
+            cairo_line_to(cr, xc - 3, yc + 3);
+            cairo_stroke(cr);
+        }
+
+        cairo_restore(cr);
+    }
+
+    if (g_cpop.open) {
+        double px = g_cpop.x;
+        double py = g_cpop.y;
+        double pw = g_cpop.w;
+        double ph = g_cpop.h - PPADDING;
+        double r = PRADIUS;
+
+        panel_begin(cr, px, py, pw, ph, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
+
+        for (int i = 0; i < g_cpop.n_items; i++) {
+            double ry = py + MENU_PADDING + i * CTX_ROW_HEIGHT;
+
+            if (g_cpop.hover == i) {
+                draw_hover_row(cr, px + 1, ry, pw - 2, CTX_ROW_HEIGHT,
+                               0, MENU_HOVER_A);
+            }
+
+            if (i > 0) {
+                cairo_set_source_rgba(cr, COLOR(PBCOLOR), PBALPHA * 1.4);
+                cairo_set_line_width(cr, 1);
+                cairo_move_to(cr, px + MENU_PADDING + 4, ry);
+                cairo_line_to(cr, px + pw - MENU_PADDING - 4, ry);
+                cairo_stroke(cr);
+            }
+
+            draw_vcenter_text(cr, pl, cpop_label(i), px + MENU_PADDING + 2, ry,
+                              CTX_ROW_HEIGHT,
+                              COLOR(MENU_FG_HEX), 1.0, 0, 0);
+        }
+
+        cairo_restore(cr);
+    }
+
+    if (g_tm.open && g_tm.n_row > 0) {
+        double px = g_tm.x;
+        double py = g_tm.y;
+        double pw = g_tm.w;
+        double ph = g_tm.height - PPADDING;
+        double r = PRADIUS;
+
+        panel_begin(cr, px, py, pw, ph, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
+
+        for (int i = 0; i < g_tm.n_row; i++) {
+            struct tray_menu_entry *e = &g_tm.e[g_tm.row[i].e_idx];
+            double row_y = g_tm.row[i].y0;
+            double row_h = g_tm.row[i].y1 - g_tm.row[i].y0;
+
+            if (e->is_separator) {
+                double sy = row_y + row_h / 2.0;
+                cairo_set_source_rgba(cr, COLOR(PBCOLOR), PBALPHA * 1.4);
+                cairo_set_line_width(cr, 1);
+                cairo_move_to(cr, px + MENU_PADDING + 4, sy);
+                cairo_line_to(cr, px + pw - MENU_PADDING - 4, sy);
+                cairo_stroke(cr);
+                continue;
+            }
+
+            if (g_tm.hover_row == i && e->enabled) {
+                draw_hover_row(cr, px + 1, row_y, pw - 2, row_h,
+                               0, MENU_HOVER_A);
+            }
+
+            double text_x = px + MENU_PADDING;
+            if (e->depth > 0)
+                text_x += e->depth * 10;
+
+            if (e->is_check || e->is_radio) {
+                double cx = px + pw - MENU_PADDING - 8;
+                double cy = row_y + row_h / 2.0;
+                int state = (e->toggle_state == 1);
+                if (e->is_radio) {
+                    cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), state ? 1.0 : 0.35);
+                    cairo_set_line_width(cr, 1.5);
+                    cairo_new_path(cr);
+                    cairo_arc(cr, cx, cy, 5, 0, 2 * M_PI);
+                    cairo_stroke(cr);
+                    if (state) {
+                        cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 1.0);
+                        cairo_new_path(cr);
+                        cairo_arc(cr, cx, cy, 2.6, 0, 2 * M_PI);
+                        cairo_fill(cr);
+                    }
+                } else {
+                    cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), state ? 1.0 : 0.35);
+                    cairo_set_line_width(cr, 2);
+                    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+                    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+                    cairo_move_to(cr, cx - 4.5, cy);
+                    cairo_line_to(cr, cx - 1.5, cy + 3.5);
+                    cairo_line_to(cr, cx + 4.5, cy - 4);
+                    cairo_stroke(cr);
+                }
+            }
+
+            const char *label = e->label;
+            draw_vcenter_text(cr, pl, label && label[0] ? label : "", text_x,
+                              row_y, row_h,
+                              COLOR(MENU_FG_HEX),
+                              e->enabled ? 1.0 : 0.4, 0, 0);
+        }
+
+        cairo_restore(cr);
+    }
+
+    if (g_volpop.open) {
+        if (g_box.audio_present)
+            audio_snapshot(&g_box.vol_snap);
+
+        double px = g_volpop.x;
+        double py = g_volpop.y;
+        double pw = g_volpop.w;
+        double body_h = g_volpop.h - PPADDING;
+        double r = PRADIUS;
+
+        panel_begin(cr, px, py, pw, body_h, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
+
+        int cur_tab = g_volpop.tab;
+        double tabw = (pw - 2 * MENU_PADDING - 4) / 2.0;
+        for (int t = 0; t < 2; t++) {
+            double tx = px + MENU_PADDING + t * (tabw + 4);
+            double ty = g_volpop.tab_y;
+            double tw = tabw;
+            double th = VOL_TAB_H;
+            if (t == cur_tab) {
+                draw_hover_row(cr, tx, ty, tw, th, 4, MENU_HOVER_A);
+            } else if (g_volpop.hover_tab == t) {
+                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), 0.6);
+                cairo_new_path(cr);
+                rounded_rect(cr, tx, ty, tw, th, 4);
+                cairo_fill(cr);
+            }
+            const char *label = t == 0 ? "Output" : "Input";
+            pango_layout_set_text(pl, label, -1);
+            int ltw, lth;
+            pango_layout_get_pixel_size(pl, &ltw, &lth);
+            cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX),
+                                  t == cur_tab ? 1.0 : 0.55);
+            cairo_move_to(cr, snap_px(tx + (tw - ltw) / 2.0),
+                          snap_px(ty + (th - lth) / 2.0));
+            pango_cairo_show_layout(cr, pl);
+        }
+
+        {
+            int want_sink = (cur_tab == 0);
+            int n_rows = volpop_list_rows();
+            int row = 0;
+            for (int i = 0; i < PW_MAX_DEVICES; i++) {
+                if (g_box.vol_snap.n_sinks + g_box.vol_snap.n_sources == 0) break;
+                if (row >= n_rows) break;
+                struct audio_snap_item *it = &g_box.vol_snap.items[i];
+                if (it->is_sink != want_sink) continue;
+                double ry = g_volpop.list_y + row * VOL_DEV_ROW_H;
+                if (g_volpop.hover_dev == row) {
+                    draw_hover_row(cr, px + 1, ry, pw - 2, VOL_DEV_ROW_H,
+                                   0, MENU_HOVER_A);
+                }
+                double rcy = ry + VOL_DEV_ROW_H / 2.0;
+                double dx = px + MENU_PADDING + 5;
+                if (it->is_default) {
+                    cairo_set_source_rgba(cr, 0.4, 0.8, 0.4, 1.0);
+                    cairo_arc(cr, dx, rcy, 4, 0, 2 * M_PI);
+                    cairo_fill(cr);
+                } else {
+                    cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX),
+                                          g_volpop.hover_dev == row ? 0.75 : 0.38);
+                    cairo_arc(cr, dx, rcy, 3.2, 0, 2 * M_PI);
+                    cairo_fill(cr);
+                }
+                const char *dtxt = it->desc[0] ? it->desc : "device";
+                pango_layout_set_text(pl, dtxt, -1);
+                int dtw, dth;
+                pango_layout_get_pixel_size(pl, &dtw, &dth);
+                double dlx = dx + 12;
+                double max_w = px + pw - MENU_PADDING - dlx;
+                if (dtw > max_w && max_w > 0) {
+                    char tmp[160];
+                    snprintf(tmp, sizeof(tmp), "%s", dtxt);
+                    while (dtw > max_w && tmp[0]) {
+                        char *u = g_utf8_prev_char(tmp + strlen(tmp));
+                        *u = '\0';
+                        pango_layout_set_text(pl, tmp, -1);
+                        pango_layout_get_pixel_size(pl, &dtw, &dth);
+                    }
+                    pango_layout_set_text(pl, tmp, -1);
+                }
+                cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 0.92);
+                cairo_move_to(cr, snap_px(dlx),
+                              snap_px(ry + (VOL_DEV_ROW_H - dth) / 2.0));
+                pango_cairo_show_layout(cr, pl);
+                row++;
+            }
+        }
+
+        double mcx = g_volpop.mute_x + g_volpop.mute_w / 2.0;
+        double mcy = g_volpop.mute_y + g_volpop.mute_h / 2.0;
+
+        if (g_volpop.hover_mute) draw_hover_circle(cr, mcx, mcy, g_volpop.mute_w, 5);
+
+        double vol = cur_tab == 0 ? g_box.vol_snap.sink_volume : g_box.vol_snap.source_volume;
+        int muted = cur_tab == 0 ? g_box.vol_snap.sink_muted : g_box.vol_snap.source_muted;
+        draw_speaker(cr, mcx, mcy, 5.5, 3, 3, 6, 4, 2.2, 4.2,
+                     muted ? 0.4 : 0.95);
+
+        if (muted) {
+            cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.95);
+            cairo_move_to(cr, mcx + 2.5, mcy - 7);
+            cairo_line_to(cr, mcx + 9.5, mcy + 7);
+            cairo_move_to(cr, mcx + 9.5, mcy - 7);
+            cairo_line_to(cr, mcx + 2.5, mcy + 7);
+            cairo_stroke(cr);
+        }
+
+        double sx = g_volpop.slider_x_min;
+        double sw = g_volpop.slider_x_max - g_volpop.slider_x_min;
+        draw_slider(cr, sx, g_volpop.slider_y, sw, VOL_SLIDER_H,
+                    g_box.vol_snap.has_value ? vol / VOLUME_MAX * 100.0 : 0.0,
+                    VOL_KNOB_R, 0, VOL_SLIDER_FILL_A, 1.0, 0);
+
+        char vlabel[8];
+        snprintf(vlabel, sizeof(vlabel), "%d%%",
+                 (int)lroundf(g_box.vol_snap.has_value ? vol : 0.0f));
+        pango_layout_set_text(pl, vlabel, -1);
+        int vtw, vth;
+        pango_layout_get_pixel_size(pl, &vtw, &vth);
+        cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 1.0);
+        cairo_move_to(cr, px + pw - MENU_PADDING - vtw,
+                      snap_px(g_volpop.slider_y - vth / 2.0));
+        pango_cairo_show_layout(cr, pl);
+        (void)vtw;
+
+        cairo_restore(cr);
+    }
+
+    if (g_wspop.open) {
+        double px = g_wspop.x;
+        double py = g_wspop.y;
+        double pw = g_wspop.w;
+        double body_h = g_wspop.h;
+        double r = PRADIUS;
+
+        panel_begin(cr, px, py, pw, body_h, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
+
+        /* Wallpaper button (top row) */
+        {
+            double wbx = px + MENU_PADDING;
+            double wby = wspop_wall_y();
+            double wbw = pw - MENU_PADDING * 2;
+            int wp_hover = (g_wspop.hover_row == -2);
+
+            double ix = wspop_row_box_draw(cr, wbx, wby, wbw, wp_hover);
+
+            /* Picture icon */
+            double isz = WS_WP_ICON;
+            double iy = wby + (WS_WP_BTN_H - isz) / 2.0;
+            double ia = wp_hover ? 1.0 : 0.7;
+            cairo_set_source_rgba(cr, COLOR(FG_HEX), ia);
+            cairo_set_line_width(cr, WS_ICON_LW);
+            cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+            cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+            /* frame (inset so its stroke lands on the WS_WP_ICON square) */
+            cairo_new_path(cr);
+            rounded_rect(cr, ix + WS_ICON_INSET, iy + WS_ICON_INSET,
+                         isz - WS_ICON_LW, isz - WS_ICON_LW, 2);
+            cairo_stroke(cr);
+            /* mountain peaks */
+            cairo_move_to(cr, ix + 2, iy + isz - 3);
+            cairo_line_to(cr, ix + isz / 2.0 - 1, iy + 4);
+            cairo_line_to(cr, ix + isz - 2, iy + isz - 3);
+            cairo_stroke(cr);
+            /* sun dot */
+            cairo_arc(cr, ix + isz - 4, iy + 4, 1.5, 0, 2 * M_PI);
+            cairo_fill(cr);
+
+            /* Label */
+            sys_draw_text(cr, ix + isz + 8, wby, wbw - isz - 20, WS_WP_BTN_H,
+                          "Wallpaper", FONT_SIZE,
+                          COLOR(FG_HEX), wp_hover ? 1.0 : 0.8,
+                          PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_LEFT);
+        }
+
+        /* Quick-action row: Speedtest / Screenshot / Fastfetch */
+        for (int i = 0; i < WS_ACT_COUNT; i++)
+            wspop_action_draw(cr, i);
+
+        /* Night light box (blue filter) -- header + slider, wallpaper-button style */
+        {
+            double bl_y = wspop_blue_y();
+            double box_x = px + MENU_PADDING;
+            double box_w = pw - MENU_PADDING * 2;
+            double hc = bl_y + BLUE_HEADER_H / 2.0;
+            int bl_hover = (g_wspop.hover_row == -3 || g_wspop.hover_row == -4);
+            int ton = g_wspop.blue_on;
+
+            if (bl_hover) {
+                draw_hover_row(cr, box_x, bl_y, box_w, BLUE_BOX_H,
+                               WS_WP_BTN_R, MENU_HOVER_A);
+                cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.8);
+                cairo_set_line_width(cr, 1.2);
+                cairo_new_path(cr);
+                rounded_rect(cr, box_x, bl_y, box_w, BLUE_BOX_H, WS_WP_BTN_R);
+                cairo_stroke(cr);
+            } else {
+                cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.45);
+                cairo_set_line_width(cr, 1.2);
+                cairo_new_path(cr);
+                rounded_rect(cr, box_x, bl_y, box_w, BLUE_BOX_H, WS_WP_BTN_R);
+                cairo_stroke(cr);
+            }
+
+            /* Moon icon (crescent) */
+            double mr = WS_WP_ICON / 2.0;
+            double mx = box_x + 10 + mr;
+            cairo_set_source_rgba(cr, COLOR(FG_HEX), ton ? 0.95 : 0.6);
+            cairo_new_path(cr);
+            cairo_arc(cr, mx, hc, mr, 0, 2 * M_PI);
+            cairo_fill(cr);
+            if (bl_hover) {
+                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
+            } else {
+                cairo_set_source_rgba(cr, COLOR(BG_HEX), BG_A);
+            }
+            cairo_new_path(cr);
+            cairo_arc(cr, mx + mr * 0.45, hc - mr * 0.15, mr * 0.72, 0, 2 * M_PI);
+            cairo_fill(cr);
+
+            /* Header label */
+            double label_x = box_x + 10 + 2 * mr + 8;
+            double label_w = g_wspop.blue_toggle_x - 8 - label_x;
+            if (label_w < 0) label_w = 0;
+            sys_draw_text(cr, label_x, bl_y, label_w, BLUE_HEADER_H,
+                          "Night light", FONT_SIZE,
+                          COLOR(FG_HEX), ton ? 0.95 : 0.7,
+                          PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_LEFT);
+
+            /* On/off toggle */
+            int thover = (g_wspop.hover_row == -3);
+            draw_toggle(cr, g_wspop.blue_toggle_x, g_wspop.blue_toggle_y,
+                        BLUE_TOGGLE_W, BLUE_TOGGLE_H, ton,
+                        BLUE_ACCENT_HEX, thover);
+        }
+
+        /* Night light slider row (blue filter) */
+        {
+            int ton = g_wspop.blue_on;
+            draw_slider(cr, g_wspop.blue_sx, g_wspop.blue_sy,
+                        g_wspop.blue_sxmax - g_wspop.blue_sx, BLUE_SLIDER_H,
+                        g_wspop.blue_pct, BLUE_KNOB_R, BLUE_ACCENT_HEX,
+                        ton ? 1.0 : 0.45, ton ? 1.0 : 0.7,
+                        g_wspop.blue_dragging);
+
+            /* Temperature label */
+            char tlab[16];
+            snprintf(tlab, sizeof(tlab), "%dK", blue_cur_temp());
+            sys_draw_text(cr, g_wspop.blue_sxmax, g_wspop.blue_sy - 10, 46, 20,
+                          tlab, FONT_SIZE,
+                          COLOR(FG_HEX), ton ? 0.95 : 0.55,
+                          PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_RIGHT);
+        }
+
+        /* Workspace buttons (bottom row) */
+        for (int i = 0; i < g_ws.ws_count; i++) {
+            double step = WS_BTN_SIZE + WS_BTN_GAP;
+            double bx = px + MENU_PADDING + i * step;
+            double by = wspop_ws_y();
+            int active = g_workspaces[i].active;
+            int hover = (g_wspop.hover_row == i);
+            const char *name = g_workspaces[i].name;
+
+            if (hover && active) {
+                ws_button_draw(cr, bx, by, name,
+                               (double[4]){ 0.55, 0.9, 0.55, 1.0 }, NULL,
+                               (double[4]){ 0.1, 0.1, 0.1, 1.0 });
+            } else if (hover) {
+                ws_button_draw(cr, bx, by, name,
+                               (double[4]){ COLOR(MENU_HOVER_HEX), MENU_HOVER_A },
+                               (double[4]){ COLOR(FG_HEX), 0.8 },
+                               (double[4]){ COLOR(FG_HEX), 1.0 });
+            } else if (active) {
+                ws_button_draw(cr, bx, by, name,
+                               (double[4]){ 0.4, 0.8, 0.4, 1.0 }, NULL,
+                               (double[4]){ 0.1, 0.1, 0.1, 1.0 });
+            } else {
+                ws_button_draw(cr, bx, by, name,
+                               NULL, (double[4]){ COLOR(FG_HEX), 0.45 },
+                               (double[4]){ COLOR(FG_HEX), 0.7 });
+            }
+        }
+        cairo_restore(cr);
+    }
+
+    if (g_calpop.open) {
+        static const char *mon_names[12] = {
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December",
+        };
+        static const char *dow_names[7] = {
+            "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa",
+        };
+
+        double px = g_calpop.x;
+        double py = g_calpop.y;
+        double pw = g_calpop.w;
+        double body_h = g_calpop.h - PPADDING;
+        double r = PRADIUS;
+
+        panel_begin(cr, px, py, pw, body_h, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
+
+        double inner_w = pw - MENU_PADDING * 2;
+        double cell_w = inner_w / 7.0;
+        double hdr_y = py + MENU_PADDING;
+        double dow_y = hdr_y + CAL_HEADER_H;
+        double grid_y = dow_y + CAL_DOW_H;
+
+        char hdr[32];
+        snprintf(hdr, sizeof(hdr), "%s %d",
+                 mon_names[g_calpop.view_mon], g_calpop.view_year);
+        pango_layout_set_font_description(pl, clock_font());
+        int htw, hth;
+        pango_layout_set_text(pl, hdr, -1);
+        pango_layout_get_pixel_size(pl, &htw, &hth);
+        cairo_set_source_rgba(cr, COLOR(FG_HEX), FG_A);
+        cairo_move_to(cr, snap_px(px + (pw - htw) / 2.0),
+                      snap_px(hdr_y + (CAL_HEADER_H - hth) / 2.0));
+        pango_cairo_show_layout(cr, pl);
+
+        double alx = px + MENU_PADDING + CAL_ARROW_W / 2.0;
+        double arx = px + pw - MENU_PADDING - CAL_ARROW_W / 2.0;
+        double acy = hdr_y + CAL_HEADER_H / 2.0;
+
+        if (g_calpop.hover_prev || g_calpop.hover_next) {
+            double ax = g_calpop.hover_prev ? alx - CAL_ARROW_W / 2.0
+                                            : arx - CAL_ARROW_W / 2.0;
+            draw_hover_row(cr, ax, hdr_y, CAL_ARROW_W, CAL_HEADER_H,
+                           PRADIUS, MENU_HOVER_A);
+        }
+
+        cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.95);
+        cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+        cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+        cairo_set_line_width(cr, 1.8);
+
+        cairo_move_to(cr, alx + 3, acy - 5);
+        cairo_line_to(cr, alx - 3, acy);
+        cairo_line_to(cr, alx + 3, acy + 5);
+        cairo_stroke(cr);
+
+        cairo_move_to(cr, arx - 3, acy - 5);
+        cairo_line_to(cr, arx + 3, acy);
+        cairo_line_to(cr, arx - 3, acy + 5);
+        cairo_stroke(cr);
+
+        pango_layout_set_font_description(pl, cal_small_font());
+        for (int i = 0; i < 7; i++) {
+            int dw, dh;
+            pango_layout_set_text(pl, dow_names[i], -1);
+            pango_layout_get_pixel_size(pl, &dw, &dh);
+            cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.45);
+            cairo_move_to(cr, snap_px(px + MENU_PADDING + i * cell_w +
+                                       (cell_w - dw) / 2.0),
+                          snap_px(dow_y + (CAL_DOW_H - dh) / 2.0));
+            pango_cairo_show_layout(cr, pl);
+        }
+
+        time_t now_t = time(NULL);
+        struct tm now_tm;
+        localtime_r(&now_t, &now_tm);
+        int today_y = now_tm.tm_year + 1900;
+        int today_m = now_tm.tm_mon;
+        int today_d = now_tm.tm_mday;
+
+        int first = cal_first_weekday(g_calpop.view_year, g_calpop.view_mon);
+        int ndays = cal_days_in_month(g_calpop.view_year, g_calpop.view_mon);
+
+        pango_layout_set_font_description(pl, cal_day_font());
+        for (int d = 1; d <= ndays; d++) {
+            int slot = first + d - 1;
+            int col = slot % 7;
+            int row = slot / 7;
+            double cx0 = px + MENU_PADDING + col * cell_w;
+            double cy0 = grid_y + row * CAL_CELL_H;
+            int is_today = (d == today_d && g_calpop.view_mon == today_m &&
+                            g_calpop.view_year == today_y);
+
+            char num[8];
+            snprintf(num, sizeof(num), "%d", d);
+            int dw, dh;
+            pango_layout_set_text(pl, num, -1);
+            pango_layout_get_pixel_size(pl, &dw, &dh);
+
+            if (is_today) {
+                double ir = dh / 2.0 + 6.0;
+                cairo_set_source_rgba(cr, COLOR(FG_HEX), FG_A);
+                cairo_new_path(cr);
+                cairo_arc(cr, cx0 + cell_w / 2.0, cy0 + CAL_CELL_H / 2.0,
+                          ir, 0, 2 * M_PI);
+                cairo_fill(cr);
+                cairo_set_source_rgba(cr, 0.1, 0.1, 0.1, 1.0);
+            } else {
+                cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.85);
+            }
+
+            cairo_move_to(cr, snap_px(cx0 + (cell_w - dw) / 2.0),
+                          snap_px(cy0 + (CAL_CELL_H - dh) / 2.0));
+            pango_cairo_show_layout(cr, pl);
+        }
+
+        cairo_restore(cr);
+    }
+
+    if (g_wxpop.open) {
+        double px = g_wxpop.x;
+        double py = g_wxpop.y;
+        double pw = g_wxpop.w;
+        double body_h = g_wxpop.h - PPADDING;
+        double r = PRADIUS;
+
+        panel_begin(cr, px, py, pw, body_h, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
+
+        double inner_x = px + MENU_PADDING;
+        double inner_w = pw - MENU_PADDING * 2;
+        double head_y = py + MENU_PADDING;
+        double rows_y = head_y + WX_HEAD_H;
+        double mid_y = py + (body_h - PPADDING) / 2.0;
+
+        if (!g_wx.have) {
+            pango_layout_set_font_description(pl, wx_font());
+            const char *msg = g_wx.pending ? "Fetching weather..."
+                                           : "No weather data";
+            int tw, th;
+            pango_layout_set_text(pl, msg, -1);
+            pango_layout_get_pixel_size(pl, &tw, &th);
+            cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.5);
+            cairo_move_to(cr, snap_px(px + (pw - tw) / 2.0),
+                          snap_px(mid_y - th / 2.0));
+            pango_cairo_show_layout(cr, pl);
+            cairo_restore(cr);
+        } else {
+            /* Header: place name, then the current reading beside its label. */
+            pango_layout_set_font_description(pl, wx_small_font());
+            cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.5);
+            cairo_move_to(cr, inner_x, snap_px(head_y + 2));
+            pango_layout_set_text(pl, g_wx.place, -1);
+            pango_cairo_show_layout(cr, pl);
+
+            double cur_y = head_y + 14;
+            pango_layout_set_font_description(pl, wx_head_font());
+            char tbuf[16];
+            wx_deg_str(g_wx.temp, tbuf, sizeof(tbuf));
+            int ttw, tth;
+            pango_layout_set_text(pl, tbuf, -1);
+            pango_layout_get_pixel_size(pl, &ttw, &tth);
+            cairo_set_source_rgba(cr, COLOR(FG_HEX), FG_A);
+            double txty = snap_px(cur_y + (WX_HEAD_H - 14 - tth) / 2.0);
+            cairo_move_to(cr, inner_x, txty);
+            pango_cairo_show_layout(cr, pl);
+
+            pango_layout_set_font_description(pl, wx_font());
+            cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.75);
+            cairo_move_to(cr, inner_x + ttw + 8, snap_px(txty + tth * 0.28));
+            pango_layout_set_text(pl, wx_cond_label(g_wx.cond), -1);
+            pango_cairo_show_layout(cr, pl);
+
+            cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.12);
+            cairo_new_path(cr);
+            cairo_move_to(cr, inner_x, rows_y - 5.5);
+            cairo_line_to(cr, inner_x + inner_w, rows_y - 5.5);
+            cairo_set_line_width(cr, 1);
+            cairo_stroke(cr);
+
+            /* Columns, measured back from the right edge so the rain column
+             * and the temperatures stay put whatever the place name says. */
+            double rain_r = px + pw - MENU_PADDING;
+            double temp_r = rain_r - WX_RAIN_W;
+            double icon_x = inner_x + 36;
+
+            for (int i = 0; i < WEATHER_DAYS; i++) {
+                double ry = rows_y + i * WX_ROW_H;
+                double rcy = ry + WX_ROW_H / 2.0;
+                if (i >= g_wx.n_days) break;
+                const struct wx_day *d = &g_wx.day[i];
+
+                pango_layout_set_font_description(pl, wx_font());
+                cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.85);
+                draw_vcenter_text(cr, pl, d->name, inner_x, ry, WX_ROW_H,
+                                  COLOR(FG_HEX), 0.85, 30, 0);
+
+                double isz = WX_COL_ICON;
+                draw_wx_icon(cr, icon_x, rcy - isz / 2.0, isz, d->cond);
+
+                char lo[16], hi[16], span[40];
+                wx_deg_str(d->tmin, lo, sizeof(lo));
+                wx_deg_str(d->tmax, hi, sizeof(hi));
+                snprintf(span, sizeof(span), "%s / %s", lo, hi);
+                draw_vcenter_text(cr, pl, span, icon_x + isz + 8, ry, WX_ROW_H,
+                                  1.0, 1.0, 1.0, 0.75,
+                                  temp_r - (icon_x + isz + 8), 1);
+
+                pango_layout_set_font_description(pl, wx_small_font());
+                if (d->rain >= 0) {
+                    char rp[16];
+                    snprintf(rp, sizeof(rp), "%d%%", d->rain);
+                    cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.55);
+                    int rw, rh;
+                    pango_layout_set_text(pl, rp, -1);
+                    pango_layout_get_pixel_size(pl, &rw, &rh);
+                    cairo_move_to(cr, rain_r - rw, snap_px(rcy - rh / 2.0));
+                    pango_cairo_show_layout(cr, pl);
+                }
+            }
+            cairo_restore(cr);
+        }
+    }
+
+    if (g_npop.open) {
+        double px = g_npop.x;
+        double py = g_npop.y;
+        double pw = g_npop.w;
+        double body_h = g_npop.h - PPADDING;
+        double r = PRADIUS;
+
+        panel_begin(cr, px, py, pw, body_h, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
+
+        pango_layout_set_font_description(pl, notif_font());
+
+        char hdr[64];
+        snprintf(hdr, sizeof(hdr), "Notifications  %d", g_n_notifs);
+        pango_layout_set_text(pl, hdr, -1);
+        int htw, hth;
+        pango_layout_get_pixel_size(pl, &htw, &hth);
+        cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.55);
+        cairo_move_to(cr, px + MENU_PADDING,
+                      py + (NOTIF_HEADER_H - hth) / 2.0);
+        pango_cairo_show_layout(cr, pl);
+
+        pango_layout_set_font_description(pl, clock_font());
+
+        cairo_set_source_rgba(cr, COLOR(PBCOLOR), PBALPHA * 1.4);
+        cairo_rectangle(cr, px + MENU_PADDING, py + NOTIF_HEADER_H,
+                        pw - 2 * MENU_PADDING, 1);
+        cairo_fill(cr);
+
+        int can_clear = g_n_notifs > 0;
+        cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX),
+                              g_npop.hover_clear
+                                  ? MENU_HOVER_A : (can_clear ? 0.35 : 0.18));
+        cairo_new_path(cr);
+        rounded_rect(cr, g_npop.clear_x, g_npop.clear_y, g_npop.clear_w,
+                     g_npop.clear_h, g_npop.clear_h / 2.0);
+        cairo_fill(cr);
+        pango_layout_set_text(pl, "Clear all", -1);
+        int ctw, cth;
+        pango_layout_get_pixel_size(pl, &ctw, &cth);
+        cairo_set_source_rgba(cr, COLOR(FG_HEX), can_clear ? 0.95 : 0.4);
+        cairo_move_to(cr, g_npop.clear_x + (g_npop.clear_w - ctw) / 2.0,
+                      g_npop.clear_y + (g_npop.clear_h - cth) / 2.0);
+        pango_cairo_show_layout(cr, pl);
+
+        cairo_save(cr);
+        cairo_new_path(cr);
+        cairo_rectangle(cr, g_npop.rows_x, g_npop.list_y,
+                        g_npop.rows_w, g_npop.list_h);
+        cairo_clip(cr);
+        int first = (int)(lround(g_npop.scroll) / NOTIF_ROW_H);
+        for (int i = first; i < g_n_notifs; i++) {
+            double ry = g_npop.list_y + i * NOTIF_ROW_H - lround(g_npop.scroll);
+            if (ry >= g_npop.list_y + g_npop.list_h) break;
+            if (ry + NOTIF_ROW_H <= g_npop.list_y) continue;
+            notif_draw_row(cr, pl, i);
+        }
+        cairo_restore(cr);
+
+        cairo_restore(cr);
+    }
+
+    if (g_wlp.open)
+        wlp_draw(cr, pl);
+}
+
 static void
 bar_draw(struct bar *b)
 {
@@ -7039,7 +9047,9 @@ bar_draw(struct bar *b)
 
     int w = b->width;
     int bar_h = BAR_HEIGHT;
-    double bar_y = bar_y_offset();
+    /* The bar has its own surface now, so it fills it from the top; the flyout
+     * strip above it is a separate surface. */
+    double bar_y = 0;
     cairo_t *cr = b->cr;
 
     cairo_save(cr);
@@ -7074,6 +9084,35 @@ bar_draw(struct bar *b)
         cairo_fill(cr);
     }
 
+    if (wx_visible()) {
+        double ww = wx_width();
+        double wx = wx_x();
+        double isz = WEATHER_ICON;
+        double iy = bar_y + (bar_h - isz) / 2.0;
+
+        if (g_pointer.hover_wx) {
+            draw_hover_row(cr, wx, bar_y + 2, ww, bar_h - 4,
+                           (bar_h - 4) / 2.0, MENU_HOVER_A);
+        }
+
+        draw_wx_icon(cr, wx + WEATHER_PAD_X, iy, isz, g_wx.cond);
+
+        char wt[16];
+        wx_bar_text(wt, sizeof(wt));
+        double ttx = wx + WEATHER_PAD_X + isz + WEATHER_ICON_GAP;
+        double tty = bar_y + (bar_h - FONT_SIZE) / 2.0 - 1;
+        cairo_set_source_rgba(cr, COLOR(FG_HEX), FG_A);
+        cairo_move_to(cr, ttx, tty);
+        pango_layout_set_text(pl, wt, -1);
+        pango_cairo_show_layout(cr, pl);
+
+        /* The condition in words, dimmed so the reading stays the number. */
+        cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.6);
+        cairo_move_to(cr, ttx + wx_text_width() + WEATHER_ICON_GAP, tty);
+        pango_layout_set_text(pl, wx_cond_label(g_wx.cond), -1);
+        pango_cairo_show_layout(cr, pl);
+    }
+
     double pill_w = MENU_PILL_W;
     double pill_h = MENU_PILL_H;
     double icon_x = 10;
@@ -7081,10 +9120,8 @@ bar_draw(struct bar *b)
 
     cairo_set_line_width(cr, 1.5);
     if (g_pointer.hover_pill) {
-        cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-        cairo_new_path(cr);
-        rounded_rect(cr, icon_x, icon_y, pill_w, pill_h, pill_h / 2.0);
-        cairo_fill(cr);
+        draw_hover_row(cr, icon_x, icon_y, pill_w, pill_h,
+                       pill_h / 2.0, MENU_HOVER_A);
         cairo_set_source_rgba(cr, COLOR(FG_HEX), FG_A);
         cairo_new_path(cr);
         rounded_rect(cr, icon_x, icon_y, pill_w, pill_h, pill_h / 2.0);
@@ -7262,11 +9299,8 @@ bar_draw(struct bar *b)
         double clk_x = bell_x - TRAY_GAP - clk_tw;
 
         if (g_pointer.hover_clock) {
-            cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-            cairo_new_path(cr);
-            rounded_rect(cr, clk_x - 7, bar_y + 4,
-                         clk_tw + 14, BAR_HEIGHT - 8, MENU_CORNER_R);
-            cairo_fill(cr);
+            draw_hover_row(cr, clk_x - 7, bar_y + 4, clk_tw + 14,
+                           BAR_HEIGHT - 8, PRADIUS, MENU_HOVER_A);
         }
 
         cairo_set_source_rgba(cr, COLOR(FG_HEX), FG_A);
@@ -7305,726 +9339,6 @@ bar_draw(struct bar *b)
         }
     }
 
-    if (g_gpopup.open) {
-        double pw = GROUP_POPUP_W;
-        double ph = g_gpopup.height - MENU_FLOAT_GAP;
-        double px = g_gpopup.x;
-        double py = g_gpopup.y;
-        double r = MENU_CORNER_R;
-
-        panel_begin(cr, px, py, pw, ph, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
-
-        for (int i = 0; i < g_gpopup.n_windows; i++) {
-            double row_y = py + MENU_PADDING + i * MENU_ROW_HEIGHT;
-            if (g_gpopup.hover_idx == i) {
-                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-                cairo_rectangle(cr, px, row_y, pw, MENU_ROW_HEIGHT);
-                cairo_fill(cr);
-            }
-            int tl_idx = g_gpopup.windows[i];
-            struct toplevel_entry *t = &g_toplevels[tl_idx];
-            double text_x = px + MENU_PADDING;
-            text_x += draw_icon_fit(cr, t->icon, text_x, row_y,
-                                    0, MENU_ROW_HEIGHT, MENU_ROW_ICON, 0);
-            double xc = px + pw - MENU_PADDING - 8;
-            double yc = row_y + MENU_ROW_HEIGHT / 2.0;
-
-            const char *title = t->title;
-            double max_text_w = xc - text_x - 10;
-            draw_vcenter_text(cr, pl, title && title[0] ? title : "(untitled)",
-                              text_x, row_y, MENU_ROW_HEIGHT,
-                              COLOR(MENU_FG_HEX), 1.0,
-                              max_text_w, 1);
-            if (g_gpopup.hover_close == i) {
-                cairo_set_source_rgba(cr, 0.85, 0.2, 0.2, 0.9);
-                cairo_new_path(cr);
-                cairo_arc(cr, xc, yc, 8, 0, 2 * M_PI);
-                cairo_fill(cr);
-                cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
-            } else {
-                cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 0.55);
-            }
-            cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-            cairo_set_line_width(cr, 1.5);
-            cairo_move_to(cr, xc - 3, yc - 3);
-            cairo_line_to(cr, xc + 3, yc + 3);
-            cairo_stroke(cr);
-            cairo_move_to(cr, xc + 3, yc - 3);
-            cairo_line_to(cr, xc - 3, yc + 3);
-            cairo_stroke(cr);
-        }
-
-        cairo_restore(cr);
-    }
-
-    if (g_cpop.open) {
-        double px = g_cpop.x;
-        double py = g_cpop.y;
-        double pw = g_cpop.w;
-        double ph = g_cpop.h - MENU_FLOAT_GAP;
-        double r = MENU_CORNER_R;
-
-        panel_begin(cr, px, py, pw, ph, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
-
-        for (int i = 0; i < g_cpop.n_items; i++) {
-            double ry = py + MENU_PADDING + i * CTX_ROW_HEIGHT;
-
-            if (g_cpop.hover == i) {
-                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-                cairo_rectangle(cr, px + 1, ry, pw - 2, CTX_ROW_HEIGHT);
-                cairo_fill(cr);
-            }
-
-            if (i > 0) {
-                cairo_set_source_rgba(cr, COLOR(MENU_BORDER_HEX), 0.4);
-                cairo_set_line_width(cr, 1);
-                cairo_move_to(cr, px + MENU_PADDING + 4, ry);
-                cairo_line_to(cr, px + pw - MENU_PADDING - 4, ry);
-                cairo_stroke(cr);
-            }
-
-            draw_vcenter_text(cr, pl, cpop_label(i), px + MENU_PADDING + 2, ry,
-                              CTX_ROW_HEIGHT,
-                              COLOR(MENU_FG_HEX), 1.0, 0, 0);
-        }
-
-        cairo_restore(cr);
-    }
-
-    if (g_tm.open && g_tm.n_row > 0) {
-        double px = g_tm.x;
-        double py = g_tm.y;
-        double pw = g_tm.w;
-        double ph = g_tm.height - MENU_FLOAT_GAP;
-        double r = MENU_CORNER_R;
-
-        panel_begin(cr, px, py, pw, ph, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
-
-        for (int i = 0; i < g_tm.n_row; i++) {
-            struct tray_menu_entry *e = &g_tm.e[g_tm.row[i].e_idx];
-            double row_y = g_tm.row[i].y0;
-            double row_h = g_tm.row[i].y1 - g_tm.row[i].y0;
-
-            if (e->is_separator) {
-                double sy = row_y + row_h / 2.0;
-                cairo_set_source_rgba(cr, COLOR(MENU_BORDER_HEX), 0.4);
-                cairo_set_line_width(cr, 1);
-                cairo_move_to(cr, px + MENU_PADDING + 4, sy);
-                cairo_line_to(cr, px + pw - MENU_PADDING - 4, sy);
-                cairo_stroke(cr);
-                continue;
-            }
-
-            if (g_tm.hover_row == i && e->enabled) {
-                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-                cairo_rectangle(cr, px + 1, row_y, pw - 2, row_h);
-                cairo_fill(cr);
-            }
-
-            double text_x = px + MENU_PADDING;
-            if (e->depth > 0)
-                text_x += e->depth * 10;
-
-            if (e->is_check || e->is_radio) {
-                double cx = px + pw - MENU_PADDING - 8;
-                double cy = row_y + row_h / 2.0;
-                int state = (e->toggle_state == 1);
-                if (e->is_radio) {
-                    cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), state ? 1.0 : 0.35);
-                    cairo_set_line_width(cr, 1.5);
-                    cairo_new_path(cr);
-                    cairo_arc(cr, cx, cy, 5, 0, 2 * M_PI);
-                    cairo_stroke(cr);
-                    if (state) {
-                        cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 1.0);
-                        cairo_new_path(cr);
-                        cairo_arc(cr, cx, cy, 2.6, 0, 2 * M_PI);
-                        cairo_fill(cr);
-                    }
-                } else {
-                    cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), state ? 1.0 : 0.35);
-                    cairo_set_line_width(cr, 2);
-                    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-                    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
-                    cairo_move_to(cr, cx - 4.5, cy);
-                    cairo_line_to(cr, cx - 1.5, cy + 3.5);
-                    cairo_line_to(cr, cx + 4.5, cy - 4);
-                    cairo_stroke(cr);
-                }
-            }
-
-            const char *label = e->label;
-            draw_vcenter_text(cr, pl, label && label[0] ? label : "", text_x,
-                              row_y, row_h,
-                              COLOR(MENU_FG_HEX),
-                              e->enabled ? 1.0 : 0.4, 0, 0);
-        }
-
-        cairo_restore(cr);
-    }
-
-    if (g_volpop.open) {
-        if (g_box.audio_present)
-            audio_snapshot(&g_box.vol_snap);
-
-        double px = g_volpop.x;
-        double py = g_volpop.y;
-        double pw = g_volpop.w;
-        double body_h = g_volpop.h - MENU_FLOAT_GAP;
-        double r = MENU_CORNER_R;
-
-        panel_begin(cr, px, py, pw, body_h, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
-
-        int cur_tab = g_volpop.tab;
-        double tabw = (pw - 2 * MENU_PADDING - 4) / 2.0;
-        for (int t = 0; t < 2; t++) {
-            double tx = px + MENU_PADDING + t * (tabw + 4);
-            double ty = g_volpop.tab_y;
-            double tw = tabw;
-            double th = VOL_TAB_H;
-            if (t == cur_tab) {
-                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-                cairo_new_path(cr);
-                rounded_rect(cr, tx, ty, tw, th, 4);
-                cairo_fill(cr);
-            } else if (g_volpop.hover_tab == t) {
-                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), 0.6);
-                cairo_new_path(cr);
-                rounded_rect(cr, tx, ty, tw, th, 4);
-                cairo_fill(cr);
-            }
-            const char *label = t == 0 ? "Output" : "Input";
-            pango_layout_set_text(pl, label, -1);
-            int ltw, lth;
-            pango_layout_get_pixel_size(pl, &ltw, &lth);
-            cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX),
-                                  t == cur_tab ? 1.0 : 0.55);
-            cairo_move_to(cr, tx + (tw - ltw) / 2.0, ty + (th - lth) / 2.0);
-            pango_cairo_show_layout(cr, pl);
-        }
-
-        {
-            int want_sink = (cur_tab == 0);
-            int n_rows = volpop_list_rows();
-            int row = 0;
-            for (int i = 0; i < PW_MAX_DEVICES; i++) {
-                if (g_box.vol_snap.n_sinks + g_box.vol_snap.n_sources == 0) break;
-                if (row >= n_rows) break;
-                struct audio_snap_item *it = &g_box.vol_snap.items[i];
-                if (it->is_sink != want_sink) continue;
-                double ry = g_volpop.list_y + row * VOL_DEV_ROW_H;
-                if (g_volpop.hover_dev == row) {
-                    cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-                    cairo_rectangle(cr, px + 1, ry, pw - 2, VOL_DEV_ROW_H);
-                    cairo_fill(cr);
-                }
-                double rcy = ry + VOL_DEV_ROW_H / 2.0;
-                double dx = px + MENU_PADDING + 5;
-                if (it->is_default) {
-                    cairo_set_source_rgba(cr, 0.4, 0.8, 0.4, 1.0);
-                    cairo_arc(cr, dx, rcy, 4, 0, 2 * M_PI);
-                    cairo_fill(cr);
-                } else {
-                    cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX),
-                                          g_volpop.hover_dev == row ? 0.75 : 0.38);
-                    cairo_arc(cr, dx, rcy, 3.2, 0, 2 * M_PI);
-                    cairo_fill(cr);
-                }
-                const char *dtxt = it->desc[0] ? it->desc : "device";
-                pango_layout_set_text(pl, dtxt, -1);
-                int dtw, dth;
-                pango_layout_get_pixel_size(pl, &dtw, &dth);
-                double dlx = dx + 12;
-                double max_w = px + pw - MENU_PADDING - dlx;
-                if (dtw > max_w && max_w > 0) {
-                    char tmp[160];
-                    snprintf(tmp, sizeof(tmp), "%s", dtxt);
-                    while (dtw > max_w && tmp[0]) {
-                        char *u = g_utf8_prev_char(tmp + strlen(tmp));
-                        *u = '\0';
-                        pango_layout_set_text(pl, tmp, -1);
-                        pango_layout_get_pixel_size(pl, &dtw, &dth);
-                    }
-                    pango_layout_set_text(pl, tmp, -1);
-                }
-                cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 0.92);
-                cairo_move_to(cr, dlx, ry + (VOL_DEV_ROW_H - dth) / 2.0);
-                pango_cairo_show_layout(cr, pl);
-                row++;
-            }
-        }
-
-        double mcx = g_volpop.mute_x + g_volpop.mute_w / 2.0;
-        double mcy = g_volpop.mute_y + g_volpop.mute_h / 2.0;
-
-        if (g_volpop.hover_mute) draw_hover_circle(cr, mcx, mcy, g_volpop.mute_w, 5);
-
-        double vol = cur_tab == 0 ? g_box.vol_snap.sink_volume : g_box.vol_snap.source_volume;
-        int muted = cur_tab == 0 ? g_box.vol_snap.sink_muted : g_box.vol_snap.source_muted;
-        draw_speaker(cr, mcx, mcy, 5.5, 3, 3, 6, 4, 2.2, 4.2,
-                     muted ? 0.4 : 0.95);
-
-        if (muted) {
-            cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.95);
-            cairo_move_to(cr, mcx + 2.5, mcy - 7);
-            cairo_line_to(cr, mcx + 9.5, mcy + 7);
-            cairo_move_to(cr, mcx + 9.5, mcy - 7);
-            cairo_line_to(cr, mcx + 2.5, mcy + 7);
-            cairo_stroke(cr);
-        }
-
-        double sx = g_volpop.slider_x_min;
-        double sw = g_volpop.slider_x_max - g_volpop.slider_x_min;
-        double sy = g_volpop.slider_y;
-        double fill_w = 0;
-        if (g_box.vol_snap.has_value) {
-            fill_w = sw * (vol / VOLUME_MAX);
-            fill_w = clampd(fill_w, 0, sw);
-        }
-        double sr = VOL_SLIDER_H / 2.0;
-
-        cairo_set_source_rgba(cr, COLOR(VOL_SLIDER_BG_HEX), VOL_SLIDER_BG_A);
-        cairo_new_path(cr);
-        rounded_rect(cr, sx, sy - sr, sw, VOL_SLIDER_H, sr);
-        cairo_fill(cr);
-
-        cairo_set_source_rgba(cr, COLOR(VOL_SLIDER_FILL_HEX), VOL_SLIDER_FILL_A);
-        if (fill_w >= sr * 2) {
-            cairo_new_path(cr);
-            rounded_rect(cr, sx, sy - sr, fill_w, VOL_SLIDER_H, sr);
-        } else {
-            cairo_rectangle(cr, sx, sy - sr, fill_w, VOL_SLIDER_H);
-        }
-        cairo_fill(cr);
-
-        double kx = sx + fill_w;
-        kx = clampd(kx, sx, sx + sw);
-        cairo_set_source_rgba(cr, COLOR(FG_HEX), 1.0);
-        cairo_arc(cr, kx, sy, VOL_KNOB_R, 0, 2 * M_PI);
-        cairo_fill(cr);
-
-        char vlabel[8];
-        snprintf(vlabel, sizeof(vlabel), "%d%%",
-                 (int)lroundf(g_box.vol_snap.has_value ? vol : 0.0f));
-        pango_layout_set_text(pl, vlabel, -1);
-        int vtw, vth;
-        pango_layout_get_pixel_size(pl, &vtw, &vth);
-        cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 1.0);
-        cairo_move_to(cr, px + pw - MENU_PADDING - vtw, sy - vth / 2.0);
-        pango_cairo_show_layout(cr, pl);
-        (void)vtw;
-
-        cairo_restore(cr);
-    }
-
-    if (g_wspop.open) {
-        double px = g_wspop.x;
-        double py = g_wspop.y;
-        double pw = g_wspop.w;
-        double body_h = g_wspop.h;
-        double r = MENU_CORNER_R;
-
-        panel_begin(cr, px, py, pw, body_h, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
-
-        /* Wallpaper button (top row) */
-        {
-            double wbx = px + MENU_PADDING;
-            double wby = py + MENU_PADDING;
-            double wbw = pw - MENU_PADDING * 2;
-            int wp_hover = (g_wspop.hover_row == -2);
-
-            if (wp_hover) {
-                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-                cairo_new_path(cr);
-                rounded_rect(cr, wbx, wby, wbw, WS_WP_BTN_H, WS_WP_BTN_R);
-                cairo_fill(cr);
-                cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.8);
-                cairo_set_line_width(cr, 1.2);
-                cairo_new_path(cr);
-                rounded_rect(cr, wbx, wby, wbw, WS_WP_BTN_H, WS_WP_BTN_R);
-                cairo_stroke(cr);
-            } else {
-                cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.45);
-                cairo_set_line_width(cr, 1.2);
-                cairo_new_path(cr);
-                rounded_rect(cr, wbx, wby, wbw, WS_WP_BTN_H, WS_WP_BTN_R);
-                cairo_stroke(cr);
-            }
-
-            /* Picture icon */
-            double isz = WS_WP_ICON;
-            double ix = wbx + 10;
-            double iy = wby + (WS_WP_BTN_H - isz) / 2.0;
-            double ia = wp_hover ? 1.0 : 0.7;
-            cairo_set_source_rgba(cr, COLOR(FG_HEX), ia);
-            cairo_set_line_width(cr, 1.3);
-            cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-            cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
-            /* frame */
-            cairo_new_path(cr);
-            rounded_rect(cr, ix, iy, isz, isz, 2);
-            cairo_stroke(cr);
-            /* mountain peaks */
-            cairo_move_to(cr, ix + 2, iy + isz - 3);
-            cairo_line_to(cr, ix + isz / 2.0 - 1, iy + 4);
-            cairo_line_to(cr, ix + isz - 2, iy + isz - 3);
-            cairo_stroke(cr);
-            /* sun dot */
-            cairo_arc(cr, ix + isz - 4, iy + 4, 1.5, 0, 2 * M_PI);
-            cairo_fill(cr);
-
-            /* Label */
-            sys_draw_text(cr, ix + isz + 8, wby, wbw - isz - 20, WS_WP_BTN_H,
-                          "Wallpaper", FONT_SIZE,
-                          COLOR(FG_HEX), wp_hover ? 1.0 : 0.8,
-                          PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_LEFT);
-        }
-
-        /* Night light box (blue filter) -- header + slider, wallpaper-button style */
-        {
-            double bl_y = wspop_blue_y();
-            double box_x = px + MENU_PADDING;
-            double box_w = pw - MENU_PADDING * 2;
-            double hc = bl_y + BLUE_HEADER_H / 2.0;
-            int bl_hover = (g_wspop.hover_row == -3 || g_wspop.hover_row == -4);
-            int ton = g_wspop.blue_on;
-
-            if (bl_hover) {
-                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-                cairo_new_path(cr);
-                rounded_rect(cr, box_x, bl_y, box_w, BLUE_BOX_H, WS_WP_BTN_R);
-                cairo_fill(cr);
-                cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.8);
-                cairo_set_line_width(cr, 1.2);
-                cairo_new_path(cr);
-                rounded_rect(cr, box_x, bl_y, box_w, BLUE_BOX_H, WS_WP_BTN_R);
-                cairo_stroke(cr);
-            } else {
-                cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.45);
-                cairo_set_line_width(cr, 1.2);
-                cairo_new_path(cr);
-                rounded_rect(cr, box_x, bl_y, box_w, BLUE_BOX_H, WS_WP_BTN_R);
-                cairo_stroke(cr);
-            }
-
-            /* Moon icon (crescent) */
-            double mr = 7.0;
-            double mx = box_x + 10 + mr;
-            cairo_set_source_rgba(cr, COLOR(FG_HEX), ton ? 0.95 : 0.6);
-            cairo_new_path(cr);
-            cairo_arc(cr, mx, hc, mr, 0, 2 * M_PI);
-            cairo_fill(cr);
-            if (bl_hover) {
-                cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-            } else {
-                cairo_set_source_rgba(cr, COLOR(MENU_BG_HEX), MENU_BG_A);
-            }
-            cairo_new_path(cr);
-            cairo_arc(cr, mx + mr * 0.45, hc - mr * 0.15, mr * 0.72, 0, 2 * M_PI);
-            cairo_fill(cr);
-
-            /* Header label */
-            double label_x = box_x + 10 + 2 * mr + 8;
-            double label_w = g_wspop.blue_toggle_x - 8 - label_x;
-            if (label_w < 0) label_w = 0;
-            sys_draw_text(cr, label_x, bl_y, label_w, BLUE_HEADER_H,
-                          "Night light", FONT_SIZE,
-                          COLOR(FG_HEX), ton ? 0.95 : 0.7,
-                          PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_LEFT);
-
-            /* On/off toggle */
-            double tx = g_wspop.blue_toggle_x;
-            double ty = g_wspop.blue_toggle_y;
-            int thover = (g_wspop.hover_row == -3);
-            cairo_set_source_rgba(cr, COLOR(MENU_BORDER_HEX), 1.0);
-            cairo_set_line_width(cr, 1);
-            cairo_new_path(cr);
-            rounded_rect(cr, tx, ty, BLUE_TOGGLE_W, BLUE_TOGGLE_H,
-                         BLUE_TOGGLE_H / 2.0);
-            cairo_stroke(cr);
-            if (ton) {
-                cairo_set_source_rgba(cr, COLOR(BLUE_ACCENT_HEX),
-                                      thover ? 1.0 : 0.9);
-            } else {
-                cairo_set_source_rgba(cr, 0.12, 0.2, 0.2, thover ? 1.0 : 0.9);
-            }
-            cairo_new_path(cr);
-            rounded_rect(cr, tx + 1, ty + 1, BLUE_TOGGLE_W - 2,
-                         BLUE_TOGGLE_H - 2, (BLUE_TOGGLE_H - 2) / 2.0);
-            cairo_fill(cr);
-            double kd = BLUE_TOGGLE_H - 6;
-            double kx2 = ton ? tx + BLUE_TOGGLE_W - kd - 3 : tx + 3;
-            double ky2 = ty + 3;
-            cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, thover ? 1.0 : 0.85);
-            cairo_new_path(cr);
-            cairo_arc(cr, kx2 + kd / 2.0, ky2 + kd / 2.0, kd / 2.0, 0, 2 * M_PI);
-            cairo_fill(cr);
-        }
-
-        /* Night light slider row (blue filter) */
-        {
-            double sx = g_wspop.blue_sx;
-            double sw = g_wspop.blue_sxmax - g_wspop.blue_sx;
-            double sy = g_wspop.blue_sy;
-            double sr = BLUE_SLIDER_H / 2.0;
-            int ton = g_wspop.blue_on;
-            double fill_w = sw * (g_wspop.blue_pct / 100.0);
-            fill_w = clampd(fill_w, 0, sw);
-
-            /* track background */
-            cairo_set_source_rgba(cr, COLOR(VOL_SLIDER_BG_HEX), VOL_SLIDER_BG_A);
-            cairo_new_path(cr);
-            rounded_rect(cr, sx, sy - sr, sw, BLUE_SLIDER_H, sr);
-            cairo_fill(cr);
-
-            if (fill_w > 0) {
-                cairo_set_source_rgba(cr, COLOR(BLUE_ACCENT_HEX),
-                                      ton ? 1.0 : 0.45);
-                if (fill_w >= sr * 2) {
-                    cairo_new_path(cr);
-                    rounded_rect(cr, sx, sy - sr, fill_w, BLUE_SLIDER_H, sr);
-                } else {
-                    cairo_rectangle(cr, sx, sy - sr, fill_w, BLUE_SLIDER_H);
-                }
-                cairo_fill(cr);
-            }
-
-            double kx = clampd(sx + fill_w, sx, sx + sw);
-            cairo_set_source_rgba(cr, COLOR(FG_HEX), ton ? 1.0 : 0.7);
-            if (g_wspop.blue_dragging)
-                cairo_set_source_rgba(cr, COLOR(BLUE_ACCENT_HEX), 1.0);
-            cairo_new_path(cr);
-            cairo_arc(cr, kx, sy, BLUE_KNOB_R, 0, 2 * M_PI);
-            cairo_fill(cr);
-
-            /* Temperature label */
-            char tlab[16];
-            snprintf(tlab, sizeof(tlab), "%dK", blue_cur_temp());
-            sys_draw_text(cr, g_wspop.blue_sxmax, sy - 10, 46, 20,
-                          tlab, FONT_SIZE,
-                          COLOR(FG_HEX), ton ? 0.95 : 0.55,
-                          PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_RIGHT);
-        }
-
-        /* Workspace buttons (bottom row) */
-        for (int i = 0; i < g_ws.ws_count; i++) {
-            double step = WS_BTN_SIZE + WS_BTN_GAP;
-            double bx = px + MENU_PADDING + i * step;
-            double by = py + MENU_PADDING + WS_WP_BTN_H + MENU_PADDING +
-                        BLUE_BOX_H + MENU_PADDING;
-            int active = g_workspaces[i].active;
-            int hover = (g_wspop.hover_row == i);
-            const char *name = g_workspaces[i].name;
-
-            if (hover && active) {
-                ws_button_draw(cr, bx, by, name,
-                               (double[4]){ 0.55, 0.9, 0.55, 1.0 }, NULL,
-                               (double[4]){ 0.1, 0.1, 0.1, 1.0 });
-            } else if (hover) {
-                ws_button_draw(cr, bx, by, name,
-                               (double[4]){ COLOR(MENU_HOVER_HEX), MENU_HOVER_A },
-                               (double[4]){ COLOR(FG_HEX), 0.8 },
-                               (double[4]){ COLOR(FG_HEX), 1.0 });
-            } else if (active) {
-                ws_button_draw(cr, bx, by, name,
-                               (double[4]){ 0.4, 0.8, 0.4, 1.0 }, NULL,
-                               (double[4]){ 0.1, 0.1, 0.1, 1.0 });
-            } else {
-                ws_button_draw(cr, bx, by, name,
-                               NULL, (double[4]){ COLOR(FG_HEX), 0.45 },
-                               (double[4]){ COLOR(FG_HEX), 0.7 });
-            }
-        }
-        cairo_restore(cr);
-    }
-
-    if (g_calpop.open) {
-        static const char *mon_names[12] = {
-            "January", "February", "March", "April", "May", "June",
-            "July", "August", "September", "October", "November", "December",
-        };
-        static const char *dow_names[7] = {
-            "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa",
-        };
-
-        double px = g_calpop.x;
-        double py = g_calpop.y;
-        double pw = g_calpop.w;
-        double body_h = g_calpop.h - MENU_FLOAT_GAP;
-        double r = MENU_CORNER_R;
-
-        panel_begin(cr, px, py, pw, body_h, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
-
-        double inner_w = pw - MENU_PADDING * 2;
-        double cell_w = inner_w / 7.0;
-        double hdr_y = py + MENU_PADDING;
-        double dow_y = hdr_y + CAL_HEADER_H;
-        double grid_y = dow_y + CAL_DOW_H;
-
-        char hdr[32];
-        snprintf(hdr, sizeof(hdr), "%s %d",
-                 mon_names[g_calpop.view_mon], g_calpop.view_year);
-        pango_layout_set_font_description(pl, clock_font());
-        int htw, hth;
-        pango_layout_set_text(pl, hdr, -1);
-        pango_layout_get_pixel_size(pl, &htw, &hth);
-        cairo_set_source_rgba(cr, COLOR(FG_HEX), FG_A);
-        cairo_move_to(cr, px + (pw - htw) / 2.0,
-                      hdr_y + (CAL_HEADER_H - hth) / 2.0);
-        pango_cairo_show_layout(cr, pl);
-
-        double alx = px + MENU_PADDING + CAL_ARROW_W / 2.0;
-        double arx = px + pw - MENU_PADDING - CAL_ARROW_W / 2.0;
-        double acy = hdr_y + CAL_HEADER_H / 2.0;
-
-        if (g_calpop.hover_prev || g_calpop.hover_next) {
-            cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
-            cairo_new_path(cr);
-            if (g_calpop.hover_prev)
-                rounded_rect(cr, alx - CAL_ARROW_W / 2.0, hdr_y,
-                             CAL_ARROW_W, CAL_HEADER_H, MENU_CORNER_R);
-            else
-                rounded_rect(cr, arx - CAL_ARROW_W / 2.0, hdr_y,
-                             CAL_ARROW_W, CAL_HEADER_H, MENU_CORNER_R);
-            cairo_fill(cr);
-        }
-
-        cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.95);
-        cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-        cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
-        cairo_set_line_width(cr, 1.8);
-
-        cairo_move_to(cr, alx + 3, acy - 5);
-        cairo_line_to(cr, alx - 3, acy);
-        cairo_line_to(cr, alx + 3, acy + 5);
-        cairo_stroke(cr);
-
-        cairo_move_to(cr, arx - 3, acy - 5);
-        cairo_line_to(cr, arx + 3, acy);
-        cairo_line_to(cr, arx - 3, acy + 5);
-        cairo_stroke(cr);
-
-        pango_layout_set_font_description(pl, cal_small_font());
-        for (int i = 0; i < 7; i++) {
-            int dw, dh;
-            pango_layout_set_text(pl, dow_names[i], -1);
-            pango_layout_get_pixel_size(pl, &dw, &dh);
-            cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.45);
-            cairo_move_to(cr, px + MENU_PADDING + i * cell_w +
-                                (cell_w - dw) / 2.0,
-                          dow_y + (CAL_DOW_H - dh) / 2.0);
-            pango_cairo_show_layout(cr, pl);
-        }
-
-        time_t now_t = time(NULL);
-        struct tm now_tm;
-        localtime_r(&now_t, &now_tm);
-        int today_y = now_tm.tm_year + 1900;
-        int today_m = now_tm.tm_mon;
-        int today_d = now_tm.tm_mday;
-
-        int first = cal_first_weekday(g_calpop.view_year, g_calpop.view_mon);
-        int ndays = cal_days_in_month(g_calpop.view_year, g_calpop.view_mon);
-
-        pango_layout_set_font_description(pl, cal_day_font());
-        for (int d = 1; d <= ndays; d++) {
-            int slot = first + d - 1;
-            int col = slot % 7;
-            int row = slot / 7;
-            double cx0 = px + MENU_PADDING + col * cell_w;
-            double cy0 = grid_y + row * CAL_CELL_H;
-            int is_today = (d == today_d && g_calpop.view_mon == today_m &&
-                            g_calpop.view_year == today_y);
-
-            char num[8];
-            snprintf(num, sizeof(num), "%d", d);
-            int dw, dh;
-            pango_layout_set_text(pl, num, -1);
-            pango_layout_get_pixel_size(pl, &dw, &dh);
-
-            if (is_today) {
-                double ir = dh / 2.0 + 6.0;
-                cairo_set_source_rgba(cr, COLOR(FG_HEX), FG_A);
-                cairo_new_path(cr);
-                cairo_arc(cr, cx0 + cell_w / 2.0, cy0 + CAL_CELL_H / 2.0,
-                          ir, 0, 2 * M_PI);
-                cairo_fill(cr);
-                cairo_set_source_rgba(cr, 0.1, 0.1, 0.1, 1.0);
-            } else {
-                cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.85);
-            }
-
-            cairo_move_to(cr, cx0 + (cell_w - dw) / 2.0,
-                          cy0 + (CAL_CELL_H - dh) / 2.0);
-            pango_cairo_show_layout(cr, pl);
-        }
-
-        cairo_restore(cr);
-    }
-
-    if (g_npop.open) {
-        double px = g_npop.x;
-        double py = g_npop.y;
-        double pw = g_npop.w;
-        double body_h = g_npop.h - MENU_FLOAT_GAP;
-        double r = MENU_CORNER_R;
-
-        panel_begin(cr, px, py, pw, body_h, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
-
-        pango_layout_set_font_description(pl, notif_font());
-
-        char hdr[64];
-        snprintf(hdr, sizeof(hdr), "Notifications  %d", g_n_notifs);
-        pango_layout_set_text(pl, hdr, -1);
-        int htw, hth;
-        pango_layout_get_pixel_size(pl, &htw, &hth);
-        cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.55);
-        cairo_move_to(cr, px + MENU_PADDING,
-                      py + (NOTIF_HEADER_H - hth) / 2.0);
-        pango_cairo_show_layout(cr, pl);
-
-        pango_layout_set_font_description(pl, clock_font());
-
-        cairo_set_source_rgba(cr, COLOR(MENU_BORDER_HEX), 0.4);
-        cairo_rectangle(cr, px + MENU_PADDING, py + NOTIF_HEADER_H,
-                        pw - 2 * MENU_PADDING, 1);
-        cairo_fill(cr);
-
-        int can_clear = g_n_notifs > 0;
-        cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX),
-                              g_npop.hover_clear
-                                  ? MENU_HOVER_A : (can_clear ? 0.35 : 0.18));
-        cairo_new_path(cr);
-        rounded_rect(cr, g_npop.clear_x, g_npop.clear_y, g_npop.clear_w,
-                     g_npop.clear_h, g_npop.clear_h / 2.0);
-        cairo_fill(cr);
-        pango_layout_set_text(pl, "Clear all", -1);
-        int ctw, cth;
-        pango_layout_get_pixel_size(pl, &ctw, &cth);
-        cairo_set_source_rgba(cr, COLOR(FG_HEX), can_clear ? 0.95 : 0.4);
-        cairo_move_to(cr, g_npop.clear_x + (g_npop.clear_w - ctw) / 2.0,
-                      g_npop.clear_y + (g_npop.clear_h - cth) / 2.0);
-        pango_cairo_show_layout(cr, pl);
-
-        cairo_save(cr);
-        cairo_new_path(cr);
-        cairo_rectangle(cr, g_npop.rows_x, g_npop.list_y,
-                        g_npop.rows_w, g_npop.list_h);
-        cairo_clip(cr);
-        int first = (int)(lround(g_npop.scroll) / NOTIF_ROW_H);
-        for (int i = first; i < g_n_notifs; i++) {
-            double ry = g_npop.list_y + i * NOTIF_ROW_H - lround(g_npop.scroll);
-            if (ry >= g_npop.list_y + g_npop.list_h) break;
-            if (ry + NOTIF_ROW_H <= g_npop.list_y) continue;
-            notif_draw_row(cr, pl, i);
-        }
-        cairo_restore(cr);
-
-        cairo_restore(cr);
-    }
-
-    if (g_wlp.open)
-        wlp_draw(cr, pl);
 
     g_object_unref(pl);
     pango_font_description_free(fd);
@@ -8282,6 +9596,213 @@ menu_surface_destroy(struct bar *b)
     menu_surface_free(b);
 }
 
+/* ---------------------------------------------------------------------------
+ * Flyout surface: the strip above the bar that hosts whichever of the nine
+ * flyouts is open. Mirrors the menu surface's lifecycle.
+ * ------------------------------------------------------------------------- */
+
+static void
+fly_frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    struct bar *b = data;
+    (void)time;
+    if (b->fly_frame_cb == cb)
+        b->fly_frame_cb = NULL;
+    wl_callback_destroy(cb);
+    b->fly_frame_pending = 0;
+}
+
+static const struct wl_callback_listener fly_frame_listener = {
+    .done = fly_frame_done,
+};
+
+static void
+fly_commit(struct bar *b)
+{
+    struct surf_commit c = {
+        .ready = b->fly_surf_configured,
+        .surface = b->fly_surface,
+        .pool = &b->fly_pool,
+        .cairo = b->fly_cairo,
+        .width = b->fly_surf_width,
+        .height = b->fly_surf_height,
+        .scale = b->scale,
+        .frame_cb = &b->fly_frame_cb,
+        .frame_pending = &b->fly_frame_pending,
+        .listener = &fly_frame_listener,
+        .listener_data = b,
+    };
+    surf_commit(&c);
+}
+
+static void
+flyout_surface_size_alloc(struct bar *b, int width, int height)
+{
+    int scale = b->scale ? b->scale : 1;
+    int phys_w = width * scale;
+    int phys_h = height * scale;
+    int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, phys_w);
+
+    if (b->fly_cairo && width == b->fly_surf_width &&
+        height == b->fly_surf_height)
+        return;
+    b->fly_surf_width = width;
+    b->fly_surf_height = height;
+    size_t buf_size = stride * phys_h;
+    shm_pool_init(&b->fly_pool, buf_size);
+    if (b->fly_pool.fd < 0) return;
+    pool_cairo_init(&b->fly_pool, &b->fly_cairo, &b->fly_cr,
+                    phys_w, phys_h, stride, scale);
+}
+
+static void
+flyout_surface_free(struct bar *b)
+{
+    if (b->fly_frame_cb) { wl_callback_destroy(b->fly_frame_cb); b->fly_frame_cb = NULL; }
+    b->fly_frame_pending = 0;
+    if (b->fly_cairo) { cairo_surface_destroy(b->fly_cairo); b->fly_cairo = NULL; }
+    if (b->fly_cr) { cairo_destroy(b->fly_cr); b->fly_cr = NULL; }
+    shm_pool_cleanup(&b->fly_pool);
+    b->fly_surf_configured = 0;
+    b->fly_needs_render = 0;
+    b->fly_surf_width = 0;
+    b->fly_surf_height = 0;
+}
+
+static void
+flyout_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
+                       uint32_t serial, uint32_t width, uint32_t height)
+{
+    (void)data;
+    zwlr_layer_surface_v1_ack_configure(surface, serial);
+    struct bar *b = &g_bar;
+    if (!b->fly_layer) return;
+    flyout_surface_size_alloc(b, width, height);
+    b->fly_surf_configured = 1;
+    b->fly_needs_render = 1;
+}
+
+static void
+flyout_layer_closed(void *data, struct zwlr_layer_surface_v1 *surface)
+{
+    (void)data; (void)surface;
+    struct bar *b = &g_bar;
+    b->fly_layer = NULL;
+    b->fly_surface = NULL;
+    flyout_surface_free(b);
+    /* The compositor tore the strip down underneath us. Drop whatever flyout
+     * was open so no hit test keeps answering for a surface that is gone. */
+    close_sibling_popups();
+}
+
+static const struct zwlr_layer_surface_v1_listener flyout_layer_listener = {
+    .configure = flyout_layer_configure,
+    .closed = flyout_layer_closed,
+};
+
+static void
+flyout_surface_render(struct bar *b)
+{
+    if (!b->fly_surf_configured || !b->fly_cr) return;
+
+    cairo_t *cr = b->fly_cr;
+    cairo_save(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(cr);
+    cairo_restore(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+
+    PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
+    pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
+    PangoLayout *pl = pango_ctx_layout(cr);
+    pango_layout_set_font_description(pl, fd);
+
+    flyout_draw(cr, pl);
+
+    g_object_unref(pl);
+    pango_font_description_free(fd);
+
+    cairo_surface_flush(b->fly_cairo);
+    fly_commit(b);
+}
+
+static void
+flyout_surface_create(struct bar *b)
+{
+    if (b->fly_layer) return;
+    if (!g_wl.compositor || !g_wl.layer_shell) return;
+
+    struct wl_surface *surf = wl_compositor_create_surface(g_wl.compositor);
+    b->fly_surface = surf;
+
+    struct zwlr_layer_surface_v1 *ls =
+        zwlr_layer_shell_v1_get_layer_surface(g_wl.layer_shell, surf, NULL,
+            ZWLR_LAYER_SHELL_V1_LAYER_TOP, "jtlab-flyout");
+    b->fly_layer = ls;
+    zwlr_layer_surface_v1_add_listener(ls, &flyout_layer_listener, NULL);
+
+    /* Bottom-anchored with no margin, like the launcher menu surface: the
+     * layer's exclusive zone (the bar's BAR_HEIGHT) is what lifts this clear of
+     * the bar, so adding a margin here too would count the bar height twice and
+     * float the popups a bar's worth too high. The bar's own exclusive zone
+     * does not move the bar itself, so the zone also puts this surface's bottom
+     * edge exactly on the bar's top edge. */
+    uint32_t anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+                      ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT |
+                      ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM;
+    zwlr_layer_surface_v1_set_anchor(ls, anchor);
+    zwlr_layer_surface_v1_set_margin(ls, 0, 0, 0, 0);
+    zwlr_layer_surface_v1_set_size(ls, 0, bar_y_offset());
+    zwlr_layer_surface_v1_set_exclusive_zone(ls, 0);
+    zwlr_layer_surface_v1_set_keyboard_interactivity(ls,
+        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+    /* No input region: the strip is full-width, and taking input across it is
+     * what makes click-anywhere-to-dismiss work. The strip only exists while a
+     * flyout is open, so the grab lasts exactly as long as the flyout does. */
+    wl_surface_commit(surf);
+}
+
+static void
+flyout_surface_destroy(struct bar *b)
+{
+    if (!b->fly_layer) return;
+    zwlr_layer_surface_v1_destroy(b->fly_layer);
+    b->fly_layer = NULL;
+    if (b->fly_surface) wl_surface_destroy(b->fly_surface);
+    b->fly_surface = NULL;
+    flyout_surface_free(b);
+}
+
+/* Size the strip to whichever flyout is open, creating or dropping it as
+ * needed. The reallocation happens in the configure handler; all that happens
+ * here is ask for the right size and let the render flag follow. */
+static void
+flyout_update_size(struct bar *b)
+{
+    if (!b->configured) return;
+    int h = bar_y_offset();
+    if (h <= 0) {
+        if (b->fly_layer) flyout_surface_destroy(b);
+        return;
+    }
+    if (!b->fly_layer) {
+        flyout_surface_create(b);
+        /* The pointer has not moved since the click that opened this popup, so
+         * its coordinates are still the anchor icon's -- on the bar, not on
+         * the strip. Mark it stale so popup_coords_safe() drops the first
+         * click after opening instead of hitting a panel out of nowhere.
+         * This used to fall out of bar_reinit_shm() running on every open. */
+        g_box.resize_at_ms = now_ms();
+        return;
+    }
+    if (b->fly_surf_height != h) {
+        zwlr_layer_surface_v1_set_size(b->fly_layer, 0, h);
+        wl_surface_commit(b->fly_surface);
+    } else {
+        b->fly_needs_render = 1;
+    }
+}
+
 static void
 bar_render(struct bar *b)
 {
@@ -8438,7 +9959,10 @@ static void
 bar_update_size(struct bar *b)
 {
     if (!b->layer_surface || !b->configured) return;
-    int total = BAR_HEIGHT + bar_y_offset();
+    /* The bar is always exactly BAR_HEIGHT tall now. Flyouts live on their own
+     * surface, so opening one no longer resizes or reallocates this buffer --
+     * this only reallocates when the output width or scale changes. */
+    int total = BAR_HEIGHT;
     int scale = b->scale ? b->scale : 1;
     int w = b->width;
 
@@ -8485,6 +10009,7 @@ close_sibling_popups(void)
     wspop_close();
     notifpop_close();
     calpop_close();
+    wxpop_close();
     wlp_close();
     ctx_close();
 }
@@ -8541,8 +10066,8 @@ menu_power_hit_test(double px, double py)
     if (!g_bar.menu_open) return -1;
     double mx = MENU_MARGIN_L;
     double my = 0;
-    double mh_body = g_bar.menu_height - MENU_FLOAT_GAP;
-    double row_base = mh_body - MENU_PADDING - 4 * POWER_ROW_H;
+    double mh_body = g_bar.menu_height - PPADDING;
+    double row_base = menu_power_row_base(mh_body);
     if (!in_rect(px, py, mx, my + row_base, POWER_COL_W, 4 * POWER_ROW_H)) return -1;
     int row = (int)((py - my - row_base) / POWER_ROW_H);
     if (row >= 0 && row < 4) return row;
@@ -8617,7 +10142,11 @@ bar_y_offset(void)
     int nh = g_npop.open ? notif_height() : 0;
     int ch = g_calpop.open ? calpop_height() : 0;
     int wlh = g_wlp.open ? wlp_height() : 0;
-    return ph + cph + vh + th + wh + nh + ch + wlh;
+    int xxh = g_wxpop.open ? wxpop_height() : 0;
+    /* Each panel's height already carries its bottom pad, so the strip is
+     * exactly as tall as the open panel. A top inset would go here too, once
+     * the bar can spawn at the top of the screen. */
+    return ph + cph + vh + th + wh + nh + ch + wlh + xxh;
 }
 
 static int
@@ -8654,12 +10183,18 @@ audio_hit_test(double px, double py)
 }
 
 static int
+wx_hit_test(double px, double py)
+{
+    if (!wx_visible()) return 0;
+    return bar_icon_hit_test(px, py, wx_x(), wx_width(), WEATHER_ICON);
+}
+
+static int
 bar_item_hit_test(double px, double py, const struct bar_item *items, int n, double icon)
 {
-    int bar_y = bar_y_offset();
     for (int i = 0; i < n; i++) {
         double hx = items[i].x + (items[i].w - icon) / 2.0 - 4;
-        if (in_rect(px, py, hx, bar_y, icon + 8, BAR_HEIGHT))
+        if (in_rect(px, py, hx, 0, icon + 8, BAR_HEIGHT))
             return i;
     }
     return -1;
@@ -8678,7 +10213,7 @@ menu_hit_test(double px, double py)
     menu_clamp_scroll();
     double mx = MENU_MARGIN_L;
     double my = 0;
-    double mh_body = g_bar.menu_height - MENU_FLOAT_GAP;
+    double mh_body = g_bar.menu_height - PPADDING;
     if (!in_rect(px, py, mx + POWER_COL_W, my, MENU_WIDTH, mh_body)) return -1;
     double ry = py - my;
     double list_top, list_bottom;
@@ -8693,11 +10228,10 @@ menu_hit_test(double px, double py)
 static int
 toplevel_hit_test(double px, double py)
 {
-    int bar_y = bar_y_offset();
     for (int i = 0; i < g_box.n_taskbar_groups; i++) {
         const struct taskbar_group *g = &g_box.taskbar_groups[i];
         double hx = g->x + (g->w - TASKBAR_ICON) / 2.0 - 4;
-        if (in_rect(px, py, hx, bar_y, TASKBAR_ICON + 8, BAR_HEIGHT))
+        if (in_rect(px, py, hx, 0, TASKBAR_ICON + 8, BAR_HEIGHT))
             return i;
     }
     return -1;
@@ -8708,7 +10242,7 @@ group_popup_hit_test(double px, double py)
 {
     if (!g_gpopup.open) return -1;
     double cw = GROUP_POPUP_W;
-    double ch = g_gpopup.height - MENU_FLOAT_GAP;
+    double ch = g_gpopup.height - PPADDING;
     if (!in_rect(px, py, g_gpopup.x, g_gpopup.y, cw, ch)) return -1;
     int idx = (int)((py - g_gpopup.y - MENU_PADDING) / MENU_ROW_HEIGHT);
     if (idx >= 0 && idx < g_gpopup.n_windows) return idx;
@@ -8774,11 +10308,24 @@ on_bar_surface(void)
 {
     return g_pointer.enter_surface == g_bar.surface;
 }
+/* The flyout strip is a separate surface from the bar, so pointer coordinates
+ * are relative to the strip: the open flyout sits at y=0 and needs no offset
+ * against the bar the way it did when they shared one buffer. */
+static int
+on_flyout_surface(void)
+{
+    /* fly_surface is NULL whenever no flyout is open, so without the NULL test
+     * this would also be true for the pointer sitting over the desktop. */
+    return g_bar.fly_surface && g_pointer.enter_surface == g_bar.fly_surface;
+}
 
 static int
 on_menu_surface(void)
 {
-    return g_pointer.enter_surface == g_bar.menu_surface;
+    /* menu_surface is NULL while the launcher is closed, and enter_surface is
+     * NULL whenever the pointer is over no surface at all, so the NULL test is
+     * what stops a plain desktop click from reading as a launcher click. */
+    return g_bar.menu_surface && g_pointer.enter_surface == g_bar.menu_surface;
 }
 
 struct bar_hover_ent {
@@ -8870,10 +10417,12 @@ menu_hover_refresh(int on_menu)
            old_ctrl != g_sys.ctrl_hover;
 }
 
+/* Hover state is split by surface: the bar's own items are only reachable while
+ * the pointer is on the bar, and a flyout's only while it is on the strip. */
 static int
-bar_hover_refresh(int on_bar)
+bar_hover_refresh(int on_bar, int on_fly)
 {
-    static const struct bar_hover_ent tbl[] = {
+    static const struct bar_hover_ent bar_tbl[] = {
         { &g_pointer.hover_pinned_idx, -1, pinned_hit_test },
         { &g_pointer.hover_taskbar_idx, -1, toplevel_hit_test },
         { &g_pointer.hover_pill, 0, pill_hit_test },
@@ -8883,15 +10432,25 @@ bar_hover_refresh(int on_bar)
         { &g_pointer.hover_audio, 0, audio_hit_test },
         { &g_pointer.hover_tray, -1, tray_hit_test },
         { &g_pointer.hover_ws, 0, workspace_icon_hit_test },
+        { &g_pointer.hover_wx, 0, wx_hit_test },
+    };
+    static const struct bar_hover_ent fly_tbl[] = {
         { &g_wspop.hover_row, -1, wspop_hit_test },
         { &g_calpop.hover_prev, 0, calprev_hit_test },
         { &g_calpop.hover_next, 0, calnext_hit_test },
     };
     int changed = 0;
-    for (size_t i = 0; i < sizeof(tbl) / sizeof(tbl[0]); i++) {
-        int v = on_bar ? tbl[i].hit(g_pointer.x, g_pointer.y) : tbl[i].def;
-        if (*tbl[i].field != v) {
-            *tbl[i].field = v;
+    for (size_t i = 0; i < sizeof(fly_tbl) / sizeof(fly_tbl[0]); i++) {
+        int v = on_fly ? fly_tbl[i].hit(g_pointer.x, g_pointer.y) : fly_tbl[i].def;
+        if (*fly_tbl[i].field != v) {
+            *fly_tbl[i].field = v;
+            changed = 1;
+        }
+    }
+    for (size_t i = 0; i < sizeof(bar_tbl) / sizeof(bar_tbl[0]); i++) {
+        int v = on_bar ? bar_tbl[i].hit(g_pointer.x, g_pointer.y) : bar_tbl[i].def;
+        if (*bar_tbl[i].field != v) {
+            *bar_tbl[i].field = v;
             changed = 1;
         }
     }
@@ -8902,27 +10461,28 @@ static void
 pointer_refresh_hover(void)
 {
     int on_bar = on_bar_surface();
+    int on_fly = on_flyout_surface();
     int on_menu = on_menu_surface();
     int changed = 0;
 
-    changed |= cpop_hover_refresh(on_bar);
-    changed |= gpopup_hover_refresh(on_bar);
-    changed |= volpop_hover_refresh(on_bar);
-    changed |= tm_hover_refresh(on_bar);
-    changed |= notifpop_hover_refresh(on_bar);
+    changed |= cpop_hover_refresh(on_fly);
+    changed |= gpopup_hover_refresh(on_fly);
+    changed |= volpop_hover_refresh(on_fly);
+    changed |= tm_hover_refresh(on_fly);
+    changed |= notifpop_hover_refresh(on_fly);
     {
         int old = g_wlp.hover_idx;
-        g_wlp.hover_idx = (g_wlp.open && on_bar)
+        g_wlp.hover_idx = (g_wlp.open && on_fly)
             ? wlp_hit_test(g_pointer.x, g_pointer.y) : -1;
         if (old != g_wlp.hover_idx) changed = 1;
         int oldp = g_wlp.hover_power;
-        g_wlp.hover_power = (g_wlp.open && on_bar)
+        g_wlp.hover_power = (g_wlp.open && on_fly)
             ? wlp_toggle_hit_test(g_pointer.x, g_pointer.y) : 0;
         if (oldp != g_wlp.hover_power) changed = 1;
     }
     changed |= ctx_hover_refresh(on_menu);
     changed |= menu_hover_refresh(on_menu);
-    changed |= bar_hover_refresh(on_bar);
+    changed |= bar_hover_refresh(on_bar, on_fly);
     if (g_wspop.blue_dragging)
         blue_set_from_x(g_pointer.x);
 
@@ -8933,9 +10493,9 @@ pointer_refresh_hover(void)
         if (over || t - last_log > 500) {
             last_log = t;
             fprintf(stderr,
-                    "[trace] ptr x=%.0f y=%.0f on_bar=%d yoff=%d n_pl=%d "
+                    "[trace] ptr x=%.0f y=%.0f on_bar=%d on_fly=%d n_pl=%d "
                     "n_grp=%d hp=%d ht=%d | G0=%.0f G1=%.0f\n",
-                    g_pointer.x, g_pointer.y, on_bar, bar_y_offset(),
+                    g_pointer.x, g_pointer.y, on_bar, on_fly,
                     g_box.n_pl, g_box.n_taskbar_groups,
                     g_pointer.hover_pinned_idx, g_pointer.hover_taskbar_idx,
                     g_box.n_taskbar_groups > 0 ? g_box.taskbar_groups[0].x : -1.0,
@@ -8975,7 +10535,7 @@ pointer_handle_leave(void *data, struct wl_pointer *pointer,
     notifpop_hover_refresh(0);
     ctx_hover_refresh(0);
     menu_hover_refresh(0);
-    bar_hover_refresh(0);
+    bar_hover_refresh(0, 0);
     render_request();
 }
 
@@ -9014,16 +10574,16 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
 
     if (trace_on())
         fprintf(stderr,
-                "[trace] click b=%u x=%.0f y=%.0f on_bar=%d yoff=%d "
+                "[trace] click b=%u x=%.0f y=%.0f on_bar=%d on_fly=%d "
                 "hp=%d ht=%d n_pl=%d n_grp=%d | G0=%.0f G1=%.0f\n",
                 button, g_pointer.x, g_pointer.y, on_bar_surface(),
-                bar_y_offset(), g_pointer.hover_pinned_idx,
+                on_flyout_surface(), g_pointer.hover_pinned_idx,
                 g_pointer.hover_taskbar_idx, g_box.n_pl,
                 g_box.n_taskbar_groups,
                 g_box.n_taskbar_groups > 0 ? g_box.taskbar_groups[0].x : -1.0,
                 g_box.n_taskbar_groups > 1 ? g_box.taskbar_groups[1].x : -1.0);
 
-    if (popup_coords_safe(time) && g_volpop.open && on_bar_surface()) {
+    if (popup_coords_safe(time) && g_volpop.open && on_flyout_surface()) {
         if (button == BTN_LEFT && volpop_hit_test(g_pointer.x, g_pointer.y)) {
             int tab = volpop_tab_hit_test(g_pointer.x, g_pointer.y);
             if (tab >= 0) {
@@ -9033,7 +10593,7 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
                     if (g_box.audio_present)
                         audio_snapshot(&g_box.vol_snap);
                     volpop_recalc_layout();
-                    bar_update_size(&g_bar);
+                    flyout_update_size(&g_bar);
                 }
                 return;
             }
@@ -9069,19 +10629,26 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
             }
             return;
         }
-        int on_audio = g_box.audio_present && button == BTN_LEFT &&
-                       audio_hit_test(g_pointer.x, g_pointer.y);
-        int vh = volpop_height();
+        /* Missed the panel: the strip is full width, so this is a click in the
+         * empty space beside it. Dismiss. */
         volpop_close();
-        g_pointer.y -= vh;
-        if (on_audio) return;
     }
 
-    if (popup_coords_safe(time) && g_wspop.open && on_bar_surface()) {
+    if (popup_coords_safe(time) && g_wspop.open && on_flyout_surface()) {
         int row = wspop_hit_test(g_pointer.x, g_pointer.y);
         if (row == -2) {
             wspop_close();
             wlp_open();
+            render_request();
+            return;
+        }
+        /* Quick-action buttons: hit codes WS_ACT_HIT_BASE - i for i in
+         * [0, WS_ACT_COUNT), so accept the whole block rather than listing
+         * each code and having to remember to extend it per button. */
+        if (button == BTN_LEFT && row <= WS_ACT_HIT_BASE &&
+            row > WS_ACT_HIT_BASE - WS_ACT_COUNT) {
+            wspop_action_activate(WS_ACT_HIT_BASE - row);
+            wspop_close();
             render_request();
             return;
         }
@@ -9104,14 +10671,10 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
             g_pointer.y >= g_wspop.y && g_pointer.y < g_wspop.y + g_wspop.h) {
             return;
         }
-        int on_ws = workspace_icon_hit_test(g_pointer.x, g_pointer.y);
-        int wh = wspop_height();
         wspop_close();
-        g_pointer.y -= wh;
-        if (on_ws) return;
     }
 
-    if (popup_coords_safe(time) && g_tm.open && on_bar_surface()) {
+    if (popup_coords_safe(time) && g_tm.open && on_flyout_surface()) {
         int row = tray_menu_hit_test(g_pointer.x, g_pointer.y);
         if (row >= 0) {
             struct tray_menu_entry *e = &g_tm.e[g_tm.row[row].e_idx];
@@ -9122,14 +10685,10 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
             render_request();
             return;
         }
-        int on_tray = tray_hit_test(g_pointer.x, g_pointer.y) >= 0;
-        int th = g_tm.height;
         tray_menu_close();
-        g_pointer.y -= th;
-        if (on_tray) return;
     }
 
-    if (popup_coords_safe(time) && g_gpopup.open && on_bar_surface()) {
+    if (popup_coords_safe(time) && g_gpopup.open && on_flyout_surface()) {
         int cidx = group_popup_close_hit_test(g_pointer.x, g_pointer.y);
         if (cidx >= 0) {
             int tl_idx = g_gpopup.windows[cidx];
@@ -9143,23 +10702,10 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
             gpopup_close();
             return;
         }
-        int on_src = 0;
-        int pidx = pinned_hit_test(g_pointer.x, g_pointer.y);
-        if (pidx >= 0 && g_gpopup.n_windows > 0) {
-            on_src = app_matches_id(&g_app.apps[g_app.pinned[pidx]],
-                                    g_toplevels[g_gpopup.windows[0]].app_id);
-        } else {
-            int gidx = toplevel_hit_test(g_pointer.x, g_pointer.y);
-            if (gidx >= 0)
-                on_src = g_box.taskbar_groups[gidx].windows[0] == g_gpopup.windows[0];
-        }
-        int ph = g_gpopup.height;
         gpopup_close();
-        g_pointer.y -= ph;
-        if (on_src) return;
     }
 
-    if (popup_coords_safe(time) && g_cpop.open && on_bar_surface()) {
+    if (popup_coords_safe(time) && g_cpop.open && on_flyout_surface()) {
         int row = cpop_hit_test(g_pointer.x, g_pointer.y);
         if (row >= 0) {
             int n_open = g_cpop.app_idx >= 0;
@@ -9174,12 +10720,10 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
             cpop_close();
             return;
         }
-        double ch = g_cpop.h;
         cpop_close();
-        g_pointer.y -= ch;
     }
 
-    if (popup_coords_safe(time) && g_npop.open && on_bar_surface()) {
+    if (popup_coords_safe(time) && g_npop.open && on_flyout_surface()) {
         if (button == BTN_LEFT &&
             notifpop_clear_hit_test(g_pointer.x, g_pointer.y)) {
             notif_clear_all();
@@ -9201,14 +10745,10 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
         }
         if (notifpop_hit_test(g_pointer.x, g_pointer.y))
             return;
-        int on_bell = bell_hit_test(g_pointer.x, g_pointer.y);
-        int nh = notif_height();
         notifpop_close();
-        g_pointer.y -= nh;
-        if (on_bell) return;
     }
 
-    if (popup_coords_safe(time) && g_wlp.open && on_bar_surface()) {
+    if (popup_coords_safe(time) && g_wlp.open && on_flyout_surface()) {
         if (button == BTN_LEFT && wlp_toggle_hit_test(g_pointer.x, g_pointer.y)) {
             wlp_toggle_power();
             return;
@@ -9221,15 +10761,11 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
         }
         if (idx >= 0)
             return;
-        double body_h = g_wlp.h - MENU_FLOAT_GAP;
+        double body_h = g_wlp.h - PPADDING;
         if (g_pointer.x >= g_wlp.x && g_pointer.x < g_wlp.x + g_wlp.w &&
             g_pointer.y >= g_wlp.y && g_pointer.y < g_wlp.y + body_h)
             return;
-        int on_ws = workspace_icon_hit_test(g_pointer.x, g_pointer.y);
-        int wh = wlp_height();
         wlp_close();
-        g_pointer.y -= wh;
-        if (on_ws) return;
     }
 
     if (popup_coords_safe(time) && g_ctx.open && on_menu_surface()) {
@@ -9301,7 +10837,7 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
             int count = windows_of_app(a, wins, MAX_WINDOWS_PER_GROUP);
             if (count > 1) {
                 if (g_bar.menu_open) menu_close(&g_bar);
-                gpopup_open_pinned(idx, g_box.pl[idx].x, 0);
+                gpopup_open_pinned(idx, g_box.pl[idx].x);
                 return;
             }
             if (g_bar.menu_open) menu_close(&g_bar);
@@ -9322,7 +10858,8 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
             int count = windows_of_app(a, wins, MAX_WINDOWS_PER_GROUP);
             if (count > 0) {
                 close_all_popups();
-                cpop_open(app_idx, count == 1 ? wins[0] : -1, g_box.pl[idx].x + g_box.pl[idx].w / 2.0, 0);
+                cpop_open(app_idx, count == 1 ? wins[0] : -1,
+                          g_box.pl[idx].x + g_box.pl[idx].w / 2.0);
             }
             return;
         }
@@ -9339,14 +10876,14 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
                 int app_idx = app_index_by_app_id(g_toplevels[g->windows[0]].app_id);
                 int win = (g->n_windows == 1) ? g->windows[0] : -1;
                 close_all_popups();
-                cpop_open(app_idx, win, g->x + g->w / 2.0, 0);
+                cpop_open(app_idx, win, g->x + g->w / 2.0);
             } else if (button == BTN_LEFT) {
                 if (g->n_windows == 1) {
                     if (g_bar.menu_open) menu_close(&g_bar);
                     zwlr_foreign_toplevel_handle_v1_activate(g_toplevels[g->windows[0]].handle, g_wl.seat);
                 } else {
                     if (g_bar.menu_open) menu_close(&g_bar);
-                    gpopup_open(gidx, g->x, 0);
+                    gpopup_open(gidx, g->x);
                 }
             }
             return;
@@ -9367,8 +10904,27 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
 
     if (button == BTN_LEFT && g_box.audio_present && on_bar_surface() &&
         audio_hit_test(g_pointer.x, g_pointer.y)) {
-        close_all_popups();
-        volpop_open();
+        /* Toggles, like the workspace/clock/bell icons. The flyout block cannot
+         * catch this click any more -- the icon is on the bar, the panel is on
+         * the strip -- so closing has to be decided here. */
+        if (g_volpop.open) {
+            volpop_close();
+        } else {
+            close_all_popups();
+            volpop_open();
+        }
+        render_request();
+        return;
+    }
+
+    if (button == BTN_LEFT && on_bar_surface() && wx_visible() &&
+        wx_hit_test(g_pointer.x, g_pointer.y)) {
+        if (g_wxpop.open) {
+            wxpop_close();
+        } else {
+            close_all_popups();
+            wxpop_open();
+        }
         render_request();
         return;
     }
@@ -9421,8 +10977,15 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
         }
     }
 
+    if (button == BTN_LEFT && popup_coords_safe(time) && g_wxpop.open &&
+        on_flyout_surface()) {
+        if (in_rect(g_pointer.x, g_pointer.y, g_wxpop.x, g_wxpop.y,
+                    g_wxpop.w, g_wxpop.h - PPADDING))
+            return;
+    }
+
     if (button == BTN_LEFT && popup_coords_safe(time) && g_calpop.open &&
-        on_bar_surface()) {
+        on_flyout_surface()) {
         if (calprev_hit_test(g_pointer.x, g_pointer.y)) {
             calpop_step(-1);
             return;
@@ -9432,11 +10995,11 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
             return;
         }
         if (in_rect(g_pointer.x, g_pointer.y, g_calpop.x, g_calpop.y,
-                    g_calpop.w, g_calpop.h - MENU_FLOAT_GAP))
+                    g_calpop.w, g_calpop.h - PPADDING))
             return;
     }
 
-    if (on_bar_surface()) {
+    if (on_bar_surface() || on_flyout_surface()) {
         close_all_and_render();
     }
 }
@@ -9450,6 +11013,7 @@ pointer_handle_axis(void *d, struct wl_pointer *p, uint32_t t,
     double delta = wl_fixed_to_double(v);
 
     int on_bar = on_bar_surface();
+    int on_fly = on_flyout_surface();
     int over_tray = on_bar ? tray_hit_test(g_pointer.x, g_pointer.y) : -1;
     if (over_tray >= 0) {
         if (!g_tray[over_tray].proxy) return;
@@ -9461,28 +11025,28 @@ pointer_handle_axis(void *d, struct wl_pointer *p, uint32_t t,
     }
 
     int over_audio = on_bar && g_box.audio_present && audio_hit_test(g_pointer.x, g_pointer.y);
-    int over_slider = on_bar && popup_coords_safe(t) && g_volpop.open &&
+    int over_slider = on_fly && popup_coords_safe(t) && g_volpop.open &&
                       volpop_slider_hit_test(g_pointer.x, g_pointer.y);
     if (over_audio || over_slider) {
         volpop_scroll(delta < 0 ? 5.0 : -5.0);
         return;
     }
 
-    int over_notif = on_bar && popup_coords_safe(t) && g_npop.open &&
+    int over_notif = on_fly && popup_coords_safe(t) && g_npop.open &&
                      notifpop_hit_test(g_pointer.x, g_pointer.y);
     if (over_notif) {
         notifpop_scroll(delta < 0 ? -30.0 : 30.0);
         return;
     }
 
-    int over_wlp = on_bar && popup_coords_safe(t) && g_wlp.open &&
+    int over_wlp = on_fly && popup_coords_safe(t) && g_wlp.open &&
                    wlp_hit_test(g_pointer.x, g_pointer.y) >= 0;
     if (over_wlp) {
         wlp_scroll(delta < 0 ? -40.0 : 40.0);
         return;
     }
 
-    int over_blue = on_bar && popup_coords_safe(t) && g_wspop.open &&
+    int over_blue = on_fly && popup_coords_safe(t) && g_wspop.open &&
                     blue_slider_hit_test(g_pointer.x, g_pointer.y);
     if (over_blue) {
         blue_scroll(delta < 0 ? -5 : 5);
@@ -9774,13 +11338,13 @@ toplevel_remap_popups(int closed_idx, int old_last)
         }
         int old_h = g_gpopup.height;
         g_gpopup.n_windows = w;
-        g_gpopup.height = MENU_FLOAT_GAP + MENU_PADDING * 2 +
+        g_gpopup.height = PPADDING + MENU_PADDING * 2 +
                           g_gpopup.n_windows * MENU_ROW_HEIGHT;
         if (g_gpopup.hover_idx >= g_gpopup.n_windows) g_gpopup.hover_idx = -1;
         if (g_gpopup.n_windows == 0) {
             gpopup_close();
         } else if (g_gpopup.height != old_h && g_bar.configured) {
-            bar_update_size(&g_bar);
+            flyout_update_size(&g_bar);
         }
     }
     if (g_cpop.open) {
@@ -9866,6 +11430,12 @@ cleanup()
     if (g_bar.cairo) { cairo_surface_destroy(g_bar.cairo); g_bar.cairo = NULL; }
     if (g_bar.cr) { cairo_destroy(g_bar.cr); g_bar.cr = NULL; }
     shm_pool_cleanup(&g_bar.pool);
+    if (g_bar.fly_frame_cb) { wl_callback_destroy(g_bar.fly_frame_cb); g_bar.fly_frame_cb = NULL; }
+    if (g_bar.fly_cairo) { cairo_surface_destroy(g_bar.fly_cairo); g_bar.fly_cairo = NULL; }
+    if (g_bar.fly_cr) { cairo_destroy(g_bar.fly_cr); g_bar.fly_cr = NULL; }
+    shm_pool_cleanup(&g_bar.fly_pool);
+    if (g_bar.fly_layer) zwlr_layer_surface_v1_destroy(g_bar.fly_layer);
+    if (g_bar.fly_surface) wl_surface_destroy(g_bar.fly_surface);
     shm_pool_cleanup(&g_bar.menu_pool);
     if (g_bar.menu_frame_cb) { wl_callback_destroy(g_bar.menu_frame_cb); g_bar.menu_frame_cb = NULL; }
     if (g_bar.menu_cairo) { cairo_surface_destroy(g_bar.menu_cairo); g_bar.menu_cairo = NULL; }
@@ -9998,6 +11568,7 @@ state_init(void)
 {
     memset(&g_bar, 0, sizeof(g_bar));
     g_bar.pool.fd = -1;
+    g_bar.fly_pool.fd = -1;
     g_bar.menu_pool.fd = -1;
     g_bar.scale = 1;
     g_pw.retry_delay_ms = 250;
@@ -10019,6 +11590,9 @@ services_init(void)
     pw_connect();
     tray_init();
     sys_init();
+    /* After tray_init(), so the SoupSession lands on the main context that the
+     * main loop actually iterates. */
+    wx_maybe_refresh();
 }
 
 static int
@@ -10115,6 +11689,11 @@ main_loop(void)
         if (g_bar.needs_render && g_bar.configured && !g_bar.frame_pending) {
             bar_render(&g_bar);
             g_bar.needs_render = 0;
+        }
+        if (g_bar.fly_needs_render && g_bar.fly_surf_configured &&
+            !g_bar.fly_frame_pending) {
+            flyout_surface_render(&g_bar);
+            g_bar.fly_needs_render = 0;
         }
         if (g_bar.menu_needs_render && g_bar.menu_surf_configured &&
             !g_bar.menu_frame_pending) {
