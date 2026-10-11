@@ -220,7 +220,8 @@
  * moon icon, the "Night light" label and the on/off toggle; the temperature
  * slider sits in its own row directly below. The slider maps 0-100% intensity
  * to a color temperature from BLUE_TEMP_OFF (no filter, 6500K) down to
- * BLUE_TEMP_MIN (max filter), driving an external wlsunset daemon. */
+ * BLUE_TEMP_MIN (max filter), applied natively to every output through the
+ * wlr-gamma-control protocol. */
 #define BLUE_HEADER_H     (WS_WP_BTN_H)
 #define BLUE_SLIDER_TOP   8
 #define BLUE_SLIDER_BOT   12

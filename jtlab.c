@@ -38,6 +38,7 @@
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
 #include "ext-workspace-v1-client-protocol.h"
+#include "wlr-gamma-control-unstable-v1-client-protocol.h"
 
 static struct {
     struct wl_display *display;
@@ -52,11 +53,12 @@ static struct {
     struct zwlr_layer_shell_v1 *layer_shell;
     struct zwlr_foreign_toplevel_manager_v1 *toplevel_mgr;
     struct ext_workspace_manager_v1 *ext_ws_mgr;
+    struct zwlr_gamma_control_manager_v1 *gamma_mgr;
     struct xkb_context *xkb_ctx;
     struct xkb_keymap *xkb_keymap;
     struct xkb_state *xkb_state;
     uint32_t compositor_name, shm_name, seat_name, layer_shell_name;
-    uint32_t toplevel_mgr_name, ext_ws_mgr_name;
+    uint32_t toplevel_mgr_name, ext_ws_mgr_name, gamma_mgr_name;
 } g_wl = { 0 };
 
 static void
@@ -1405,7 +1407,7 @@ static int menu_hit_test(double px, double py);
 static int pinned_running(int pinned_idx);
 static void sys_tick(void);
 static int sys_column_height(void);
-static double menu_vert_pad(double mh_body);
+static double menu_vert_pad(void);
 
 static void
 desktop_file_trim(char *s)
@@ -1719,23 +1721,30 @@ icon_theme_search(const char *theme_dir, const struct icon_theme_dir *dirs,
     return NULL;
 }
 
+/* Append a theme name to a deduplicated chain, honoring its capacity. Shared
+ * by the icon search paths so the ICON_THEME -> config -> fallback ordering
+ * and the dedup logic live in one place. */
+static void
+theme_chain_add(char (*chain)[64], int cap, int *n, const char *name)
+{
+    if (!name || !name[0] || *n >= cap) return;
+    for (int i = 0; i < *n; i++)
+        if (strcmp(chain[i], name) == 0) return;
+    snprintf(chain[*n], sizeof(chain[0]), "%s", name);
+    (*n)++;
+}
+
 static cairo_surface_t *
 icon_theme_lookup(const char *base, int target, char (*roots)[512], int n_roots)
 {
     char chain[8][64];
     int n_chain = 0;
-    const char *cfg = icon_theme_name();
-    const char *ordered[] = { ICON_THEME, cfg, "hicolor", "default", "plasma",
-                              NULL };
-    for (int i = 0; ordered[i] && n_chain < 8; i++) {
-        if (!ordered[i] || !ordered[i][0]) continue;
-        int dup = 0;
-        for (int j = 0; j < n_chain; j++)
-            if (strcmp(chain[j], ordered[i]) == 0) dup = 1;
-        if (!dup) snprintf(chain[n_chain++], sizeof(chain[0]), "%s", ordered[i]);
-    }
+    const char *ordered[] = { ICON_THEME, icon_theme_name(), "hicolor",
+                              "default", "plasma", NULL };
+    for (int i = 0; ordered[i]; i++)
+        theme_chain_add(chain, 8, &n_chain, ordered[i]);
 
-    for (int ci = 0; ci < n_chain && n_chain < 8; ci++) {
+    for (int ci = 0; ci < n_chain; ci++) {
         for (int r = 0; r < n_roots; r++) {
             char dir[600];
             snprintf(dir, sizeof(dir), "%.480s/icons/%.80s", roots[r], chain[ci]);
@@ -1747,12 +1756,8 @@ icon_theme_lookup(const char *base, int target, char (*roots)[512], int n_roots)
             cairo_surface_t *sf = icon_theme_search(dir, dirs, nd, base, target);
             free(dirs);
             if (sf) return sf;
-            for (int k = 0; k < n_inh && n_chain < 8; k++) {
-                int dup = 0;
-                for (int j = 0; j < n_chain; j++)
-                    if (strcmp(chain[j], inh[k]) == 0) dup = 1;
-                if (!dup) snprintf(chain[n_chain++], sizeof(chain[0]), "%s", inh[k]);
-            }
+            for (int k = 0; k < n_inh; k++)
+                theme_chain_add(chain, 8, &n_chain, inh[k]);
         }
     }
     return NULL;
@@ -1794,26 +1799,12 @@ icon_load(const char *icon_name)
                                "places", "preferences", "categories",
                                "emblems", "mimetypes", NULL };
 
-    char themes[4][128] = {{0}};
+    char themes[4][64] = {{0}};
     int n_themes = 0;
-    const char *cfg = icon_theme_name();
-    const char *fallbacks[] = { "hicolor", "default", "plasma", NULL };
-    if (ICON_THEME[0])
-        snprintf(themes[n_themes++], sizeof(themes[0]), "%s", ICON_THEME);
-    if (cfg && cfg[0]) {
-        int dup = 0;
-        for (int i = 0; i < n_themes; i++)
-            if (strcmp(themes[i], cfg) == 0) dup = 1;
-        if (!dup && n_themes < 4)
-            snprintf(themes[n_themes++], sizeof(themes[0]), "%s", cfg);
-    }
-    for (int i = 0; fallbacks[i] && n_themes < 4; i++) {
-        int dup = 0;
-        for (int j = 0; j < n_themes; j++)
-            if (strcmp(themes[j], fallbacks[i]) == 0) dup = 1;
-        if (!dup)
-            snprintf(themes[n_themes++], sizeof(themes[0]), "%s", fallbacks[i]);
-    }
+    const char *ordered[] = { ICON_THEME, icon_theme_name(), "hicolor",
+                              "default", "plasma", NULL };
+    for (int i = 0; ordered[i]; i++)
+        theme_chain_add(themes, 4, &n_themes, ordered[i]);
 
     char roots[16][512];
     int n_roots = 0;
@@ -2253,6 +2244,203 @@ scroll_anim_cancel(struct scroll_anim *a)
         g_source_destroy(*a->src);
         *a->src = NULL;
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * Popup slide/fade transitions
+ *
+ * The flyout strip and the launcher menu are separate layer surfaces that
+ * appear just above the bar. When one is shown its content eases up from behind
+ * the bar and fades in; when it is hidden it eases back down and fades out
+ * before the surface is torn down.
+ *
+ * The closing pass animates a snapshot of the last frame. By the time a close
+ * is requested the owning popup has already cleared its state, so a live redraw
+ * would be blank; the snapshot is what lets the content slide away instead of
+ * vanishing.
+ *
+ * A 16ms timeout only pokes the surface's needs_render flag each tick. The
+ * actual buffer upload is paced by the compositor's frame callbacks in
+ * main_loop(), so the transition runs at the display refresh rate, matching the
+ * existing scroll animations.
+ * ------------------------------------------------------------------------- */
+
+struct transition {
+    GSource *src;
+    int active;             /* a transition is in progress */
+    int closing;            /* running toward hidden */
+    int pending_open;       /* a freshly created surface should ease in */
+    double y, y_target;     /* vertical offset, logical px */
+    double alpha, alpha_target;
+    cairo_surface_t *snapshot;  /* device-pixel frame being animated out */
+    int snap_scale;
+    _Atomic int *flag;      /* the surface's needs_render flag to poke */
+    void (*done)(void);     /* teardown once a close has finished */
+};
+
+static struct transition g_fly_trans;
+static struct transition g_menu_trans;
+
+/* Exponential approach, matching the feel of the scroll animations above. */
+#define TRANS_EASE 0.25
+
+static void
+transition_free_snapshot(struct transition *t)
+{
+    if (t->snapshot) {
+        cairo_surface_destroy(t->snapshot);
+        t->snapshot = NULL;
+    }
+}
+
+static gboolean
+transition_tick(void *data)
+{
+    struct transition *t = data;
+    double dy = t->y_target - t->y;
+    double da = t->alpha_target - t->alpha;
+
+    if (fabs(dy) < 0.5 && fabs(da) < 0.01) {
+        t->y = t->y_target;
+        t->alpha = t->alpha_target;
+        t->src = NULL;
+        t->active = 0;
+        if (t->flag) *t->flag = 1;   /* draw the exact resting frame */
+        if (t->closing) {
+            void (*done)(void) = t->done;
+            t->closing = 0;
+            t->done = NULL;
+            transition_free_snapshot(t);
+            if (done) done();
+        }
+        return G_SOURCE_REMOVE;
+    }
+    t->y += dy * TRANS_EASE;
+    t->alpha += da * TRANS_EASE;
+    if (t->flag) *t->flag = 1;
+    return G_SOURCE_CONTINUE;
+}
+
+static void
+transition_start(struct transition *t)
+{
+    if (t->src) return;
+    GSource *src = g_timeout_source_new(16);
+    g_source_set_callback(src, transition_tick, t, NULL);
+    g_source_attach(src, g_sni.glib_ctx);
+    t->src = src;
+    g_source_unref(src);
+}
+
+static void
+transition_stop(struct transition *t)
+{
+    if (t->src) { g_source_destroy(t->src); t->src = NULL; }
+    transition_free_snapshot(t);
+}
+
+static void
+transition_cancel(struct transition *t)
+{
+    transition_stop(t);
+    t->active = 0;
+    t->closing = 0;
+    t->pending_open = 0;
+    t->y = 0.0;
+    t->alpha = 1.0;
+    t->done = NULL;
+    if (t->flag) *t->flag = 1;
+}
+
+static void
+transition_begin_open(struct transition *t, double dist, _Atomic int *flag)
+{
+    transition_stop(t);
+    t->flag = flag;
+    t->done = NULL;
+    t->closing = 0;
+    t->pending_open = 0;
+    t->active = 1;
+    t->y = dist;
+    t->alpha = 0.0;
+    t->y_target = 0.0;
+    t->alpha_target = 1.0;
+    if (t->flag) *t->flag = 1;
+    transition_start(t);
+}
+
+/* Capture the live surface and ease it out. Returns 1 when a transition was
+ * started (the caller must not destroy the surface; the transition does that
+ * through `done`), 0 when it could not start. */
+static int
+transition_begin_close(struct transition *t, cairo_surface_t *live,
+                       int phys_w, int phys_h, int scale, double dist,
+                       _Atomic int *flag, void (*done)(void))
+{
+    if (!live || phys_w <= 0 || phys_h <= 0) return 0;
+
+    cairo_surface_t *snap =
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, phys_w, phys_h);
+    if (cairo_surface_status(snap) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(snap);
+        return 0;
+    }
+    cairo_t *sc = cairo_create(snap);
+    cairo_set_source_surface(sc, live, 0, 0);
+    cairo_set_operator(sc, CAIRO_OPERATOR_SOURCE);
+    cairo_paint(sc);
+    cairo_destroy(sc);
+
+    transition_stop(t);
+    t->snapshot = snap;
+    t->snap_scale = scale ? scale : 1;
+    t->flag = flag;
+    t->done = done;
+    t->closing = 1;
+    t->pending_open = 0;
+    t->active = 1;
+    t->y = 0.0;
+    t->alpha = 1.0;
+    t->y_target = dist;
+    t->alpha_target = 0.0;
+    if (t->flag) *t->flag = 1;
+    transition_start(t);
+    return 1;
+}
+
+/* Wrap drawing of live content: pushes a group and translates it. Returns a
+ * token for transition_end_frame, or 0 when the surface is at rest and the
+ * caller can draw straight into the buffer. */
+static int
+transition_begin_frame(cairo_t *cr, struct transition *t)
+{
+    if (!t->active && t->y == 0.0 && t->alpha == 1.0)
+        return 0;
+    cairo_push_group(cr);
+    cairo_translate(cr, 0, t->y);
+    return 1;
+}
+
+static void
+transition_end_frame(cairo_t *cr, struct transition *t, int grouped)
+{
+    if (!grouped) return;
+    cairo_pop_group_to_source(cr);
+    cairo_paint_with_alpha(cr, t->alpha);
+}
+
+/* Draw the captured frame for a closing transition (in device pixels). */
+static int
+transition_draw_snapshot(cairo_t *cr, struct transition *t)
+{
+    if (!t->snapshot) return 0;
+    int scale = t->snap_scale ? t->snap_scale : 1;
+    cairo_save(cr);
+    cairo_scale(cr, 1.0 / scale, 1.0 / scale);
+    cairo_set_source_surface(cr, t->snapshot, 0, t->y * scale);
+    cairo_paint_with_alpha(cr, t->alpha);
+    cairo_restore(cr);
+    return 1;
 }
 
 struct tray_item {
@@ -3309,6 +3497,22 @@ pinned_save(void)
     fclose(f);
 }
 
+/* Append an app to the pinned list, growing the backing array when needed.
+ * Returns 1 on success, 0 only if the array could not be grown. */
+static int
+pinned_append(int app_idx)
+{
+    if (g_app.n_pinned >= g_app.pinned_cap) {
+        int new_cap = g_app.pinned_cap ? g_app.pinned_cap * 2 : 16;
+        int *new_pinned = realloc(g_app.pinned, new_cap * sizeof(int));
+        if (!new_pinned) return 0;
+        g_app.pinned = new_pinned;
+        g_app.pinned_cap = new_cap;
+    }
+    g_app.pinned[g_app.n_pinned++] = app_idx;
+    return 1;
+}
+
 static void
 pinned_load(void)
 {
@@ -3329,14 +3533,7 @@ pinned_load(void)
             }
         }
         if (found < 0) continue;
-        if (g_app.n_pinned >= g_app.pinned_cap) {
-            int new_cap = g_app.pinned_cap ? g_app.pinned_cap * 2 : 16;
-            int *new_pinned = realloc(g_app.pinned, new_cap * sizeof(int));
-            if (!new_pinned) break;
-            g_app.pinned = new_pinned;
-            g_app.pinned_cap = new_cap;
-        }
-        g_app.pinned[g_app.n_pinned++] = found;
+        if (!pinned_append(found)) break;
     }
     fclose(f);
 }
@@ -3358,14 +3555,7 @@ pinned_toggle(int app_idx)
             return;
         }
     }
-    if (g_app.n_pinned >= g_app.pinned_cap) {
-        int new_cap = g_app.pinned_cap ? g_app.pinned_cap * 2 : 16;
-        int *new_pinned = realloc(g_app.pinned, new_cap * sizeof(int));
-        if (!new_pinned) return;
-        g_app.pinned = new_pinned;
-        g_app.pinned_cap = new_cap;
-    }
-    g_app.pinned[g_app.n_pinned++] = app_idx;
+    if (!pinned_append(app_idx)) return;
     pinned_save();
     pinned_recalc_layout();
     toplevel_recalc_layout();
@@ -3466,8 +3656,8 @@ run_cmd(const char *cmd, int terminal)
 }
 
 /* SIGTERM every process whose comm matches name. Used to take ownership of the
- * wallpaper (wbg) and night-light (wlsunset) daemons, both of which this bar
- * restarts itself; pkill is not an option for matching on comm alone. */
+ * wallpaper (wbg) daemon, which this bar restarts itself; pkill is not an
+ * option for matching on comm alone. */
 static void
 kill_comm(const char *name)
 {
@@ -3499,7 +3689,7 @@ kill_comm(const char *name)
 static void
 menu_list_area(double mh_body, double *top, double *bottom)
 {
-    double pad = menu_vert_pad(mh_body);
+    double pad = menu_vert_pad();
     *top = 2 * pad;
     *bottom = mh_body - 2 * pad - MENU_SEARCH_H - 2 * pad;
 }
@@ -3670,34 +3860,33 @@ menu_pos_of_app(int app_idx)
 }
 
 static double
-menu_vert_pad(double mh_body)
+menu_vert_pad(void)
 {
-    (void)mh_body;
     return MENU_PADDING;
 }
 
 static double
-menu_search_area(double mh_body)
+menu_search_area(void)
 {
-    return MENU_SEARCH_H + 2 * menu_vert_pad(mh_body);
+    return MENU_SEARCH_H + 2 * menu_vert_pad();
 }
 
 /* Top inset of the profile photo. Deliberately the same expression that
  * menu_list_area() uses for the app list's first row, so the photo lines up
  * with the top of the app rows rather than sitting closer to the panel edge. */
 static double
-menu_avatar_top(double mh_body)
+menu_avatar_top(void)
 {
-    return 2 * menu_vert_pad(mh_body);
+    return 2 * menu_vert_pad();
 }
 
 /* Vertical band at the top of the power column that the profile photo
  * occupies: that top inset, the circle, then a gap that keeps it clear of the
  * power icons below. */
 static double
-menu_avatar_band(double mh_body)
+menu_avatar_band(void)
 {
-    return menu_avatar_top(mh_body) + PROFILE_PHOTO_SIZE + 12;
+    return menu_avatar_top() + PROFILE_PHOTO_SIZE + 12;
 }
 
 /* First power row's y offset within the menu body. Normally bottom-anchored,
@@ -3706,7 +3895,7 @@ static double
 menu_power_row_base(double mh_body)
 {
     double bottom = mh_body - MENU_PADDING - 4 * POWER_ROW_H;
-    double top = menu_avatar_band(mh_body);
+    double top = menu_avatar_band();
     return bottom > top ? bottom : top;
 }
 
@@ -3716,9 +3905,9 @@ calc_menu_height(void)
     int rows = g_app.n_apps;
     double body = 0;
     for (int i = 0; i < 10; i++) {
-        double apps_h = 2 * menu_vert_pad(body) + rows * MENU_ROW_HEIGHT
-                        + 2 * menu_search_area(body);
-        double power_h = menu_avatar_band(body) + 4 * POWER_ROW_H + MENU_PADDING;
+        double apps_h = 2 * menu_vert_pad() + rows * MENU_ROW_HEIGHT
+                        + 2 * menu_search_area();
+        double power_h = menu_avatar_band() + 4 * POWER_ROW_H + MENU_PADDING;
         double sys_h = sys_column_height();
         double b = apps_h > power_h ? apps_h : power_h;
         if (sys_h > b) b = sys_h;
@@ -4398,7 +4587,6 @@ struct ws_popup {
     int blue_on;
     int blue_pct;       /* 0-100 filter intensity */
     int blue_dragging;
-    GSource *blue_src;  /* debounced wlsunset respawn timer */
     double blue_toggle_x, blue_toggle_y;
     double blue_sx, blue_sxmax, blue_sy;   /* slider track geometry */
 };
@@ -4644,6 +4832,10 @@ wspop_hit_test(double px, double py)
  * Night light (blue filter) helpers
  * ------------------------------------------------------------------------- */
 
+/* Defined with the wlr-gamma-control subsystem below; applies a colour
+ * temperature (0 = identity/off) to every output. */
+static void gamma_apply_all(int temp);
+
 static int
 blue_cur_temp(void)
 {
@@ -4666,18 +4858,9 @@ blue_state_path(void)
 static void
 blue_apply(void)
 {
-    kill_comm("wlsunset");
-    if (!g_wspop.blue_on) return;
-
-    int temp = blue_cur_temp();
-    int lo = temp - 1;
-    if (lo < 1000) lo = 1000;
-    char cmd[256];
-    /* Manual fill-color mode: -S/-s pin the whole day to "day" so the applied
-     * color is exactly the -T (high) temperature set by the slider. */
-    snprintf(cmd, sizeof(cmd),
-             "wlsunset -t %d -T %d -S 00:00 -s 23:59 -d 0", lo, temp);
-    run_cmd(cmd, 0);
+    /* A temperature of 0 means "off": every output gets an identity ramp so
+     * the screen is exactly unfiltered. */
+    gamma_apply_all(g_wspop.blue_on ? blue_cur_temp() : 0);
 }
 
 static void
@@ -4686,39 +4869,6 @@ blue_save(void)
     const char *sp = blue_state_path();
     FILE *f = fopen(sp, "w");
     if (f) { fprintf(f, "%d\n%d\n", g_wspop.blue_on, g_wspop.blue_pct); fclose(f); }
-}
-
-static void
-blue_cancel_pending(void)
-{
-    if (g_wspop.blue_src) {
-        g_source_destroy(g_wspop.blue_src);
-        g_wspop.blue_src = NULL;
-    }
-}
-
-/* Debounce the wlsunset respawn so fast slider/scroll input does not kill and
- * relaunch the daemon on every tick (screen flicker). Fires 250ms after the
- * last change; mouse release flushes immediately. */
-static gboolean
-blue_apply_cb(void *data)
-{
-    (void)data;
-    g_wspop.blue_src = NULL;
-    blue_apply();
-    blue_save();
-    return G_SOURCE_REMOVE;
-}
-
-static void
-blue_schedule_apply(void)
-{
-    blue_cancel_pending();
-    GSource *src = g_timeout_source_new(250);
-    g_source_set_callback(src, (GSourceFunc)blue_apply_cb, NULL, NULL);
-    g_source_attach(src, g_sni.glib_ctx);
-    g_wspop.blue_src = src;
-    g_source_unref(src);
 }
 
 static void
@@ -4741,13 +4891,13 @@ static void
 blue_toggle(void)
 {
     g_wspop.blue_on = !g_wspop.blue_on;
-    blue_cancel_pending();
     blue_apply();
     blue_save();
 }
 
-/* Slider drag: only records the new value; the change is applied when the
- * pointer button is released (or via the debounce for scroll). */
+/* Slider drag: records the new value and applies it live. The native gamma
+ * upload is cheap and flicker-free, so the filter tracks the slider instead of
+ * waiting for the button release the way the old wlsunset respawn had to. */
 static void
 blue_set_from_x(double px)
 {
@@ -4759,6 +4909,8 @@ blue_set_from_x(double px)
     int np = (int)lround(f * 100.0);
     if (np == g_wspop.blue_pct) return;
     g_wspop.blue_pct = np;
+    if (g_wspop.blue_on)
+        blue_apply();
     render_request();
 }
 
@@ -4771,7 +4923,8 @@ blue_scroll(int d)
     if (np == g_wspop.blue_pct) return;
     g_wspop.blue_pct = np;
     if (g_wspop.blue_on)
-        blue_schedule_apply();
+        blue_apply();
+    blue_save();
     render_request();
 }
 
@@ -4782,6 +4935,255 @@ blue_slider_hit_test(double px, double py)
     if (px < g_wspop.blue_sx || px > g_wspop.blue_sxmax) return 0;
     double reach = BLUE_SLIDER_H / 2.0 + 8;
     return py >= g_wspop.blue_sy - reach && py <= g_wspop.blue_sy + reach;
+}
+
+/* ---------------------------------------------------------------------------
+ * Native night light: wlr-gamma-control
+ *
+ * The blue-light filter used to be delegated to an external wlsunset daemon
+ * that was killed and respawned on every change. Instead jtlab now holds a
+ * gamma control for each output and uploads a per-channel ramp built from the
+ * requested colour temperature. Uploading a ramp is immediate and flicker
+ * free, and because the ramp belongs to the output it filters every client on
+ * the screen, not just this bar.
+ * ------------------------------------------------------------------------- */
+
+#define MAX_OUTPUTS 16
+
+struct output_entry {
+    uint32_t global_name;
+    struct wl_output *output;
+    struct zwlr_gamma_control_v1 *gamma;
+    uint32_t gamma_size;
+};
+
+static struct output_entry g_outputs[MAX_OUTPUTS];
+static int g_n_outputs = 0;
+
+/* We only need the wl_output object as a handle for the gamma control, but a
+ * listener keeps libwayland from complaining about undelivered events. */
+static void
+output_handle_geometry(void *data, struct wl_output *o, int32_t x, int32_t y,
+                       int32_t pw, int32_t ph, int32_t subpixel,
+                       const char *make, const char *model, int32_t transform)
+{
+    (void)data; (void)o; (void)x; (void)y; (void)pw; (void)ph; (void)subpixel;
+    (void)make; (void)model; (void)transform;
+}
+
+static void
+output_handle_mode(void *data, struct wl_output *o, uint32_t flags,
+                   int32_t w, int32_t h, int32_t refresh)
+{
+    (void)data; (void)o; (void)flags; (void)w; (void)h; (void)refresh;
+}
+
+static void
+output_handle_done(void *data, struct wl_output *o) { (void)data; (void)o; }
+
+static void
+output_handle_scale(void *data, struct wl_output *o, int32_t factor)
+{
+    (void)data; (void)o; (void)factor;
+}
+
+static void
+output_handle_name(void *data, struct wl_output *o, const char *name)
+{
+    (void)data; (void)o; (void)name;
+}
+
+static void
+output_handle_description(void *data, struct wl_output *o, const char *desc)
+{
+    (void)data; (void)o; (void)desc;
+}
+
+static const struct wl_output_listener output_listener = {
+    .geometry = output_handle_geometry,
+    .mode = output_handle_mode,
+    .done = output_handle_done,
+    .scale = output_handle_scale,
+    .name = output_handle_name,
+    .description = output_handle_description,
+};
+
+/* Tanner Helland's blackbody approximation: map a Kelvin temperature to
+ * linear per-channel gains in [0,1]. The red channel stays at full across our
+ * whole range, which is the usual night-light behaviour. */
+static void
+gamma_whitepoint(int temp, double *r, double *g, double *b)
+{
+    double t = temp / 100.0;
+    double rr, gg, bb;
+    if (t <= 66.0)
+        rr = 255.0;
+    else
+        rr = 329.698727446 * pow(t - 60.0, -0.1332047592);
+    if (t <= 66.0)
+        gg = 99.4708025861 * log(t) - 161.1195681661;
+    else
+        gg = 288.1221695283 * pow(t - 60.0, -0.0755148492);
+    if (t >= 66.0)
+        bb = 255.0;
+    else if (t <= 19.0)
+        bb = 0.0;
+    else
+        bb = 138.5177312231 * log(t - 10.0) - 305.0447927307;
+    *r = clampd(rr, 0.0, 255.0) / 255.0;
+    *g = clampd(gg, 0.0, 255.0) / 255.0;
+    *b = clampd(bb, 0.0, 255.0) / 255.0;
+}
+
+/* Fill a 3 x size ramp (red, then green, then blue) as consecutive uint16
+ * tables -- the layout the protocol expects. temp <= 0 yields the identity
+ * ramp used when the filter is off. */
+static void
+gamma_fill_ramp(uint16_t *ramp, uint32_t size, int temp)
+{
+    double r = 1.0, g = 1.0, b = 1.0;
+    if (temp > 0)
+        gamma_whitepoint(temp, &r, &g, &b);
+
+    for (uint32_t i = 0; i < size; i++) {
+        double v = size > 1 ? (double)i / (double)(size - 1) : 0.0;
+        ramp[i]            = (uint16_t)lround(clampd(v * r, 0.0, 1.0) * 65535.0);
+        ramp[size + i]     = (uint16_t)lround(clampd(v * g, 0.0, 1.0) * 65535.0);
+        ramp[2 * size + i] = (uint16_t)lround(clampd(v * b, 0.0, 1.0) * 65535.0);
+    }
+}
+
+/* Build the ramp in an anonymous fd, which set_gamma consumes; the caller
+ * closes its copy afterwards. */
+static int
+gamma_make_fd(uint32_t size, int temp)
+{
+    size_t len = (size_t)size * 3 * sizeof(uint16_t);
+    uint16_t *ramp = malloc(len);
+    if (!ramp) return -1;
+    gamma_fill_ramp(ramp, size, temp);
+
+    int fd = memfd_create("jtlab-gamma", MFD_CLOEXEC);
+    if (fd < 0) { free(ramp); return -1; }
+
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, (const char *)ramp + off, len - off);
+        if (w <= 0) { close(fd); free(ramp); return -1; }
+        off += (size_t)w;
+    }
+    free(ramp);
+    return fd;
+}
+
+static void
+gamma_apply_output(struct output_entry *o, int temp)
+{
+    if (!o->gamma || o->gamma_size == 0) return;
+    int fd = gamma_make_fd(o->gamma_size, temp);
+    if (fd < 0) return;
+    zwlr_gamma_control_v1_set_gamma(o->gamma, fd);
+    close(fd);
+}
+
+static void
+gamma_apply_all(int temp)
+{
+    for (int i = 0; i < g_n_outputs; i++)
+        gamma_apply_output(&g_outputs[i], temp);
+}
+
+static void
+output_gamma_size(void *data, struct zwlr_gamma_control_v1 *gc, uint32_t size)
+{
+    (void)gc;
+    struct output_entry *o = data;
+    o->gamma_size = size;
+    /* The event lands right after the control object is created; (re)apply the
+     * current filter now that a ramp size is known. */
+    if (g_wspop.blue_on)
+        gamma_apply_output(o, blue_cur_temp());
+}
+
+static void
+output_gamma_failed(void *data, struct zwlr_gamma_control_v1 *gc)
+{
+    struct output_entry *o = data;
+    /* This object is no longer valid -- unsupported output, another client
+     * took exclusive control, etc. Drop it; the compositor restores the
+     * original gamma when it goes away. */
+    zwlr_gamma_control_v1_destroy(gc);
+    o->gamma = NULL;
+    o->gamma_size = 0;
+}
+
+static const struct zwlr_gamma_control_v1_listener gamma_listener = {
+    .gamma_size = output_gamma_size,
+    .failed = output_gamma_failed,
+};
+
+static void
+output_gamma_create(struct output_entry *o)
+{
+    if (!g_wl.gamma_mgr || o->gamma) return;
+    o->gamma = zwlr_gamma_control_manager_v1_get_gamma_control(g_wl.gamma_mgr,
+                                                              o->output);
+    if (o->gamma)
+        zwlr_gamma_control_v1_add_listener(o->gamma, &gamma_listener, o);
+}
+
+static void
+output_gamma_create_all(void)
+{
+    for (int i = 0; i < g_n_outputs; i++)
+        output_gamma_create(&g_outputs[i]);
+}
+
+static void
+output_add(struct wl_registry *reg, uint32_t name, uint32_t version)
+{
+    if (g_n_outputs >= MAX_OUTPUTS) return;
+    struct output_entry *o = &g_outputs[g_n_outputs];
+    memset(o, 0, sizeof(*o));
+    o->global_name = name;
+    uint32_t v = version < 4 ? version : 4;
+    o->output = wl_registry_bind(reg, name, &wl_output_interface, v);
+    if (!o->output) return;
+    wl_output_add_listener(o->output, &output_listener, o);
+    g_n_outputs++;
+    output_gamma_create(o);
+}
+
+static void
+output_remove(uint32_t name)
+{
+    for (int i = 0; i < g_n_outputs; i++) {
+        if (g_outputs[i].global_name != name) continue;
+        if (g_outputs[i].gamma)
+            zwlr_gamma_control_v1_destroy(g_outputs[i].gamma);
+        if (g_outputs[i].output)
+            wl_output_destroy(g_outputs[i].output);
+        memmove(&g_outputs[i], &g_outputs[i + 1],
+                (size_t)(g_n_outputs - i - 1) * sizeof(g_outputs[0]));
+        g_n_outputs--;
+        return;
+    }
+}
+
+static void
+gamma_cleanup(void)
+{
+    for (int i = 0; i < g_n_outputs; i++) {
+        if (g_outputs[i].gamma)
+            zwlr_gamma_control_v1_destroy(g_outputs[i].gamma);
+        if (g_outputs[i].output)
+            wl_output_destroy(g_outputs[i].output);
+    }
+    g_n_outputs = 0;
+    if (g_wl.gamma_mgr) {
+        zwlr_gamma_control_manager_v1_destroy(g_wl.gamma_mgr);
+        g_wl.gamma_mgr = NULL;
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -6781,10 +7183,10 @@ avatar_default_draw(cairo_t *cr, double cx, double cy, double r)
 }
 
 static void
-avatar_draw(cairo_t *cr, double mh_body)
+avatar_draw(cairo_t *cr)
 {
     double cx = MENU_MARGIN_L + POWER_COL_W / 2.0;
-    double cy = menu_avatar_top(mh_body) + PROFILE_PHOTO_SIZE / 2.0;
+    double cy = menu_avatar_top() + PROFILE_PHOTO_SIZE / 2.0;
     double r = PROFILE_PHOTO_SIZE / 2.0;
 
     avatar_load();
@@ -7913,9 +8315,9 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
     static const char *power_labels[4] = {
         "Power off", "Reboot", "Log out", "Suspend",
     };
-    double apad = menu_vert_pad(mh_body) * 2;
+    double apad = menu_vert_pad() * 2;
     double row_base = menu_power_row_base(mh_body);
-    avatar_draw(cr, mh_body);
+    avatar_draw(cr);
     for (int i = 0; i < 4; i++) {
         double row_y = my + row_base + i * POWER_ROW_H;
 
@@ -9487,6 +9889,11 @@ menu_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
     menu_surface_size_alloc(b, width, height);
     b->menu_surf_configured = 1;
     b->menu_needs_render = 1;
+    if (g_menu_trans.pending_open) {
+        g_menu_trans.pending_open = 0;
+        transition_begin_open(&g_menu_trans, (double)height,
+                              &b->menu_needs_render);
+    }
 }
 
 static void
@@ -9500,6 +9907,7 @@ menu_hover_reset(void)
 static void
 menu_surface_free(struct bar *b)
 {
+    transition_cancel(&g_menu_trans);
     if (b->menu_frame_cb) { wl_callback_destroy(b->menu_frame_cb); b->menu_frame_cb = NULL; }
     b->menu_frame_pending = 0;
     if (b->menu_cairo) { cairo_surface_destroy(b->menu_cairo); b->menu_cairo = NULL; }
@@ -9539,12 +9947,20 @@ menu_surface_render(struct bar *b)
     cairo_restore(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
+    if (transition_draw_snapshot(cr, &g_menu_trans)) {
+        cairo_surface_flush(b->menu_cairo);
+        menu_commit(b);
+        return;
+    }
+
     PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
     pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(cr);
     pango_layout_set_font_description(pl, fd);
 
+    int grouped = transition_begin_frame(cr, &g_menu_trans);
     menu_draw(cr, pl, g_bar.menu_height);
+    transition_end_frame(cr, &g_menu_trans, grouped);
 
     g_object_unref(pl);
     pango_font_description_free(fd);
@@ -9583,6 +9999,8 @@ menu_surface_create(struct bar *b)
     wl_surface_set_input_region(surf, region);
     wl_region_destroy(region);
     wl_surface_commit(surf);
+    /* The configure that follows is what kicks off the ease-in. */
+    g_menu_trans.pending_open = 1;
 }
 
 static void
@@ -9594,6 +10012,13 @@ menu_surface_destroy(struct bar *b)
     if (b->menu_surface) wl_surface_destroy(b->menu_surface);
     b->menu_surface = NULL;
     menu_surface_free(b);
+}
+
+static void
+menu_close_done(void)
+{
+    /* Runs from the transition tick once the strip has eased fully out. */
+    menu_surface_destroy(&g_bar);
 }
 
 /* ---------------------------------------------------------------------------
@@ -9658,6 +10083,7 @@ flyout_surface_size_alloc(struct bar *b, int width, int height)
 static void
 flyout_surface_free(struct bar *b)
 {
+    transition_cancel(&g_fly_trans);
     if (b->fly_frame_cb) { wl_callback_destroy(b->fly_frame_cb); b->fly_frame_cb = NULL; }
     b->fly_frame_pending = 0;
     if (b->fly_cairo) { cairo_surface_destroy(b->fly_cairo); b->fly_cairo = NULL; }
@@ -9680,6 +10106,11 @@ flyout_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
     flyout_surface_size_alloc(b, width, height);
     b->fly_surf_configured = 1;
     b->fly_needs_render = 1;
+    if (g_fly_trans.pending_open) {
+        g_fly_trans.pending_open = 0;
+        transition_begin_open(&g_fly_trans, (double)height,
+                              &b->fly_needs_render);
+    }
 }
 
 static void
@@ -9712,12 +10143,20 @@ flyout_surface_render(struct bar *b)
     cairo_restore(cr);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
 
+    if (transition_draw_snapshot(cr, &g_fly_trans)) {
+        cairo_surface_flush(b->fly_cairo);
+        fly_commit(b);
+        return;
+    }
+
     PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
     pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(cr);
     pango_layout_set_font_description(pl, fd);
 
+    int grouped = transition_begin_frame(cr, &g_fly_trans);
     flyout_draw(cr, pl);
+    transition_end_frame(cr, &g_fly_trans, grouped);
 
     g_object_unref(pl);
     pango_font_description_free(fd);
@@ -9760,6 +10199,8 @@ flyout_surface_create(struct bar *b)
      * what makes click-anywhere-to-dismiss work. The strip only exists while a
      * flyout is open, so the grab lasts exactly as long as the flyout does. */
     wl_surface_commit(surf);
+    /* The configure that follows is what kicks off the ease-in. */
+    g_fly_trans.pending_open = 1;
 }
 
 static void
@@ -9773,6 +10214,13 @@ flyout_surface_destroy(struct bar *b)
     flyout_surface_free(b);
 }
 
+static void
+flyout_close_done(void)
+{
+    /* Runs from the transition tick once the strip has eased fully out. */
+    flyout_surface_destroy(&g_bar);
+}
+
 /* Size the strip to whichever flyout is open, creating or dropping it as
  * needed. The reallocation happens in the configure handler; all that happens
  * here is ask for the right size and let the render flag follow. */
@@ -9781,10 +10229,48 @@ flyout_update_size(struct bar *b)
 {
     if (!b->configured) return;
     int h = bar_y_offset();
+
     if (h <= 0) {
+        /* Nothing should be open. If the strip is still up, ease it out and
+         * tear it down at the end; otherwise there is nothing to do. */
+        if (g_fly_trans.closing)
+            return;
+        if (b->fly_layer && b->fly_surf_configured && b->fly_cairo) {
+            int scale = b->scale ? b->scale : 1;
+            if (transition_begin_close(&g_fly_trans, b->fly_cairo,
+                                       b->fly_surf_width * scale,
+                                       b->fly_surf_height * scale,
+                                       scale, b->fly_surf_height,
+                                       &b->fly_needs_render,
+                                       flyout_close_done))
+                return;
+        }
         if (b->fly_layer) flyout_surface_destroy(b);
         return;
     }
+
+    /* A new popup is taking over the strip -- either replacing one that was
+     * still easing out, or a second switch landing before the previous resize
+     * configure arrived. The old content goes away at once and the new one
+     * eases open exactly like a fresh open. */
+    if (g_fly_trans.closing || g_fly_trans.pending_open) {
+        transition_cancel(&g_fly_trans);
+        if (b->fly_layer && b->fly_surf_height == h) {
+            /* Same height: no configure is coming, so start the ease now. */
+            transition_begin_open(&g_fly_trans, (double)h, &b->fly_needs_render);
+        } else {
+            /* The strip has to resize before the new content can be drawn.
+             * Show one transparent frame so the old content disappears
+             * immediately, then ease in from the configure -- otherwise the new
+             * popup flashes in at full opacity and *then* animates. */
+            g_fly_trans.y = (double)h;
+            g_fly_trans.alpha = 0.0;
+            g_fly_trans.active = 1;
+            g_fly_trans.pending_open = 1;
+            b->fly_needs_render = 1;
+        }
+    }
+
     if (!b->fly_layer) {
         flyout_surface_create(b);
         /* The pointer has not moved since the click that opened this popup, so
@@ -9995,7 +10481,19 @@ menu_close(struct bar *b)
     ctx_close();
     menu_search_clear();
     g_app.menu_sel = 0;
-    menu_surface_destroy(b);
+
+    int animating = 0;
+    if (b->menu_layer && b->menu_surf_configured && b->menu_cairo) {
+        int scale = b->scale ? b->scale : 1;
+        animating = transition_begin_close(&g_menu_trans, b->menu_cairo,
+                                           b->menu_surf_width * scale,
+                                           b->menu_surf_height * scale,
+                                           scale, b->menu_surf_height,
+                                           &b->menu_needs_render,
+                                           menu_close_done);
+    }
+    if (!animating)
+        menu_surface_destroy(b);
     bar_update_size(b);
 }
 
@@ -10034,6 +10532,10 @@ static void
 menu_open(struct bar *b)
 {
     if (b->menu_open) return;
+    /* A previous instance may still be easing out; reclaim the surface rather
+     * than letting its teardown fire under the new menu. */
+    if (g_menu_trans.closing)
+        transition_cancel(&g_menu_trans);
     close_sibling_popups();
     menu_search_clear();
     b->menu_scroll = 0;
@@ -10048,6 +10550,15 @@ menu_open(struct bar *b)
     sys_stats_refresh();
     mpris_refresh();
     menu_surface_create(b);
+    /* If the surface survived the cancel (still configured), resize it to the
+     * new height ourselves -- menu_surface_create() early-returns when it
+     * exists. */
+    if (b->menu_layer && b->menu_surf_configured &&
+        b->menu_surf_height != b->menu_height) {
+        zwlr_layer_surface_v1_set_size(b->menu_layer, 0, b->menu_height);
+        wl_surface_commit(b->menu_surface);
+    }
+    b->menu_needs_render = 1;
     bar_update_size(b);
 }
 
@@ -10561,10 +11072,9 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
         if (button == BTN_LEFT) {
             g_volpop.dragging = 0;
             if (g_wspop.blue_dragging) {
+                /* The filter already tracked every motion event, so the
+                 * release only has to persist the final value. */
                 g_wspop.blue_dragging = 0;
-                blue_cancel_pending();
-                if (g_wspop.blue_on)
-                    blue_apply();
                 blue_save();
                 render_request();
             }
@@ -11426,6 +11936,8 @@ toplevel_manager_finished(void *data, struct zwlr_foreign_toplevel_manager_v1 *m
 static void
 cleanup()
 {
+    transition_cancel(&g_fly_trans);
+    transition_cancel(&g_menu_trans);
     if (g_bar.frame_cb) { wl_callback_destroy(g_bar.frame_cb); g_bar.frame_cb = NULL; }
     if (g_bar.cairo) { cairo_surface_destroy(g_bar.cairo); g_bar.cairo = NULL; }
     if (g_bar.cr) { cairo_destroy(g_bar.cr); g_bar.cr = NULL; }
@@ -11453,6 +11965,7 @@ cleanup()
     if (g_wl.seat) wl_seat_destroy(g_wl.seat);
     if (g_wl.shm) wl_shm_destroy(g_wl.shm);
     if (g_wl.compositor) wl_compositor_destroy(g_wl.compositor);
+    gamma_cleanup();
     if (g_wl.registry) wl_registry_destroy(g_wl.registry);
 }
 
@@ -11486,6 +11999,10 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name,
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
         g_wl.seat = wl_registry_bind(reg, name, &wl_seat_interface, 5);
         g_wl.seat_name = name;
+        /* The listener must be in place before the seat's capabilities event
+         * is dispatched -- it is what creates the wl_pointer, and the event
+         * can arrive as early as the roundtrip that flushes this bind. */
+        wl_seat_add_listener(g_wl.seat, &seat_listener, NULL);
     } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
         g_wl.layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, 3);
         g_wl.layer_shell_name = name;
@@ -11498,6 +12015,12 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name,
         g_wl.ext_ws_mgr = wl_registry_bind(reg, name, &ext_workspace_manager_v1_interface, 1);
         g_wl.ext_ws_mgr_name = name;
         ext_workspace_manager_v1_add_listener(g_wl.ext_ws_mgr, &ws_mgr_listener, NULL);
+    } else if (strcmp(interface, wl_output_interface.name) == 0) {
+        output_add(reg, name, version);
+    } else if (strcmp(interface, zwlr_gamma_control_manager_v1_interface.name) == 0) {
+        g_wl.gamma_mgr = wl_registry_bind(reg, name, &zwlr_gamma_control_manager_v1_interface, 1);
+        g_wl.gamma_mgr_name = name;
+        output_gamma_create_all();
     }
 }
 
@@ -11530,7 +12053,12 @@ registry_global_remove(void *data, struct wl_registry *reg, uint32_t name)
         g_wl.ext_ws_mgr = NULL;
         g_ws.ws_proxies_n = 0;
         workspaces_placeholder_init();
+    } else if (g_wl.gamma_mgr && g_wl.gamma_mgr_name == name) {
+        /* Controls created by the manager stay valid; only the manager goes. */
+        zwlr_gamma_control_manager_v1_destroy(g_wl.gamma_mgr);
+        g_wl.gamma_mgr = NULL;
     }
+    output_remove(name);
 }
 
 static const struct wl_registry_listener registry_listener = {
@@ -11608,18 +12136,23 @@ wayland_init(void)
     wl_registry_add_listener(g_wl.registry, &registry_listener, NULL);
     wl_display_roundtrip(g_wl.display);
 
+    /* Second roundtrip so the gamma_size events for the controls created above
+     * have landed before blue_load() applies the saved filter state. */
+    wl_display_roundtrip(g_wl.display);
+
     if (!g_wl.compositor || !g_wl.shm || !g_wl.layer_shell) {
         fprintf(stderr, "jtlab: missing wayland globals\n");
         return 0;
     }
+
+    if (!g_wl.gamma_mgr)
+        fprintf(stderr, "jtlab: compositor lacks wlr-gamma-control; night light disabled\n");
 
     if (!g_wl.ext_ws_mgr)
         workspaces_placeholder_init();
 
     cursor_init();
 
-    if (g_wl.seat)
-        wl_seat_add_listener(g_wl.seat, &seat_listener, NULL);
     return 1;
 }
 

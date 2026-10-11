@@ -37,7 +37,7 @@ A lightweight, highly configurable Wayland status bar for wlroots-based composit
 
 ### Desktop Customization
 - **Wallpaper management** - integrated with [wbg](https://codeberg.org/dnkl/wbg) for setting wallpapers. Browse and select wallpapers from a configurable directory in the workspace popup.
-- **Night light** (blue light filter) with adjustable color temperature (6500K down to 2500K), controlled via external `wlsunset` daemon
+- **Night light** (blue light filter) with adjustable color temperature (6500K down to 2500K), applied natively to every output via the `wlr-gamma-control` protocol
 - **Customizable icons** with icon theme support (Adwaita by default)
 
 ### Utilities
@@ -51,7 +51,7 @@ A lightweight, highly configurable Wayland status bar for wlroots-based composit
 - [wayland-client](https://wayland.freedesktop.org/)
 - [wayland-cursor](https://wayland.freedesktop.org/)
 - [wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols)
-- [wlroots protocols](https://gitlab.freedesktop.org/wlroots/wlroots) - includes wlr-layer-shell, wlr-foreign-toplevel-management (protocol XML files provided in `protocols/`)
+- [wlroots protocols](https://gitlab.freedesktop.org/wlroots/wlroots) - includes wlr-layer-shell, wlr-foreign-toplevel-management and wlr-gamma-control (protocol XML files provided in `protocols/`)
 
 ### Graphics & UI
 - [Cairo](https://www.cairographics.org/) - 2D rendering
@@ -72,7 +72,6 @@ A lightweight, highly configurable Wayland status bar for wlroots-based composit
 
 ### Runtime Dependencies (Optional but Recommended)
 - [wbg](https://codeberg.org/dnkl/wbg) - wallpaper setting (required for wallpaper functionality)
-- [wlsunset](https://sr.ht/~kennylevinsen/wlsunset) - night light/blue light filter
 - [foot](https://codeberg.org/dnkl/foot) or any terminal - default is `footclient` (configurable in `config.h`)
 - A wlroots-based Wayland compositor (sway, hyprland, dwl, wayfire, river, niri, etc.)
 
@@ -129,7 +128,7 @@ Key configuration options include:
 - **Wallpaper**: `WALLPAPER_DIR` (default: `~/Wallpapers/`) - also requires [wbg](https://codeberg.org/dnkl/wbg) installed
 - **Weather**: `WEATHER_ENABLED`, `WEATHER_CITY`, refresh intervals
 - **Terminal**: `TERMINAL_CMD` (default: `footclient`)
-- **Night light**: Temperature range controlled via `BLUE_TEMP_OFF`/`BLUE_TEMP_MIN`, integrates with `wlsunset`
+- **Night light**: Temperature range controlled via `BLUE_TEMP_OFF`/`BLUE_TEMP_MIN`, applied natively through the `wlr-gamma-control` protocol
 - **Profile photo**: `PROFILE_PHOTO` path to custom avatar image
 
 After modifying `config.h`, rebuild:
@@ -156,7 +155,7 @@ jtlabctl quit  # Exit jtlab
 - Bind `jtlabctl menu` to a key in your compositor (e.g., Super+D) for quick app launching
 - Ensure [wbg](https://codeberg.org/dnkl/wbg) is installed if you use wallpaper features - the bar sets wallpapers using `wbg`
 - If you have another wallpaper tool running, stop/disable it as jtlab manages wallpapers
-- For night light to work properly, ensure `wlsunset` is installed and accessible
+- For night light to work, the compositor must expose `wlr-gamma-control`; all wlroots-based compositors (sway, Hyprland, dwl, river, niri, ...) do
 
 ## Known Issues
 
