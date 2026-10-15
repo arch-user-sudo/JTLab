@@ -36,7 +36,7 @@ A lightweight, highly configurable Wayland status bar for wlroots-based composit
 - **Mini music player** showing album art, track info, and playback controls (via PipeWire metadata)
 
 ### Desktop Customization
-- **Wallpaper management** - integrated with [wbg](https://codeberg.org/dnkl/wbg) for setting wallpapers. Browse and select wallpapers from a configurable directory in the workspace popup.
+- **Wallpaper management** - rendered natively as a background layer surface per output. Browse and select wallpapers from a configurable directory in the workspace popup.
 - **Night light** (blue light filter) with adjustable color temperature (6500K down to 2500K), applied natively to every output via the `wlr-gamma-control` protocol
 - **Customizable icons** with icon theme support (Adwaita by default)
 
@@ -71,7 +71,6 @@ A lightweight, highly configurable Wayland status bar for wlroots-based composit
 - [wayland-scanner](https://wayland.freedesktop.org/building.html)
 
 ### Runtime Dependencies (Optional but Recommended)
-- [wbg](https://codeberg.org/dnkl/wbg) - wallpaper setting (required for wallpaper functionality)
 - [foot](https://codeberg.org/dnkl/foot) or any terminal - default is `footclient` (configurable in `config.h`)
 - A wlroots-based Wayland compositor (sway, hyprland, dwl, wayfire, river, niri, etc.)
 
@@ -125,7 +124,7 @@ All configuration is done at compile time via `config.h`. Edit it to match your 
 
 Key configuration options include:
 - **Appearance**: `BAR_HEIGHT`, `FONT_FAMILY`, `FONT_SIZE`, colors, corner radius, padding
-- **Wallpaper**: `WALLPAPER_DIR` (default: `~/Wallpapers/`) - also requires [wbg](https://codeberg.org/dnkl/wbg) installed
+- **Wallpaper**: `WALLPAPER_DIR` (default: `~/Wallpapers/`) - PNG is decoded natively, other formats (JPEG, WebP, ...) via GdkPixbuf
 - **Weather**: `WEATHER_ENABLED`, `WEATHER_CITY`, refresh intervals
 - **Terminal**: `TERMINAL_CMD` (default: `footclient`)
 - **Night light**: Temperature range controlled via `BLUE_TEMP_OFF`/`BLUE_TEMP_MIN`, applied natively through the `wlr-gamma-control` protocol
@@ -153,9 +152,18 @@ jtlabctl quit  # Exit jtlab
 
 ### Tips
 - Bind `jtlabctl menu` to a key in your compositor (e.g., Super+D) for quick app launching
-- Ensure [wbg](https://codeberg.org/dnkl/wbg) is installed if you use wallpaper features - the bar sets wallpapers using `wbg`
-- If you have another wallpaper tool running, stop/disable it as jtlab manages wallpapers
+- If you have another wallpaper tool running, stop/disable it as jtlab renders wallpapers itself
 - For night light to work, the compositor must expose `wlr-gamma-control`; all wlroots-based compositors (sway, Hyprland, dwl, river, niri, ...) do
+
+## Memory Usage
+
+jtlab's resident memory is dominated by the wallpaper, and a large footprint here is expected rather than a leak. The image is decoded once into raw, uncompressed pixels and kept in that form while it is the active wallpaper -- it is *not* stored compressed between frames.
+
+- **Uncompressed picture data.** The wallpaper is decoded to raw 32-bit ARGB (4 bytes per pixel) and held that way. The compressed size of the source file is irrelevant; only the pixel resolution matters. A 1080p image costs ~8 MB, 1440p ~14 MB and 4K ~33 MB, whether the source PNG/JPEG is 200 KB or 20 MB. A high-resolution source stays high-resolution in memory even when shown on a smaller output.
+- **One full-resolution buffer per output.** Each output's background layer surface owns an shm buffer sized to that output in device pixels, also 4 bytes per pixel, living in `/dev/shm`. That is roughly 8 MB at 1080p and 33 MB at 4K (or at 2x scale on a 1080p output), per monitor.
+- **Browser thumbnails.** While the wallpaper browser is open, one small 130x80 thumbnail is kept per entry; these are freed when it closes.
+
+Only the current wallpaper is decoded at any time (single-slot cache): selecting a new one destroys the previous decoded image. Because the wallpaper is rendered in its pure, uncompressed form, memory scales with resolution rather than with the source file size.
 
 ## Known Issues
 
@@ -171,6 +179,5 @@ See the source files for license information (if not specified, check the reposi
 
 ## Acknowledgements
 
-- [wbg](https://codeberg.org/dnkl/wbg) for wallpaper setting functionality
 - wlroots community for Wayland protocols and compositor ecosystem
 - The Wayland, Cairo, Pango, PipeWire and other open source projects that make this possible

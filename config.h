@@ -21,7 +21,7 @@
 
 /* Colors: RRGGBB hex + separate alpha (0.0 - 1.0) */
 #define BG_HEX          0x111111
-#define BG_A            0.98
+#define BG_A            0.96
 
 #define FG_HEX          0xFFFFFF
 #define FG_A            1.0

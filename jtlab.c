@@ -3655,34 +3655,6 @@ run_cmd(const char *cmd, int terminal)
     run_cmd_ex(cmd, terminal, 0);
 }
 
-/* SIGTERM every process whose comm matches name. Used to take ownership of the
- * wallpaper (wbg) daemon, which this bar restarts itself; pkill is not an
- * option for matching on comm alone. */
-static void
-kill_comm(const char *name)
-{
-    DIR *proc = opendir("/proc");
-    if (!proc) return;
-    struct dirent *de;
-    char ppath[512], comm[64];
-    while ((de = readdir(proc)) != NULL) {
-        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
-        snprintf(ppath, sizeof(ppath), "/proc/%s/comm", de->d_name);
-        int fd = open(ppath, O_RDONLY);
-        if (fd < 0) continue;
-        ssize_t n = read(fd, comm, 63);
-        close(fd);
-        if (n > 0) {
-            comm[n] = '\0';
-            char *nl = strchr(comm, '\n');
-            if (nl) *nl = '\0';
-            if (strcmp(comm, name) == 0)
-                kill((pid_t)atoi(de->d_name), SIGTERM);
-        }
-    }
-    closedir(proc);
-}
-
 /* The scrollable app list region for a given menu body height. Single source of
  * truth for where rows are drawn and hit-tested: double vertical padding on
  * top/bottom plus the search bar below the list. */
@@ -4955,9 +4927,22 @@ struct output_entry {
     struct wl_output *output;
     struct zwlr_gamma_control_v1 *gamma;
     uint32_t gamma_size;
+    int w, h, scale;
+    struct wl_surface *bg_surface;
+    struct zwlr_layer_surface_v1 *bg_layer;
+    struct shm_pool bg_pool;
+    cairo_surface_t *bg_cairo;
+    cairo_t *bg_cr;
+    int bg_configured;
+    int bg_width, bg_height, bg_scale;
+    struct wl_callback *bg_frame_cb;
+    int bg_frame_pending;
 };
 
-static struct output_entry g_outputs[MAX_OUTPUTS];
+/* Outputs are heap-allocated and stored by pointer so that a Wayland listener
+ * (which holds a pointer to its struct) stays valid when the array is
+ * compacted in output_remove(). */
+static struct output_entry *g_outputs[MAX_OUTPUTS];
 static int g_n_outputs = 0;
 
 /* We only need the wl_output object as a handle for the gamma control, but a
@@ -4975,7 +4960,12 @@ static void
 output_handle_mode(void *data, struct wl_output *o, uint32_t flags,
                    int32_t w, int32_t h, int32_t refresh)
 {
-    (void)data; (void)o; (void)flags; (void)w; (void)h; (void)refresh;
+    (void)data; (void)o; (void)refresh;
+    struct output_entry *out = data;
+    if (out && (flags & WL_OUTPUT_MODE_CURRENT)) {
+        out->w = w;
+        out->h = h;
+    }
 }
 
 static void
@@ -4984,7 +4974,10 @@ output_handle_done(void *data, struct wl_output *o) { (void)data; (void)o; }
 static void
 output_handle_scale(void *data, struct wl_output *o, int32_t factor)
 {
-    (void)data; (void)o; (void)factor;
+    (void)data; (void)o;
+    struct output_entry *out = data;
+    if (out)
+        out->scale = factor;
 }
 
 static void
@@ -5090,7 +5083,7 @@ static void
 gamma_apply_all(int temp)
 {
     for (int i = 0; i < g_n_outputs; i++)
-        gamma_apply_output(&g_outputs[i], temp);
+        gamma_apply_output(g_outputs[i], temp);
 }
 
 static void
@@ -5136,33 +5129,48 @@ static void
 output_gamma_create_all(void)
 {
     for (int i = 0; i < g_n_outputs; i++)
-        output_gamma_create(&g_outputs[i]);
+        output_gamma_create(g_outputs[i]);
 }
+
+/* The wallpaper background layer surface lives with the wallpaper code (it
+ * needs g_wlp), but outputs are bound and unbound here -- these are the
+ * hand-off points. */
+static void output_bg_surface_create(struct output_entry *o);
+static void output_bg_surface_create_all(void);
+static void output_bg_surface_destroy(struct output_entry *o);
 
 static void
 output_add(struct wl_registry *reg, uint32_t name, uint32_t version)
 {
     if (g_n_outputs >= MAX_OUTPUTS) return;
-    struct output_entry *o = &g_outputs[g_n_outputs];
-    memset(o, 0, sizeof(*o));
+    struct output_entry *o = calloc(1, sizeof(*o));
+    if (!o) return;
+    /* shm_pool_cleanup() treats fd >= 0 as a live descriptor, and 0 is a
+     * perfectly good one -- seed the sentinel before anything can run. */
+    o->bg_pool.fd = -1;
     o->global_name = name;
     uint32_t v = version < 4 ? version : 4;
     o->output = wl_registry_bind(reg, name, &wl_output_interface, v);
-    if (!o->output) return;
+    if (!o->output) { free(o); return; }
+    g_outputs[g_n_outputs++] = o;
     wl_output_add_listener(o->output, &output_listener, o);
-    g_n_outputs++;
     output_gamma_create(o);
+    output_bg_surface_create(o);
 }
 
 static void
 output_remove(uint32_t name)
 {
     for (int i = 0; i < g_n_outputs; i++) {
-        if (g_outputs[i].global_name != name) continue;
-        if (g_outputs[i].gamma)
-            zwlr_gamma_control_v1_destroy(g_outputs[i].gamma);
-        if (g_outputs[i].output)
-            wl_output_destroy(g_outputs[i].output);
+        if (g_outputs[i]->global_name != name) continue;
+        output_bg_surface_destroy(g_outputs[i]);
+        if (g_outputs[i]->gamma)
+            zwlr_gamma_control_v1_destroy(g_outputs[i]->gamma);
+        if (g_outputs[i]->output)
+            wl_output_destroy(g_outputs[i]->output);
+        free(g_outputs[i]);
+        /* Move the pointers, not the structs: every live listener holds a
+         * pointer to its entry, so the entries themselves must not move. */
         memmove(&g_outputs[i], &g_outputs[i + 1],
                 (size_t)(g_n_outputs - i - 1) * sizeof(g_outputs[0]));
         g_n_outputs--;
@@ -5174,10 +5182,12 @@ static void
 gamma_cleanup(void)
 {
     for (int i = 0; i < g_n_outputs; i++) {
-        if (g_outputs[i].gamma)
-            zwlr_gamma_control_v1_destroy(g_outputs[i].gamma);
-        if (g_outputs[i].output)
-            wl_output_destroy(g_outputs[i].output);
+        output_bg_surface_destroy(g_outputs[i]);
+        if (g_outputs[i]->gamma)
+            zwlr_gamma_control_v1_destroy(g_outputs[i]->gamma);
+        if (g_outputs[i]->output)
+            wl_output_destroy(g_outputs[i]->output);
+        free(g_outputs[i]);
     }
     g_n_outputs = 0;
     if (g_wl.gamma_mgr) {
@@ -5460,6 +5470,12 @@ struct wall_popup {
     int enabled;
     int hover_power;
     char cur_wallpaper[512];
+    /* Decoded current wallpaper, kept so that a configure event (compositors
+     * re-send one on every layer arrangement change, e.g. a popup opening or
+     * closing) or a power toggle does not re-read and re-decode the file. */
+    cairo_surface_t *wall_image;
+    char wall_image_path[512];
+    long wall_image_mtime;
     struct wall_entry entries[WLP_MAX];
     struct wall_entry_staging staging[WLP_MAX];
     int n_entries;
@@ -6139,6 +6155,229 @@ wlp_hit_test(double px, double py)
     return -1;
 }
 
+/* ---------------------------------------------------------------------------
+ * Wallpaper background
+ *
+ * One layer-shell surface per output, on the background layer, spanning the
+ * whole output. It replaces the external wbg helper the bar used to shell out
+ * to: the image is decoded once and painted (cover-fit) into an shm-backed
+ * cairo surface per output.
+ * ------------------------------------------------------------------------- */
+
+static void
+bg_frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    struct output_entry *o = data;
+    (void)time;
+    if (o->bg_frame_cb == cb)
+        o->bg_frame_cb = NULL;
+    wl_callback_destroy(cb);
+    o->bg_frame_pending = 0;
+}
+
+static const struct wl_callback_listener bg_frame_listener = {
+    .done = bg_frame_done,
+};
+
+/* Upload the painted buffer. The pool's buffer is created once per geometry
+ * and reused; a new pool (and with it a new buffer) is only built when the
+ * compositor reconfigures the surface. */
+static void
+bg_commit(struct output_entry *o)
+{
+    if (!o->bg_surface || !o->bg_configured || !o->bg_cairo) return;
+    int scale = o->bg_scale > 0 ? o->bg_scale : 1;
+    int phys_w = o->bg_width * scale;
+    int phys_h = o->bg_height * scale;
+    int stride = cairo_image_surface_get_stride(o->bg_cairo);
+    if (!o->bg_pool.buffer)
+        o->bg_pool.buffer = shm_pool_create_buffer(&o->bg_pool, phys_w, phys_h,
+                                                   stride, WL_SHM_FORMAT_ARGB8888);
+    if (!o->bg_pool.buffer) return;
+
+    cairo_surface_flush(o->bg_cairo);
+    wl_surface_set_buffer_scale(o->bg_surface, scale);
+    wl_surface_attach(o->bg_surface, o->bg_pool.buffer, 0, 0);
+    wl_surface_damage_buffer(o->bg_surface, 0, 0, phys_w, phys_h);
+
+    if (o->bg_frame_cb) wl_callback_destroy(o->bg_frame_cb);
+    o->bg_frame_cb = wl_surface_frame(o->bg_surface);
+    wl_callback_add_listener(o->bg_frame_cb, &bg_frame_listener, o);
+    o->bg_frame_pending = 1;
+    wl_surface_commit(o->bg_surface);
+}
+
+/* wall == NULL clears the surface (wallpaper switched off, or the file would
+ * not load). Otherwise the image is cover-fit: scaled by the larger of the two
+ * axis ratios and centred, which is what "wbg -s" used to do for us. */
+static void
+bg_paint_output(struct output_entry *o, cairo_surface_t *wall)
+{
+    if (!o->bg_cr || !o->bg_configured) return;
+    cairo_t *cr = o->bg_cr;
+    cairo_save(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+    int w = wall ? cairo_image_surface_get_width(wall) : 0;
+    int h = wall ? cairo_image_surface_get_height(wall) : 0;
+    if (w > 0 && h > 0) {
+        double s = fmax((double)o->bg_width / w, (double)o->bg_height / h);
+        double dw = w * s, dh = h * s;
+        cairo_translate(cr, (o->bg_width - dw) / 2.0, (o->bg_height - dh) / 2.0);
+        cairo_scale(cr, s, s);
+        cairo_set_source_surface(cr, wall, 0, 0);
+        cairo_paint(cr);
+    }
+    cairo_restore(cr);
+    bg_commit(o);
+}
+
+/* Repaint one output from the cached wallpaper state. This is the cheap path:
+ * it never touches the disk, so it is safe to call on a reconfigure. */
+static void
+bg_repaint_output(struct output_entry *o)
+{
+    if (g_wlp.enabled && g_wlp.cur_wallpaper[0])
+        bg_paint_output(o, g_wlp.wall_image);
+    else
+        bg_paint_output(o, NULL);
+}
+
+static cairo_surface_t *
+bg_image_load(const char *path)
+{
+    cairo_surface_t *sf = cairo_image_surface_create_from_png(path);
+    if (cairo_surface_status(sf) == CAIRO_STATUS_SUCCESS)
+        return sf;
+    cairo_surface_destroy(sf);
+    GdkPixbuf *pb = gdk_pixbuf_new_from_file(path, NULL);
+    if (!pb) return NULL;
+    sf = surface_from_pixbuf(pb);
+    g_object_unref(pb);
+    return sf;
+}
+
+/* (Re)build the shm pool and cairo context for the geometry the compositor
+ * just configured. The cairo objects go first: they point into the pool that
+ * is about to be unmapped. */
+static void
+bg_alloc(struct output_entry *o, int width, int height, int scale)
+{
+    if (o->bg_cr) { cairo_destroy(o->bg_cr); o->bg_cr = NULL; }
+    if (o->bg_cairo) { cairo_surface_destroy(o->bg_cairo); o->bg_cairo = NULL; }
+    o->bg_width = width;
+    o->bg_height = height;
+    o->bg_scale = scale;
+    int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, width * scale);
+    if (shm_pool_init(&o->bg_pool, (size_t)stride * height * scale) < 0)
+        return;
+    pool_cairo_init(&o->bg_pool, &o->bg_cairo, &o->bg_cr,
+                    width * scale, height * scale, stride, scale);
+}
+
+static void
+bg_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
+                   uint32_t serial, uint32_t width, uint32_t height)
+{
+    struct output_entry *o = data;
+    zwlr_layer_surface_v1_ack_configure(surface, serial);
+    if (!o->bg_surface || width == 0 || height == 0) return;
+
+    int scale = o->scale > 0 ? o->scale : 1;
+    int changed = !o->bg_cr || !o->bg_configured ||
+        (int)width != o->bg_width || (int)height != o->bg_height ||
+        scale != o->bg_scale;
+    if (changed)
+        bg_alloc(o, width, height, scale);
+    if (!o->bg_cr) return;
+
+    o->bg_configured = 1;
+    /* Compositors re-send configure on every layer arrangement change (a popup
+     * opening or closing, a hotplug, ...) with an unchanged size. Only do the
+     * expensive paint when something actually changed; otherwise this would
+     * re-decode the wallpaper and push a full-screen buffer on every popup. */
+    if (!changed) return;
+    /* Startup races with wlp_load_wallpaper(): whichever of the two runs
+     * second paints. A hot-plugged output gets the current wallpaper too. */
+    bg_repaint_output(o);
+}
+
+static void
+bg_layer_closed(void *data, struct zwlr_layer_surface_v1 *surface)
+{
+    (void)surface;
+    /* The compositor dropped the output. output_remove() may follow with the
+     * registry event, so the teardown has to be idempotent -- it is. */
+    output_bg_surface_destroy(data);
+}
+
+static const struct zwlr_layer_surface_v1_listener bg_layer_listener = {
+    .configure = bg_layer_configure,
+    .closed = bg_layer_closed,
+};
+
+static void
+output_bg_surface_create(struct output_entry *o)
+{
+    if (o->bg_surface || !o->output) return;
+    if (!g_wl.compositor || !g_wl.layer_shell) return;
+
+    struct wl_surface *surf = wl_compositor_create_surface(g_wl.compositor);
+    if (!surf) return;
+    struct zwlr_layer_surface_v1 *ls =
+        zwlr_layer_shell_v1_get_layer_surface(g_wl.layer_shell, surf, o->output,
+            ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, "jtlab-bg");
+    if (!ls) { wl_surface_destroy(surf); return; }
+
+    o->bg_surface = surf;
+    o->bg_layer = ls;
+    zwlr_layer_surface_v1_add_listener(ls, &bg_layer_listener, o);
+    zwlr_layer_surface_v1_set_anchor(ls,
+        ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT |
+        ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM);
+    zwlr_layer_surface_v1_set_size(ls, 0, 0);
+    /* -1: span the whole output, ignoring the bar's exclusive zone, so the
+     * picture reaches underneath it. */
+    zwlr_layer_surface_v1_set_exclusive_zone(ls, -1);
+    zwlr_layer_surface_v1_set_keyboard_interactivity(ls,
+        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+    /* Empty input region: the wallpaper sits behind everything and must never
+     * swallow pointer events meant for the desktop. */
+    struct wl_region *region = wl_compositor_create_region(g_wl.compositor);
+    wl_surface_set_input_region(surf, region);
+    wl_region_destroy(region);
+    wl_surface_commit(surf);
+}
+
+static void
+output_bg_surface_create_all(void)
+{
+    for (int i = 0; i < g_n_outputs; i++)
+        output_bg_surface_create(g_outputs[i]);
+}
+
+static void
+output_bg_surface_destroy(struct output_entry *o)
+{
+    if (o->bg_frame_cb) { wl_callback_destroy(o->bg_frame_cb); o->bg_frame_cb = NULL; }
+    o->bg_frame_pending = 0;
+    if (o->bg_layer) { zwlr_layer_surface_v1_destroy(o->bg_layer); o->bg_layer = NULL; }
+    if (o->bg_surface) { wl_surface_destroy(o->bg_surface); o->bg_surface = NULL; }
+    if (o->bg_cr) { cairo_destroy(o->bg_cr); o->bg_cr = NULL; }
+    if (o->bg_cairo) { cairo_surface_destroy(o->bg_cairo); o->bg_cairo = NULL; }
+    shm_pool_cleanup(&o->bg_pool);
+    o->bg_configured = 0;
+    o->bg_width = o->bg_height = o->bg_scale = 0;
+}
+
+static void
+output_bg_surface_destroy_all(void)
+{
+    for (int i = 0; i < g_n_outputs; i++)
+        output_bg_surface_destroy(g_outputs[i]);
+}
+
 static char *
 wlp_state_path(void)
 {
@@ -6158,17 +6397,34 @@ wlp_save_wallpaper(const char *path)
 }
 
 static void
+wlp_set_wallpaper_bg(const char *path)
+{
+    if (!path || !path[0]) return;
+    /* Decode once and cache, keyed on the path and its mtime: a reconfigure or
+     * a power toggle then repaints the cached surface without re-reading the
+     * file, while an image replaced in place is still picked up. */
+    struct stat st;
+    long mtime = (stat(path, &st) == 0) ? (long)st.st_mtime : 0;
+    if (!g_wlp.wall_image || strcmp(g_wlp.wall_image_path, path) != 0 ||
+        g_wlp.wall_image_mtime != mtime) {
+        cairo_surface_t *wall = bg_image_load(path);
+        if (g_wlp.wall_image) {
+            cairo_surface_destroy(g_wlp.wall_image);
+            g_wlp.wall_image = NULL;
+        }
+        g_wlp.wall_image = wall;
+        g_wlp.wall_image_mtime = mtime;
+        snprintf(g_wlp.wall_image_path, sizeof(g_wlp.wall_image_path),
+                 "%s", path);
+    }
+    for (int i = 0; i < g_n_outputs; i++)
+        bg_paint_output(g_outputs[i], g_wlp.wall_image);
+}
+
+static void
 wlp_set_wallpaper(const char *path)
 {
-    /* Kill old wbg */
-    kill_comm("wbg");
-
-    /* Launch new wbg */
-    char wbg_cmd[600];
-    snprintf(wbg_cmd, sizeof(wbg_cmd), "wbg -s '%s'", path);
-    run_cmd(wbg_cmd, 0);
-
-    /* Track active wallpaper */
+    wlp_set_wallpaper_bg(path);
     strncpy(g_wlp.cur_wallpaper, path, sizeof(g_wlp.cur_wallpaper) - 1);
     g_wlp.cur_wallpaper[sizeof(g_wlp.cur_wallpaper) - 1] = '\0';
 }
@@ -6200,8 +6456,10 @@ wlp_load_wallpaper(void)
         g_wlp.enabled = (flag[0] == '1');
         if (g_wlp.enabled && path[0] && access(path, R_OK) == 0)
             wlp_set_wallpaper(path);
-        else if (path[0])
+        else if (path[0]) {
             strncpy(g_wlp.cur_wallpaper, path, sizeof(g_wlp.cur_wallpaper) - 1);
+            g_wlp.cur_wallpaper[sizeof(g_wlp.cur_wallpaper) - 1] = '\0';
+        }
     }
     fclose(f);
 }
@@ -6234,7 +6492,10 @@ wlp_toggle_power(void)
             wlp_set_wallpaper(g_wlp.cur_wallpaper);
         run_cmd("notify-send 'Wallpaper' 'Enabled'", 0);
     } else {
-        kill_comm("wbg");
+        /* Not a destroy: the surface stays mapped, just emptied, so flipping
+         * the switch back on only has to repaint. */
+        for (int i = 0; i < g_n_outputs; i++)
+            bg_paint_output(g_outputs[i], NULL);
         run_cmd("notify-send 'Wallpaper' 'Disabled'", 0);
     }
     wlp_save_wallpaper(g_wlp.cur_wallpaper);
@@ -11956,6 +12217,8 @@ cleanup()
     if (g_bar.menu_surface) wl_surface_destroy(g_bar.menu_surface);
     if (g_bar.layer_surface) zwlr_layer_surface_v1_destroy(g_bar.layer_surface);
     if (g_bar.surface) wl_surface_destroy(g_bar.surface);
+    output_bg_surface_destroy_all();
+    if (g_wlp.wall_image) { cairo_surface_destroy(g_wlp.wall_image); g_wlp.wall_image = NULL; }
     if (g_wl.layer_shell) zwlr_layer_shell_v1_destroy(g_wl.layer_shell);
     if (g_wl.cursor_surface) wl_surface_destroy(g_wl.cursor_surface);
     if (g_wl.cursor_theme) wl_cursor_theme_destroy(g_wl.cursor_theme);
@@ -12144,6 +12407,10 @@ wayland_init(void)
         fprintf(stderr, "jtlab: missing wayland globals\n");
         return 0;
     }
+
+    /* Outputs may have been advertised before the layer shell was bound, so
+     * the background surfaces could not be made in output_add(); do it now. */
+    output_bg_surface_create_all();
 
     if (!g_wl.gamma_mgr)
         fprintf(stderr, "jtlab: compositor lacks wlr-gamma-control; night light disabled\n");

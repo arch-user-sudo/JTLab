@@ -1,5 +1,5 @@
 CC      ?= gcc
-CFLAGS  ?= -Oz -march=native -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -std=c11 -D_GNU_SOURCE \
+CFLAGS  ?= -O2 -march=native -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -std=c11 -D_GNU_SOURCE \
            -flto -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables \
            -fno-pie -fno-plt -fno-ident
 LDFLAGS ?= -no-pie -Wl,--gc-sections -Wl,--as-needed -Wl,-O1 -s
