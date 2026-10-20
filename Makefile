@@ -1,4 +1,5 @@
 CC      ?= gcc
+.DEFAULT_GOAL := all
 CFLAGS  ?= -O2 -march=native -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -std=c11 -D_GNU_SOURCE \
            -flto -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables \
            -fno-pie -fno-plt -fno-ident
@@ -8,9 +9,34 @@ LDFLAGS ?= -no-pie -Wl,--gc-sections -Wl,--as-needed -Wl,-O1 -s
 DEBUG_CFLAGS = -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -std=c11 -D_GNU_SOURCE
 LIBS    = -lwayland-client -lm -lpangocairo-1.0 -lpango-1.0 -lgobject-2.0 -lcairo -lglib-2.0 -lrsvg-2 -lpipewire-0.3 -lxkbcommon
 
-CFLAGS  += $(shell pkg-config --cflags wayland-client wayland-cursor pangocairo glib-2.0 gio-2.0 cairo librsvg-2.0 libpipewire-0.3 gdk-pixbuf-2.0 libsoup-3.0 xkbcommon 2>/dev/null)
-DEBUG_CFLAGS += $(shell pkg-config --cflags wayland-client wayland-cursor pangocairo glib-2.0 gio-2.0 cairo librsvg-2.0 libpipewire-0.3 gdk-pixbuf-2.0 libsoup-3.0 xkbcommon 2>/dev/null)
-LDFLAGS += $(shell pkg-config --libs wayland-client wayland-cursor pangocairo glib-2.0 gio-2.0 cairo librsvg-2.0 libpipewire-0.3 gdk-pixbuf-2.0 libsoup-3.0 xkbcommon 2>/dev/null)
+PKGS    = wayland-client wayland-cursor pangocairo glib-2.0 gio-2.0 cairo librsvg-2.0 libpipewire-0.3 gdk-pixbuf-2.0 libsoup-3.0 xkbcommon
+
+CFLAGS  += $(shell pkg-config --cflags $(PKGS) 2>/dev/null)
+DEBUG_CFLAGS += $(shell pkg-config --cflags $(PKGS) 2>/dev/null)
+LDFLAGS += $(shell pkg-config --libs $(PKGS) 2>/dev/null)
+
+# Strict warning pass over the hand-written sources (opt-in: `make strict`).
+# The pkg-config include dirs are switched to -isystem so third-party headers
+# (pipewire's spa inline helpers) don't trip -Wconversion; jtlab.c and
+# jtlabctl.c themselves must be warning-free.
+STRICT_FLAGS ?= -Werror -Wshadow -Wconversion -Wsign-conversion
+STRICT_CFLAGS = -O2 -march=native -Wall -Wextra -Wno-unused-parameter \
+                -Wno-missing-field-initializers -std=c11 -D_GNU_SOURCE \
+                -fno-strict-aliasing -fno-strict-overflow -I. -I$(BUILD_DIR) \
+                $(shell pkg-config --cflags $(PKGS) 2>/dev/null | sed 's/-I/-isystem /g')
+
+strict: $(PROTO_HDRS)
+	$(CC) $(STRICT_CFLAGS) $(STRICT_FLAGS) -fsyntax-only jtlab.c jtlabctl.c
+
+# Static analysis (opt-in).  Reports only; nothing here modifies sources.
+TIDY_CHECKS = -*,clang-analyzer-*,bugprone-*,performance-*,readability-*,misc-*,portability-*
+tidy:
+	clang-tidy -quiet -checks='$(TIDY_CHECKS)' jtlab.c -- $(STRICT_CFLAGS)
+
+cppcheck:
+	cppcheck --enable=warning,style,performance,portability --inconclusive \
+	         --std=c11 --language=c -I. -I$(BUILD_DIR) \
+	         --suppress=missingIncludeSystem jtlab.c
 
 PROTOCOL_DIR = protocols
 BUILD_DIR    = build
@@ -107,4 +133,4 @@ install: jtlab jtlabctl
 uninstall:
 	rm -f /usr/local/bin/jtlab /usr/local/bin/jtlabctl
 
-.PHONY: all clean install uninstall debug
+.PHONY: all clean install uninstall debug strict tidy cppcheck

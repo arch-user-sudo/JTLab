@@ -79,10 +79,10 @@ cursor_set(struct wl_pointer *pointer, uint32_t serial)
     if (!g_wl.cursor_default || !g_wl.cursor_surface) return;
     struct wl_cursor_image *img = g_wl.cursor_default->images[0];
     wl_pointer_set_cursor(pointer, serial, g_wl.cursor_surface,
-                          img->hotspot_x, img->hotspot_y);
+                          (int32_t)img->hotspot_x, (int32_t)img->hotspot_y);
     wl_surface_attach(g_wl.cursor_surface,
                       wl_cursor_image_get_buffer(img), 0, 0);
-    wl_surface_damage(g_wl.cursor_surface, 0, 0, img->width, img->height);
+    wl_surface_damage(g_wl.cursor_surface, 0, 0, (int32_t)img->width, (int32_t)img->height);
     wl_surface_commit(g_wl.cursor_surface);
 }
 
@@ -187,7 +187,7 @@ shm_pool_init(struct shm_pool *p, size_t size)
         p->fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
         if (p->fd >= 0) {
             shm_unlink(name);
-            if (ftruncate(p->fd, size) == 0) break;
+            if (ftruncate(p->fd, (off_t)size) == 0) break;
             close(p->fd);
             p->fd = -1;
         }
@@ -196,7 +196,7 @@ shm_pool_init(struct shm_pool *p, size_t size)
 
     p->data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, p->fd, 0);
     if (p->data == MAP_FAILED) { close(p->fd); p->fd = -1; return -1; }
-    p->wl_pool = wl_shm_create_pool(g_wl.shm, p->fd, size);
+    p->wl_pool = wl_shm_create_pool(g_wl.shm, p->fd, (int32_t)size);
     if (!p->wl_pool) { shm_pool_cleanup(p); return -1; }
     return 0;
 }
@@ -451,7 +451,7 @@ clock_layout(cairo_t *cr)
 static double
 snap_px(double v)
 {
-    return lround(v);
+    return (double)lround(v);
 }
 
 static double
@@ -899,7 +899,7 @@ registry_event_global_remove(void *data, uint32_t id)
         }
 
         memmove(&g_pw.devices[i], &g_pw.devices[i + 1],
-                n_after * sizeof(struct audio_dev));
+                (size_t)n_after * sizeof(struct audio_dev));
         g_pw.n_devices--;
 
         for (int k = i; k < g_pw.n_devices; k++) {
@@ -938,7 +938,7 @@ node_event_param(void *data, int seq, uint32_t id, uint32_t index,
     if (param->size <= sizeof(struct spa_pod_object_body)) return;
 
     const uint8_t *body = (const uint8_t *)&obj->body + sizeof(struct spa_pod_object_body);
-    uint32_t body_size = param->size - sizeof(struct spa_pod_object_body);
+    uint32_t body_size = (uint32_t)(param->size - sizeof(struct spa_pod_object_body));
 
     float volumes[64];
     int n_ch = 0;
@@ -947,7 +947,7 @@ node_event_param(void *data, int seq, uint32_t id, uint32_t index,
     uint32_t off = 0;
     while (off + 8 <= body_size) {
         const struct spa_pod_prop *prop = (const struct spa_pod_prop *)(body + off);
-        uint32_t padded = SPA_ROUND_UP_N(SPA_POD_PROP_SIZE(prop), 8);
+        uint32_t padded = (uint32_t)SPA_ROUND_UP_N(SPA_POD_PROP_SIZE(prop), 8);
         if (padded == 0 || off + padded > body_size) break;
 
         if (prop->key == SPA_PROP_channelVolumes && prop->value.type == SPA_TYPE_Array) {
@@ -956,8 +956,8 @@ node_event_param(void *data, int seq, uint32_t id, uint32_t index,
             uint32_t child_size = arr->child.size;
             if (child_size == sizeof(float)) {
                 const void *data_ptr = (const uint8_t *)arr + sizeof(*arr);
-                uint32_t data_size = SPA_POD_BODY_SIZE(&prop->value) - sizeof(*arr);
-                n_ch = data_size / child_size;
+                uint32_t data_size = (uint32_t)(SPA_POD_BODY_SIZE(&prop->value) - sizeof(*arr));
+                n_ch = (int)(data_size / child_size);
                 if (n_ch > 64) n_ch = 64;
                 const float *vol_data = data_ptr;
                 for (int i = 0; i < n_ch; i++)
@@ -972,7 +972,7 @@ node_event_param(void *data, int seq, uint32_t id, uint32_t index,
     if (n_ch > 0) {
         float sum = 0;
         for (int i = 0; i < n_ch; i++) sum += volumes[i];
-        d->volume = cbrtf(sum / n_ch) * 100.0f;
+        d->volume = cbrtf(sum / (float)n_ch) * 100.0f;
         d->channels = n_ch;
     }
     if (muted >= 0) d->muted = muted;
@@ -1431,7 +1431,7 @@ app_add(const char *name, const char *exec, const char *icon, const char *deskto
     }
     if (g_app.n_apps >= g_app.apps_cap) {
         int new_cap = g_app.apps_cap ? g_app.apps_cap * 2 : 64;
-        struct app_entry *new_apps = realloc(g_app.apps, new_cap * sizeof(*g_app.apps));
+        struct app_entry *new_apps = realloc(g_app.apps, (size_t)new_cap * sizeof(*g_app.apps));
         if (!new_apps) return;
         g_app.apps = new_apps;
         g_app.apps_cap = new_cap;
@@ -1942,7 +1942,7 @@ static void cpop_close(void);
 static void
 pinned_drop(int p)
 {
-    memmove(&g_app.pinned[p], &g_app.pinned[p + 1], (g_app.n_pinned - p - 1) * sizeof(int));
+    memmove(&g_app.pinned[p], &g_app.pinned[p + 1], (size_t)(g_app.n_pinned - p - 1) * sizeof(int));
     g_app.n_pinned--;
     pinned_save();
     pinned_recalc_layout();
@@ -1959,7 +1959,7 @@ app_drop(int k)
     free(g_app.apps[k].desktop_id);
     free(g_app.apps[k].wm_class);
     if (g_app.apps[k].icon) cairo_surface_destroy(g_app.apps[k].icon);
-    memmove(&g_app.apps[k], &g_app.apps[k + 1], (g_app.n_apps - k - 1) * sizeof(*g_app.apps));
+    memmove(&g_app.apps[k], &g_app.apps[k + 1], (size_t)(g_app.n_apps - k - 1) * sizeof(*g_app.apps));
     g_app.n_apps--;
 
     int w = 0;
@@ -2094,7 +2094,7 @@ static void
 apps_scan(void)
 {
     apps_scan_load();
-    qsort(g_app.apps, g_app.n_apps, sizeof(*g_app.apps), app_compare);
+    qsort(g_app.apps, (size_t)g_app.n_apps, sizeof(*g_app.apps), app_compare);
 }
 
 static void
@@ -2154,7 +2154,7 @@ apps_free(void)
 static int bar_y_offset(void);
 static cairo_surface_t *surface_from_pixbuf(GdkPixbuf *pb);
 static void panel_begin(cairo_t *cr, double x, double y, double w, double h,
-                        double r, double sw, double sa, int recurse);
+                        double r, double sh_w, double sh_a, int inset_border);
 
 static int
 in_rect(double px, double py, double x, double y, double w, double h)
@@ -2588,7 +2588,7 @@ tray_surface_from_pixmap(GVariant *pixmap)
     int stride = cairo_image_surface_get_stride(sf);
     const unsigned char *src = best_data;
     for (int y = 0; y < best_h; y++) {
-        memcpy(out + (size_t)y * stride, src, (size_t)best_w * 4);
+        memcpy(out + (size_t)y * (size_t)stride, src, (size_t)best_w * 4);
         src += (size_t)best_w * 4;
     }
     cairo_surface_mark_dirty(sf);
@@ -3504,7 +3504,7 @@ pinned_append(int app_idx)
 {
     if (g_app.n_pinned >= g_app.pinned_cap) {
         int new_cap = g_app.pinned_cap ? g_app.pinned_cap * 2 : 16;
-        int *new_pinned = realloc(g_app.pinned, new_cap * sizeof(int));
+        int *new_pinned = realloc(g_app.pinned, (size_t)new_cap * sizeof(int));
         if (!new_pinned) return 0;
         g_app.pinned = new_pinned;
         g_app.pinned_cap = new_cap;
@@ -3751,7 +3751,7 @@ menu_filter_update(void)
 {
     if (g_app.apps_cap > g_app.menu_idx_cap) {
         int cap = g_app.apps_cap > 0 ? g_app.apps_cap : 64;
-        int *ni = realloc(g_app.menu_idx, cap * sizeof(*g_app.menu_idx));
+        int *ni = realloc(g_app.menu_idx, (size_t)cap * sizeof(*g_app.menu_idx));
         if (!ni) return;
         g_app.menu_idx = ni;
         g_app.menu_idx_cap = cap;
@@ -3764,7 +3764,7 @@ menu_filter_update(void)
             continue;
         g_app.menu_idx[g_app.menu_n++] = i;
     }
-    qsort(g_app.menu_idx, g_app.menu_n, sizeof(*g_app.menu_idx), menu_idx_compare);
+    qsort(g_app.menu_idx, (size_t)g_app.menu_n, sizeof(*g_app.menu_idx), menu_idx_compare);
     if (g_app.menu_sel >= g_app.menu_n) g_app.menu_sel = g_app.menu_n ? g_app.menu_n - 1 : 0;
     if (g_app.menu_sel < 0) g_app.menu_sel = 0;
     menu_clamp_scroll();
@@ -3778,7 +3778,7 @@ menu_search_add(const char *utf8, int len)
 {
     int n = (int)strlen(g_app.search);
     if (n + len >= (int)sizeof(g_app.search)) return;
-    memcpy(g_app.search + n, utf8, len);
+    memcpy(g_app.search + n, utf8, (size_t)len);
     g_app.search[n + len] = '\0';
     menu_filter_update();
     render_request();
@@ -4658,7 +4658,7 @@ wspop_body_h(void)
 static int
 wspop_height(void)
 {
-    return PPADDING + wspop_body_h();
+    return (int)(PPADDING + wspop_body_h());
 }
 
 /* Row tops, all derived so drawing and hit-testing cannot drift apart. */
@@ -5713,7 +5713,7 @@ notifpop_trash_hit_test(double px, double py)
     if (!g_npop.open) return 0;
     int row = notifpop_row_hit_test(px, py);
     if (row < 0) return 0;
-    double tcy = g_npop.list_y + row * NOTIF_ROW_H - lround(g_npop.scroll) +
+    double tcy = g_npop.list_y + row * NOTIF_ROW_H - (double)lround(g_npop.scroll) +
                  NOTIF_ROW_H / 2.0;
     return in_rect(px, py, g_npop.trash_cx - NOTIF_TRASH_ICON / 2.0 - 5,
                    tcy - NOTIF_TRASH_ICON / 2.0 - 5,
@@ -5766,7 +5766,7 @@ notif_remove_idx(int idx, uint32_t reason)
     if (idx < 0 || idx >= g_n_notifs) return;
     uint32_t id = g_notifs[idx].id;
     memmove(&g_notifs[idx], &g_notifs[idx + 1],
-            (g_n_notifs - idx - 1) * sizeof(struct notif_entry));
+            (size_t)(g_n_notifs - idx - 1) * sizeof(struct notif_entry));
     g_n_notifs--;
     if (g_sni.dbus_conn) {
         g_dbus_connection_emit_signal(g_sni.dbus_conn, NULL,
@@ -5952,7 +5952,7 @@ wlp_scan(void)
     while ((entry = readdir(dir)) != NULL && g_wlp.n_entries < WLP_MAX) {
         if (entry->d_type != DT_REG) continue;
         const char *n = entry->d_name;
-        int l = strlen(n);
+        int l = (int)strlen(n);
         if (l < 5) continue;
         const char *dot = strrchr(n, '.');
         if (!dot || (strcmp(dot, ".jpg") != 0 && strcmp(dot, ".png") != 0 &&
@@ -5969,7 +5969,7 @@ wlp_scan(void)
     }
     closedir(dir);
 
-    qsort(g_wlp.entries, g_wlp.n_entries, sizeof(struct wall_entry), wlp_cmp_mtime);
+    qsort(g_wlp.entries, (size_t)g_wlp.n_entries, sizeof(struct wall_entry), wlp_cmp_mtime);
 }
 
 static void
@@ -6270,7 +6270,7 @@ bg_alloc(struct output_entry *o, int width, int height, int scale)
     o->bg_height = height;
     o->bg_scale = scale;
     int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, width * scale);
-    if (shm_pool_init(&o->bg_pool, (size_t)stride * height * scale) < 0)
+    if (shm_pool_init(&o->bg_pool, (size_t)stride * (size_t)height * (size_t)scale) < 0)
         return;
     pool_cairo_init(&o->bg_pool, &o->bg_cairo, &o->bg_cr,
                     width * scale, height * scale, stride, scale);
@@ -6289,7 +6289,7 @@ bg_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
         (int)width != o->bg_width || (int)height != o->bg_height ||
         scale != o->bg_scale;
     if (changed)
-        bg_alloc(o, width, height, scale);
+        bg_alloc(o, (int)width, (int)height, scale);
     if (!o->bg_cr) return;
 
     o->bg_configured = 1;
@@ -6652,7 +6652,7 @@ xml_escape_append(GString *s, const char *in)
         case '&': g_string_append(s, "&amp;"); break;
         case '<': g_string_append(s, "&lt;"); break;
         case '>': g_string_append(s, "&gt;"); break;
-        default: g_string_append_c(s, *p); break;
+        default: g_string_append_c(s, (gchar)*p); break;
         }
     }
 }
@@ -6661,7 +6661,7 @@ static void
 notif_draw_row(cairo_t *cr, PangoLayout *pl, int row)
 {
     struct notif_entry *e = &g_notifs[g_n_notifs - 1 - row];
-    double ry = g_npop.list_y + row * NOTIF_ROW_H - lround(g_npop.scroll);
+    double ry = g_npop.list_y + row * NOTIF_ROW_H - (double)lround(g_npop.scroll);
     double row_w = g_npop.rows_w;
     double box_y = ry + NOTIF_BOX_GAP / 2.0;
     double box_h = NOTIF_ROW_H - NOTIF_BOX_GAP;
@@ -7718,7 +7718,7 @@ wx_url_encode(const char *in, char *out, size_t n)
     for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
         if (o + 4 >= n) break;
         if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' || *p == '~')
-            out[o++] = *p;
+            out[o++] = (char)*p;
         else
             o += (size_t)snprintf(out + o, n - o, "%%%02X", *p);
     }
@@ -8018,7 +8018,7 @@ sys_stats_refresh(void)
         fclose(f);
     }
     if (total > 0 && avail >= 0)
-        g_sys.pct[SYS_STAT_RAM] = 100.0 * (total - avail) / total;
+        g_sys.pct[SYS_STAT_RAM] = 100.0 * (double)(total - avail) / (double)total;
 
     f = fopen("/proc/stat", "r");
     if (f) {
@@ -8603,10 +8603,10 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
         cairo_rectangle(cr, mx + POWER_COL_W, list_top, MENU_WIDTH, list_h);
         cairo_clip(cr);
     }
-    double sofs = lround(g_bar.menu_anim_px);
+    double sofs = (double)lround(g_bar.menu_anim_px);
     int first_pos = (int)(sofs / MENU_ROW_HEIGHT);
-    for (int r = 0; r <= vis_rows; r++) {
-        int pos = first_pos + r;
+    for (int ri = 0; ri <= vis_rows; ri++) {
+        int pos = first_pos + ri;
         if (pos >= g_app.menu_n) break;
         int i = g_app.menu_idx[pos];
         double row_y = list_top + pos * MENU_ROW_HEIGHT - sofs;
@@ -8674,9 +8674,9 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
         double cr2_y = g_ctx.y;
         double cw = CTX_WIDTH;
         double ch = g_ctx.n_items * CTX_ROW_HEIGHT;
-        double r = PRADIUS;
+        double crad = PRADIUS;
 
-        panel_begin(cr, cr2_x, cr2_y, cw, ch, r, CTX_SHADOW_W, CTX_SHADOW_A, 0);
+        panel_begin(cr, cr2_x, cr2_y, cw, ch, crad, CTX_SHADOW_W, CTX_SHADOW_A, 0);
 
         const char *pin_label = pinned_is(g_ctx.target_app) ? "Unpin from bar" : "Pin to bar";
 
@@ -8736,7 +8736,7 @@ icon_content_box(cairo_surface_t *sf, int *x0, int *y0, int *x1, int *y1)
     int stride = cairo_image_surface_get_stride(sf);
     unsigned char *d = cairo_image_surface_get_data(sf);
     for (int y = 0; y < ih; y++) {
-        const unsigned char *row = d + (size_t)y * stride;
+        const unsigned char *row = d + (size_t)y * (size_t)stride;
         for (int x = 0; x < iw; x++) {
             if (row[(size_t)x * 4 + 3] > 0x20) {
                 if (x < *x0) *x0 = x;
@@ -9237,7 +9237,7 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
 
         char vlabel[8];
         snprintf(vlabel, sizeof(vlabel), "%d%%",
-                 (int)lroundf(g_box.vol_snap.has_value ? vol : 0.0f));
+                 (int)lroundf(g_box.vol_snap.has_value ? (float)vol : 0.0f));
         pango_layout_set_text(pl, vlabel, -1);
         int vtw, vth;
         pango_layout_get_pixel_size(pl, &vtw, &vth);
@@ -9681,7 +9681,7 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
         cairo_clip(cr);
         int first = (int)(lround(g_npop.scroll) / NOTIF_ROW_H);
         for (int i = first; i < g_n_notifs; i++) {
-            double ry = g_npop.list_y + i * NOTIF_ROW_H - lround(g_npop.scroll);
+            double ry = g_npop.list_y + i * NOTIF_ROW_H - (double)lround(g_npop.scroll);
             if (ry >= g_npop.list_y + g_npop.list_h) break;
             if (ry + NOTIF_ROW_H <= g_npop.list_y) continue;
             notif_draw_row(cr, pl, i);
@@ -9923,9 +9923,9 @@ bar_draw(struct bar *b)
             if (running) {
                 int wins[MAX_WINDOWS_PER_GROUP];
                 bcount = windows_of_app(a, wins, MAX_WINDOWS_PER_GROUP);
-                for (int w = 0; w < g_n_toplevels; w++) {
-                    if (app_matches_id(a, g_toplevels[w].app_id) &&
-                        g_toplevels[w].activated) {
+                for (int wi = 0; wi < g_n_toplevels; wi++) {
+                    if (app_matches_id(a, g_toplevels[wi].app_id) &&
+                        g_toplevels[wi].activated) {
                         focused = 1; break;
                     }
                 }
@@ -9940,8 +9940,8 @@ bar_draw(struct bar *b)
         for (int i = 0; i < g_box.n_taskbar_groups; i++) {
             struct taskbar_group *g = &g_box.taskbar_groups[i];
             int focused = 0;
-            for (int w = 0; w < g->n_windows; w++) {
-                if (g_toplevels[g->windows[w]].activated) { focused = 1; break; }
+            for (int wi = 0; wi < g->n_windows; wi++) {
+                if (g_toplevels[g->windows[wi]].activated) { focused = 1; break; }
             }
             draw_launcher_item(cr, g_toplevels[g->windows[0]].icon,
                                g->x, g->w, bar_y, bar_h, TASKBAR_ICON,
@@ -10132,7 +10132,7 @@ menu_surface_size_alloc(struct bar *b, int width, int height)
         return;
     b->menu_surf_width = width;
     b->menu_surf_height = height;
-    size_t buf_size = stride * phys_h;
+    size_t buf_size = (size_t)stride * (size_t)phys_h;
     shm_pool_init(&b->menu_pool, buf_size);
     if (b->menu_pool.fd < 0) return;
     pool_cairo_init(&b->menu_pool, &b->menu_cairo, &b->menu_cr,
@@ -10147,7 +10147,7 @@ menu_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
     zwlr_layer_surface_v1_ack_configure(surface, serial);
     struct bar *b = &g_bar;
     if (!b->menu_layer) return;
-    menu_surface_size_alloc(b, width, height);
+    menu_surface_size_alloc(b, (int)width, (int)height);
     b->menu_surf_configured = 1;
     b->menu_needs_render = 1;
     if (g_menu_trans.pending_open) {
@@ -10249,7 +10249,7 @@ menu_surface_create(struct bar *b)
                       ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT |
                       ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM;
     zwlr_layer_surface_v1_set_anchor(ls, anchor);
-    zwlr_layer_surface_v1_set_size(ls, 0, b->menu_height);
+    zwlr_layer_surface_v1_set_size(ls, 0, (uint32_t)b->menu_height);
     zwlr_layer_surface_v1_set_exclusive_zone(ls, 0);
     zwlr_layer_surface_v1_set_keyboard_interactivity(ls,
         ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
@@ -10334,7 +10334,7 @@ flyout_surface_size_alloc(struct bar *b, int width, int height)
         return;
     b->fly_surf_width = width;
     b->fly_surf_height = height;
-    size_t buf_size = stride * phys_h;
+    size_t buf_size = (size_t)stride * (size_t)phys_h;
     shm_pool_init(&b->fly_pool, buf_size);
     if (b->fly_pool.fd < 0) return;
     pool_cairo_init(&b->fly_pool, &b->fly_cairo, &b->fly_cr,
@@ -10364,7 +10364,7 @@ flyout_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
     zwlr_layer_surface_v1_ack_configure(surface, serial);
     struct bar *b = &g_bar;
     if (!b->fly_layer) return;
-    flyout_surface_size_alloc(b, width, height);
+    flyout_surface_size_alloc(b, (int)width, (int)height);
     b->fly_surf_configured = 1;
     b->fly_needs_render = 1;
     if (g_fly_trans.pending_open) {
@@ -10452,7 +10452,7 @@ flyout_surface_create(struct bar *b)
                       ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM;
     zwlr_layer_surface_v1_set_anchor(ls, anchor);
     zwlr_layer_surface_v1_set_margin(ls, 0, 0, 0, 0);
-    zwlr_layer_surface_v1_set_size(ls, 0, bar_y_offset());
+    zwlr_layer_surface_v1_set_size(ls, 0, (uint32_t)bar_y_offset());
     zwlr_layer_surface_v1_set_exclusive_zone(ls, 0);
     zwlr_layer_surface_v1_set_keyboard_interactivity(ls,
         ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
@@ -10543,7 +10543,7 @@ flyout_update_size(struct bar *b)
         return;
     }
     if (b->fly_surf_height != h) {
-        zwlr_layer_surface_v1_set_size(b->fly_layer, 0, h);
+        zwlr_layer_surface_v1_set_size(b->fly_layer, 0, (uint32_t)h);
         wl_surface_commit(b->fly_surface);
     } else {
         b->fly_needs_render = 1;
@@ -10669,13 +10669,13 @@ bar_render(struct bar *b)
             int mpw = b->menu_surf_width * mscale;
             int mph = b->menu_surf_height * mscale;
             int mstride = cairo_image_surface_get_stride(b->menu_cairo);
-            FILE *f = fopen(menu_dump, "wb");
-            if (f) {
-                fwrite(&mpw, sizeof(int), 1, f);
-                fwrite(&mph, sizeof(int), 1, f);
-                fwrite(&mstride, sizeof(int), 1, f);
-                fwrite(b->menu_pool.data, 1, (size_t)mstride * mph, f);
-                fclose(f);
+            FILE *mf = fopen(menu_dump, "wb");
+            if (mf) {
+                fwrite(&mpw, sizeof(int), 1, mf);
+                fwrite(&mph, sizeof(int), 1, mf);
+                fwrite(&mstride, sizeof(int), 1, mf);
+                fwrite(b->menu_pool.data, 1, (size_t)mstride * mph, mf);
+                fclose(mf);
             }
         }
         exit(0);
@@ -10692,7 +10692,7 @@ bar_reinit_shm(struct bar *b, int w, int h, int scale)
     int phys_w = w * scale;
     int phys_h = h * scale;
     int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, phys_w);
-    size_t buf_size = stride * phys_h;
+    size_t buf_size = (size_t)stride * (size_t)phys_h;
 
     shm_pool_init(&b->pool, buf_size);
     if (b->pool.fd < 0) return 0;
@@ -10713,7 +10713,7 @@ bar_update_size(struct bar *b)
     int scale = b->scale ? b->scale : 1;
     int w = b->width;
 
-    zwlr_layer_surface_v1_set_size(b->layer_surface, 0, total);
+    zwlr_layer_surface_v1_set_size(b->layer_surface, 0, (uint32_t)total);
 
     if (total != b->prev_height) {
         if (b->frame_pending) {
@@ -10816,7 +10816,7 @@ menu_open(struct bar *b)
      * exists. */
     if (b->menu_layer && b->menu_surf_configured &&
         b->menu_surf_height != b->menu_height) {
-        zwlr_layer_surface_v1_set_size(b->menu_layer, 0, b->menu_height);
+        zwlr_layer_surface_v1_set_size(b->menu_layer, 0, (uint32_t)b->menu_height);
         wl_surface_commit(b->menu_surface);
     }
     b->menu_needs_render = 1;
@@ -10991,7 +10991,7 @@ menu_hit_test(double px, double py)
     double list_top, list_bottom;
     menu_list_area(mh_body, &list_top, &list_bottom);
     if (ry < list_top || ry >= list_bottom) return -1;
-    double sofs = lround(g_bar.menu_anim_px);
+    double sofs = (double)lround(g_bar.menu_anim_px);
     int pos = (int)((ry - list_top + sofs) / MENU_ROW_HEIGHT);
     if (pos >= 0 && pos < g_app.menu_n) return g_app.menu_idx[pos];
     return -1;
@@ -11050,11 +11050,11 @@ bar_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
     int w_changed = ((int)width != b->width);
     int h_changed = ((int)height != b->prev_height);
     if (w_changed || h_changed || !b->cairo) {
-        b->width = width;
-        b->height = height;
+        b->width = (int)width;
+        b->height = (int)height;
         b->scale = scale;
-        if (!bar_reinit_shm(b, width, height, scale)) return;
-        b->prev_height = height;
+        if (!bar_reinit_shm(b, (int)width, (int)height, scale)) return;
+        b->prev_height = (int)height;
     }
     b->configured = 1;
     pinned_recalc_layout();
@@ -11260,7 +11260,7 @@ pointer_refresh_hover(void)
 
     if (trace_on()) {
         static unsigned long last_log;
-        unsigned long t = now_ms();
+        unsigned long t = (unsigned long)now_ms();
         int over = g_pointer.hover_pinned_idx >= 0 || g_pointer.hover_taskbar_idx >= 0;
         if (over || t - last_log > 500) {
             last_log = t;
