@@ -2,6 +2,25 @@
 
 A lightweight, highly configurable Wayland status bar for wlroots-based compositors. Built with Wayland client libraries, it provides a bottom bar packed with functionality from app launching to system monitoring.
 
+## Preview
+
+<p align="center">
+  <img src="Previews/screenshot-1792874606.png" width="32%" />
+  <img src="Previews/screenshot-1792874639.png" width="32%" />
+  <img src="Previews/screenshot-1792874650.png" width="32%" />
+</p>
+
+<p align="center">
+  <img src="Previews/screenshot-1792874669.png" width="32%" />
+  <img src="Previews/screenshot-1792874686.png" width="32%" />
+  <img src="Previews/screenshot-1792874701.png" width="32%" />
+</p>
+
+<p align="center">
+  <img src="Previews/screenshot-1792874719.png" width="32%" />
+  <img src="Previews/screenshot-1792874797.png" width="32%" />
+</p>
+
 ## Features
 
 ### Bar Layout
