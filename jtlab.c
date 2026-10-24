@@ -4451,6 +4451,22 @@ workspace_switch_to(int row)
     render_request();
 }
 
+/* Step one workspace forward (+1) or back (-1), clamping at the ends. Used by
+ * the scroll wheel over the bar's workspace icon and the popup's button row. */
+static void
+workspace_scroll_step(int dir)
+{
+    if (g_ws.ws_count <= 0) return;
+    int cur = 0;
+    for (int i = 0; i < g_ws.ws_count; i++) {
+        if (g_workspaces[i].active) { cur = i; break; }
+    }
+    int row = cur + dir;
+    if (row < 0) row = 0;
+    if (row >= g_ws.ws_count) row = g_ws.ws_count - 1;
+    if (row != cur) workspace_switch_to(row);
+}
+
 static void
 ws_handle_id(void *data, struct ext_workspace_handle_v1 *h, const char *id)
 { (void)data; (void)h; (void)id; }
@@ -11795,6 +11811,21 @@ pointer_handle_axis(void *d, struct wl_pointer *p, uint32_t t,
         return;
     }
 
+    /* Scroll wheel over the workspace icon on the bar, or over the workspace
+     * buttons at the bottom of the workspace popup, steps between workspaces. */
+    int over_ws = on_bar && workspace_icon_hit_test(g_pointer.x, g_pointer.y);
+    if (over_ws) {
+        workspace_scroll_step(delta > 0 ? -1 : 1);
+        return;
+    }
+
+    int over_ws_btns = on_fly && popup_coords_safe(t) && g_wspop.open &&
+                       wspop_hit_test(g_pointer.x, g_pointer.y) >= 0;
+    if (over_ws_btns) {
+        workspace_scroll_step(delta > 0 ? -1 : 1);
+        return;
+    }
+
     int over_audio = on_bar && g_box.audio_present && audio_hit_test(g_pointer.x, g_pointer.y);
     int over_slider = on_fly && popup_coords_safe(t) && g_volpop.open &&
                       volpop_slider_hit_test(g_pointer.x, g_pointer.y);
@@ -11820,7 +11851,7 @@ pointer_handle_axis(void *d, struct wl_pointer *p, uint32_t t,
     int over_blue = on_fly && popup_coords_safe(t) && g_wspop.open &&
                     blue_slider_hit_test(g_pointer.x, g_pointer.y);
     if (over_blue) {
-        blue_scroll(delta < 0 ? -5 : 5);
+        blue_scroll(delta > 0 ? -5 : 5);
         return;
     }
 
