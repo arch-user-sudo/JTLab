@@ -9,6 +9,9 @@ LDFLAGS ?= -no-pie -Wl,--gc-sections -Wl,--as-needed -Wl,-O1 -s
 DEBUG_CFLAGS = -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -std=c11 -D_GNU_SOURCE
 LIBS    = -lwayland-client -lm -lpangocairo-1.0 -lpango-1.0 -lgobject-2.0 -lcairo -lglib-2.0 -lrsvg-2 -lpipewire-0.3 -lxkbcommon
 
+PREFIX  ?= /usr/local
+BINDIR  := $(PREFIX)/bin
+
 PKGS    = wayland-client wayland-cursor pangocairo glib-2.0 gio-2.0 cairo librsvg-2.0 libpipewire-0.3 gdk-pixbuf-2.0 libsoup-3.0 xkbcommon
 
 CFLAGS  += $(shell pkg-config --cflags $(PKGS) 2>/dev/null)
@@ -127,10 +130,10 @@ clean:
 	rm -rf $(BUILD_DIR) jtlab.o jtlab jtlabctl jtlab-debug
 
 install: jtlab jtlabctl
-	install -Dm755 jtlab /usr/local/bin/jtlab
-	install -Dm755 jtlabctl /usr/local/bin/jtlabctl
+	install -Dm755 jtlab $(DESTDIR)$(BINDIR)/jtlab
+	install -Dm755 jtlabctl $(DESTDIR)$(BINDIR)/jtlabctl
 
 uninstall:
-	rm -f /usr/local/bin/jtlab /usr/local/bin/jtlabctl
+	rm -f $(DESTDIR)$(BINDIR)/jtlab $(DESTDIR)$(BINDIR)/jtlabctl
 
 .PHONY: all clean install uninstall debug strict tidy cppcheck

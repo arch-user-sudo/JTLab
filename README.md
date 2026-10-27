@@ -56,11 +56,13 @@ A lightweight, highly configurable Wayland status bar for wlroots-based composit
 
 ### Desktop Customization
 - **Wallpaper management** - rendered natively as a background layer surface per output. Browse and select wallpapers from a configurable directory in the workspace popup.
+- **Wallpaper-derived accent** - toggles, the volume and night-light sliders, the CPU/RAM/GPU meters, the workspace indicator, and the active audio/microphone device markers take their color from the current wallpaper. `jtspeedtest`, `jtnetworks`, and `jtupdate` are launched with the same accent and update it live while they are running when the wallpaper changes.
 - **Night light** (blue light filter) with adjustable color temperature (6500K down to 2500K), applied natively to every output via the `wlr-gamma-control` protocol
 - **Customizable icons** with icon theme support (Adwaita by default)
 
 ### Utilities
 - **External control** via `jtlabctl` unix socket - toggle menu, quit bar
+- **Live companion accents** via `jtspeedtestctl`, `jtnetworksctl`, and `jtupdatectl` - change colors on the fly or quit any companion window; JTLab uses the same sockets when the wallpaper accent changes
 - **Configurable terminal** and hold-shell behavior for launched commands
 - **Minimal resource usage** with compile-time optimizations
 
@@ -143,7 +145,8 @@ All configuration is done at compile time via `config.h`. Edit it to match your 
 
 Key configuration options include:
 - **Appearance**: `BAR_HEIGHT`, `FONT_FAMILY`, `FONT_SIZE`, colors, corner radius, padding
-- **Wallpaper**: `WALLPAPER_DIR` (default: `~/Wallpapers/`) - PNG is decoded natively, other formats (JPEG, WebP, ...) via GdkPixbuf
+- **Accent**: derived automatically from the current wallpaper and shared by every accent surface; `ACCENT_HEX` is the fallback used when no wallpaper color is available
+- **Wallpaper**: `WALLPAPER_DIR` (default: `~/Wallpapers/`) - PNG is decoded natively, other formats (JPEG, WebP, ...) via GdkPixbuf. The live wallpaper accent is passed to `SPEEDTEST_CMD`, `NETWORKS_CMD`, and `UPDATER_CMD` as a quoted `#RRGGBB` argument.
 - **Weather**: `WEATHER_ENABLED`, `WEATHER_CITY`, refresh intervals
 - **Terminal**: `TERMINAL_CMD` (default: `footclient`)
 - **Night light**: Temperature range controlled via `BLUE_TEMP_OFF`/`BLUE_TEMP_MIN`, applied natively through the `wlr-gamma-control` protocol

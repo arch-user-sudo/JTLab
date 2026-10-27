@@ -13,8 +13,10 @@
 #include <sys/epoll.h>
 #include <sys/inotify.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <execinfo.h>
 #include <linux/input-event-codes.h>
@@ -269,6 +271,30 @@ struct bar {
 };
 
 static struct bar g_bar = { 0 };
+
+/* The accent follows the current wallpaper. Every accent surface uses this
+ * single color; ACCENT_HEX is the fallback until a wallpaper tint is derived. */
+struct theme_state {
+    unsigned accent;
+};
+
+static struct theme_state g_theme = {
+    .accent = ACCENT_HEX,
+};
+
+static int
+theme_clamp_channel(int v)
+{
+    return v < 0 ? 0 : (v > 255 ? 255 : v);
+}
+
+static void
+theme_set_accent(unsigned rgb)
+{
+    if (g_theme.accent == rgb)
+        return;
+    g_theme.accent = rgb;
+}
 
 static void
 render_request(void)
@@ -3655,6 +3681,59 @@ run_cmd(const char *cmd, int terminal)
     run_cmd_ex(cmd, terminal, 0);
 }
 
+/* Launch one of the companion GUIs with the current wallpaper accent. The
+ * color is quoted because run_cmd() hands the string to /bin/sh. */
+static void
+theme_run_app(const char *cmd)
+{
+    if (!cmd || !cmd[0])
+        return;
+    char with_accent[768];
+    snprintf(with_accent, sizeof(with_accent), "%s '#%06X'",
+             cmd, g_theme.accent & 0xFFFFFF);
+    run_cmd(with_accent, 0);
+}
+
+/* Send the live accent to a running companion window. The apps listen on a
+ * per-app Unix socket in XDG_RUNTIME_DIR; a missing socket simply means that
+ * window is not running. */
+static void
+theme_send_accent(const char *app)
+{
+    char path[256];
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt || !rt[0]) rt = "/tmp";
+    snprintf(path, sizeof(path), "%s/%s-ctl.sock", rt, app);
+
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    if (strlen(path) >= sizeof(addr.sun_path))
+        return;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0)
+        return;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        char cmd[64];
+        int n = snprintf(cmd, sizeof(cmd), "accent #%06X\n",
+                         g_theme.accent & 0xFFFFFF);
+        if (n > 0)
+            (void)send(fd, cmd, (size_t)n, MSG_NOSIGNAL);
+    }
+    close(fd);
+}
+
+static void
+theme_update_open_apps(void)
+{
+    theme_send_accent("jtnetworks");
+    theme_send_accent("jtspeedtest");
+    theme_send_accent("jtupdate");
+    /* The compositor uses the same line protocol for the SSD close button and
+     * the snap overlay, so a missing socket just means jtlabwc is not up yet. */
+    theme_send_accent("jtlabwc");
+}
+
 /* The scrollable app list region for a given menu body height. Single source of
  * truth for where rows are drawn and hit-tested: double vertical padding on
  * top/bottom plus the search bar below the list. */
@@ -4561,6 +4640,7 @@ static const struct ext_workspace_manager_v1_listener ws_mgr_listener = {
 enum {
     WS_ACT_ROW_MAIN = 0,   /* Speedtest + Screenshot */
     WS_ACT_ROW_FASTFETCH,  /* Fastfetch, on its own row */
+    WS_ACT_ROW_UPDATER,    /* Updater, on its own row */
     WS_ACT_ROWS,
 };
 
@@ -4587,13 +4667,14 @@ enum {
     WS_ACT_SPEEDTEST = 0,
     WS_ACT_SCREENSHOT,
     WS_ACT_FASTFETCH,
+    WS_ACT_UPDATER,
     WS_ACT_COUNT,
 };
 
 #define WS_ACT_HIT_BASE (-5)
 
 static const char *const ws_act_label[WS_ACT_COUNT] = {
-    "Speedtest", "Screenshot", "Fastfetch",
+    "Speedtest", "Screenshot", "Fastfetch", "Updater",
 };
 
 /* Which row each action sits in, top to bottom. */
@@ -4601,6 +4682,7 @@ static const unsigned char ws_act_row[WS_ACT_COUNT] = {
     [WS_ACT_SPEEDTEST]  = WS_ACT_ROW_MAIN,
     [WS_ACT_SCREENSHOT] = WS_ACT_ROW_MAIN,
     [WS_ACT_FASTFETCH]  = WS_ACT_ROW_FASTFETCH,
+    [WS_ACT_UPDATER]    = WS_ACT_ROW_UPDATER,
 };
 
 /* Actions in the given row. */
@@ -4684,7 +4766,8 @@ wspop_wall_y(void)
     return g_wspop.y + MENU_PADDING;
 }
 
-/* Top of quick-action row r (0 = Speedtest/Screenshot, 1 = Fastfetch). */
+/* Top of quick-action row r (0 = Speedtest/Screenshot, 1 = Fastfetch,
+ * 2 = Updater). */
 static double
 wspop_act_row_y(int r)
 {
@@ -5506,9 +5589,9 @@ static void rounded_rect(cairo_t *cr, double x, double y, double w,
 static void draw_hover_row(cairo_t *cr, double x, double y, double w, double h,
                            double r, double a);
 static void draw_toggle(cairo_t *cr, double x, double y, double w, double h,
-                        int on, int on_hex, int hover);
+                        int on, unsigned on_hex, int hover);
 static void draw_slider(cairo_t *cr, double x, double y, double w, double h,
-                        double pct, double knob_r, int accent, double fill_a,
+                        double pct, double knob_r, unsigned accent, double fill_a,
                         double knob_a, int drag);
 static void draw_hover_circle(cairo_t *cr, double cx, double cy,
                               double icon_sz, double pad);
@@ -6445,12 +6528,206 @@ wlp_set_wallpaper(const char *path)
     g_wlp.cur_wallpaper[sizeof(g_wlp.cur_wallpaper) - 1] = '\0';
 }
 
+static double
+theme_clamp_double(double v, double lo, double hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static double
+theme_rgb_hue(double r, double g, double b, double max, double min)
+{
+    double d = max - min;
+    if (d <= 0.0)
+        return 0.0;
+    double h;
+    if (max == r)
+        h = fmod((g - b) / d, 6.0);
+    else if (max == g)
+        h = (b - r) / d + 2.0;
+    else
+        h = (r - g) / d + 4.0;
+    h *= 60.0;
+    if (h < 0.0)
+        h += 360.0;
+    return h;
+}
+
+static unsigned
+theme_hsl_to_rgb(double h, double s, double l)
+{
+    double c = (1.0 - fabs(2.0 * l - 1.0)) * s;
+    double hp = h / 60.0;
+    double x = c * (1.0 - fabs(fmod(hp, 2.0) - 1.0));
+    double r1 = 0.0, g1 = 0.0, b1 = 0.0;
+    if (hp < 1.0)      { r1 = c; g1 = x; }
+    else if (hp < 2.0) { r1 = x; g1 = c; }
+    else if (hp < 3.0) { g1 = c; b1 = x; }
+    else if (hp < 4.0) { g1 = x; b1 = c; }
+    else if (hp < 5.0) { r1 = x; b1 = c; }
+    else               { r1 = c; b1 = x; }
+    double m = l - c / 2.0;
+    int r = theme_clamp_channel((int)lround((r1 + m) * 255.0));
+    int g = theme_clamp_channel((int)lround((g1 + m) * 255.0));
+    int b = theme_clamp_channel((int)lround((b1 + m) * 255.0));
+    return ((unsigned)r << 16) | ((unsigned)g << 8) | (unsigned)b;
+}
+
+/* Pick a representative, UI-friendly accent from the wallpaper. A saturation-
+ * weighted hue histogram finds the dominant colored region; the winning hue
+ * is then rebuilt at a fixed lightness so the bar remains legible on its dark
+ * background regardless of how dark or washed-out the image is. */
+#define THEME_SAMPLE 64
+#define THEME_HUE_BINS 36
+
+static int
+theme_accent_from_surface(cairo_surface_t *wall, unsigned *out)
+{
+    if (!wall)
+        return 0;
+    int w = cairo_image_surface_get_width(wall);
+    int h = cairo_image_surface_get_height(wall);
+    if (w <= 0 || h <= 0)
+        return 0;
+
+    cairo_surface_t *sample =
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+                                   THEME_SAMPLE, THEME_SAMPLE);
+    if (cairo_surface_status(sample) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(sample);
+        return 0;
+    }
+    cairo_t *cr = cairo_create(sample);
+    cairo_scale(cr, (double)THEME_SAMPLE / w, (double)THEME_SAMPLE / h);
+    cairo_set_source_surface(cr, wall, 0.0, 0.0);
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_GOOD);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    cairo_surface_flush(sample);
+
+    unsigned char *data = cairo_image_surface_get_data(sample);
+    int stride = cairo_image_surface_get_stride(sample);
+    double hist[THEME_HUE_BINS] = { 0 };
+    double total = 0.0;
+
+    for (int y = 0; y < THEME_SAMPLE; y++) {
+        for (int x = 0; x < THEME_SAMPLE; x++) {
+            unsigned px;
+            memcpy(&px, data + y * stride + x * 4, sizeof(px));
+            unsigned a = px >> 24;
+            if (a < 128)
+                continue;
+            double r = ((px >> 16) & 0xFF) / 255.0;
+            double g = ((px >> 8) & 0xFF) / 255.0;
+            double b = (px & 0xFF) / 255.0;
+            double max = fmax(r, fmax(g, b));
+            double min = fmin(r, fmin(g, b));
+            double d = max - min;
+            double v = max;
+            double s = max > 0.0 ? d / max : 0.0;
+            if (v < 0.08 || v > 0.96 || s < 0.08)
+                continue;
+            double hue = theme_rgb_hue(r, g, b, max, min);
+            double mid = 1.0 - fabs(v - 0.55) / 0.60;
+            if (mid < 0.15)
+                mid = 0.15;
+            double weight = (s * s + 0.02) * mid;
+            int bin = (int)(hue / (360.0 / THEME_HUE_BINS));
+            if (bin < 0)
+                bin = 0;
+            if (bin >= THEME_HUE_BINS)
+                bin = THEME_HUE_BINS - 1;
+            hist[bin] += weight;
+            total += weight;
+        }
+    }
+
+    if (total < 0.001) {
+        cairo_surface_destroy(sample);
+        return 0;
+    }
+
+    int best = 0;
+    for (int i = 1; i < THEME_HUE_BINS; i++) {
+        if (hist[i] > hist[best])
+            best = i;
+    }
+    double center = (best + 0.5) * (360.0 / THEME_HUE_BINS);
+
+    double sum_w = 0.0, sum_s = 0.0, sum_v = 0.0;
+    double sum_sin = 0.0, sum_cos = 0.0;
+    for (int y = 0; y < THEME_SAMPLE; y++) {
+        for (int x = 0; x < THEME_SAMPLE; x++) {
+            unsigned px;
+            memcpy(&px, data + y * stride + x * 4, sizeof(px));
+            unsigned a = px >> 24;
+            if (a < 128)
+                continue;
+            double r = ((px >> 16) & 0xFF) / 255.0;
+            double g = ((px >> 8) & 0xFF) / 255.0;
+            double b = (px & 0xFF) / 255.0;
+            double max = fmax(r, fmax(g, b));
+            double min = fmin(r, fmin(g, b));
+            double d = max - min;
+            double v = max;
+            double s = max > 0.0 ? d / max : 0.0;
+            if (v < 0.08 || v > 0.96 || s < 0.08)
+                continue;
+            double hue = theme_rgb_hue(r, g, b, max, min);
+            double diff = fabs(hue - center);
+            if (diff > 180.0)
+                diff = 360.0 - diff;
+            if (diff > 180.0 / THEME_HUE_BINS)
+                continue;
+            double mid = 1.0 - fabs(v - 0.55) / 0.60;
+            if (mid < 0.15)
+                mid = 0.15;
+            double weight = (s * s + 0.02) * mid;
+            double rad = hue * (M_PI / 180.0);
+            sum_w += weight;
+            sum_s += s * weight;
+            sum_v += v * weight;
+            sum_sin += sin(rad) * weight;
+            sum_cos += cos(rad) * weight;
+        }
+    }
+
+    if (sum_w <= 0.0) {
+        cairo_surface_destroy(sample);
+        return 0;
+    }
+
+    double hue = atan2(sum_sin, sum_cos) * (180.0 / M_PI);
+    if (hue < 0.0)
+        hue += 360.0;
+    double avg_s = sum_s / sum_w;
+    double avg_v = sum_v / sum_w;
+    double sat = theme_clamp_double(avg_s * 1.15 + 0.20, 0.52, 0.82);
+    double light = theme_clamp_double(0.54 + avg_v * 0.06, 0.54, 0.62);
+    *out = theme_hsl_to_rgb(hue, sat, light);
+    cairo_surface_destroy(sample);
+    return 1;
+}
+
+static void
+theme_update_from_wallpaper(void)
+{
+    unsigned accent = ACCENT_HEX;
+    if (g_wlp.enabled && g_wlp.wall_image)
+        theme_accent_from_surface(g_wlp.wall_image, &accent);
+
+    theme_set_accent(accent);
+    theme_update_open_apps();
+    render_request();
+}
+
 static void
 wlp_set_wallpaper_user(const char *path)
 {
     g_wlp.enabled = 1;
     wlp_set_wallpaper(path);
     wlp_save_wallpaper(path);
+    theme_update_from_wallpaper();
 
     char notify_cmd[600];
     snprintf(notify_cmd, sizeof(notify_cmd),
@@ -6470,9 +6747,10 @@ wlp_load_wallpaper(void)
         nl = strchr(path, '\n');
         if (nl) *nl = '\0';
         g_wlp.enabled = (flag[0] == '1');
-        if (g_wlp.enabled && path[0] && access(path, R_OK) == 0)
+        if (g_wlp.enabled && path[0] && access(path, R_OK) == 0) {
             wlp_set_wallpaper(path);
-        else if (path[0]) {
+            theme_update_from_wallpaper();
+        } else if (path[0]) {
             strncpy(g_wlp.cur_wallpaper, path, sizeof(g_wlp.cur_wallpaper) - 1);
             g_wlp.cur_wallpaper[sizeof(g_wlp.cur_wallpaper) - 1] = '\0';
         }
@@ -6514,6 +6792,7 @@ wlp_toggle_power(void)
             bg_paint_output(g_outputs[i], NULL);
         run_cmd("notify-send 'Wallpaper' 'Disabled'", 0);
     }
+    theme_update_from_wallpaper();
     wlp_save_wallpaper(g_wlp.cur_wallpaper);
     render_request();
 }
@@ -6527,7 +6806,7 @@ wlp_draw_power_toggle(cairo_t *cr)
     int on = g_wlp.enabled;
     int hover = g_wlp.hover_power;
 
-    draw_toggle(cr, rx, ry, WLP_TOGGLE_W, WLP_TOGGLE_H, on, 0x408066, hover);
+    draw_toggle(cr, rx, ry, WLP_TOGGLE_W, WLP_TOGGLE_H, on, g_theme.accent, hover);
 }
 
 static void
@@ -6924,11 +7203,11 @@ rounded_rect(cairo_t *cr, double x, double y, double w, double h, double r)
 }
 
 /* An on/off pill: border, tinted fill, knob. Both toggles share the off tint;
- * only the lit colour differs (the wallpaper toggle's is a muted green rather
- * than the night light's amber), so `on_hex` is passed in per call site. */
+ * the lit color is passed in per call site so both follow the wallpaper
+ * accent. */
 static void
 draw_toggle(cairo_t *cr, double x, double y, double w, double h, int on,
-            int on_hex, int hover)
+            unsigned on_hex, int hover)
 {
     cairo_set_source_rgba(cr, COLOR(PBCOLOR), PBALPHA);
     cairo_set_line_width(cr, 1);
@@ -6956,7 +7235,7 @@ draw_toggle(cairo_t *cr, double x, double y, double w, double h, int on,
  * repaints the knob in the accent while the slider is being dragged. */
 static void
 draw_slider(cairo_t *cr, double x, double y, double w, double h, double pct,
-            double knob_r, int accent, double fill_a, double knob_a, int drag)
+            double knob_r, unsigned accent, double fill_a, double knob_a, int drag)
 {
     double r = h / 2.0;
     double fw = clampd(w * (pct > 100 ? 1.0 : pct / 100.0), 0, w);
@@ -7054,7 +7333,10 @@ draw_icon_fit(cairo_t *cr, cairo_surface_t *sf, double x, double y,
 static void
 draw_active_indicator(cairo_t *cr, double px_x, double item_w, int focused)
 {
-    cairo_set_source_rgba(cr, COLOR(FG_HEX), 1.0);
+    if (focused)
+        cairo_set_source_rgba(cr, COLOR(g_theme.accent), 1.0);
+    else
+        cairo_set_source_rgba(cr, COLOR(FG_HEX), 1.0);
     cairo_new_path(cr);
     if (focused) {
         double lw = 18, lh = 2;
@@ -7102,9 +7384,9 @@ draw_launcher_item(cairo_t *cr, cairo_surface_t *icon, double px_x, double item_
     double hx = px_x + (item_w - icon_size) / 2.0 - 4;
     double hw = icon_size + 8, hh = bar_h - 4;
 
-    if (focused)
-        draw_hover_row(cr, hx, bar_y + 2, hw, hh, hh / 2.0, FOCUS_HOVER_A);
-    if (hovered)
+    /* The accent bar under a focused app is its focus cue; do not add the
+     * hover background there. Unfocused apps keep the normal hover highlight. */
+    if (hovered && !focused)
         draw_hover_row(cr, hx, bar_y + 2, hw, hh, hh / 2.0, MENU_HOVER_A);
 
     draw_icon_fit(cr, icon, px_x, row_y, item_w, icon_size, icon_size, 1);
@@ -8370,7 +8652,7 @@ sys_draw_text(cairo_t *cr, double x, double y, double w, double h,
 
 static void
 sys_draw_bar(cairo_t *cr, double x, double y, double w, double pct,
-             double r, double g, double b)
+             unsigned rgb)
 {
     double bh = 4;
     cairo_new_path(cr);
@@ -8380,7 +8662,10 @@ sys_draw_bar(cairo_t *cr, double x, double y, double w, double pct,
     double fw = w * (pct > 100 ? 1.0 : pct / 100.0);
     if (fw > 0.5) {
         cairo_new_path(cr);
-        cairo_set_source_rgba(cr, r, g, b, 1.0);
+        cairo_set_source_rgba(cr,
+                              ((rgb >> 16) & 0xFF) / 255.0,
+                              ((rgb >> 8) & 0xFF) / 255.0,
+                              (rgb & 0xFF) / 255.0, 1.0);
         rounded_rect(cr, x, y, fw, bh, 2);
         cairo_fill(cr);
     }
@@ -8507,14 +8792,12 @@ sys_draw(cairo_t *cr, double mx, double my, double mh_body, double apad)
     sy += 8;
 
     static const char *labels[SYS_STAT_COUNT] = { "RAM", "CPU", "GPU" };
-    static const double colors[SYS_STAT_COUNT][3] = {
-        { 0.42, 0.72, 0.45 }, { 0.40, 0.60, 0.90 }, { 0.72, 0.45, 0.85 },
-    };
     static const int order[SYS_STAT_COUNT] = {
         SYS_STAT_CPU, SYS_STAT_GPU, SYS_STAT_RAM,
     };
     for (int i = 0; i < SYS_STAT_COUNT; i++) {
         int k = order[i];
+        unsigned bar_color = g_theme.accent;
         double ry = sy + i * SYS_STAT_H;
         sys_draw_text(cr, sxp, ry, 40, SYS_STAT_H, labels[k], SYS_FONT_SMALL,
                       0.75, 0.75, 0.75, 1.0, PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_LEFT);
@@ -8524,8 +8807,7 @@ sys_draw(cairo_t *cr, double mx, double my, double mh_body, double apad)
                       SYS_FONT_SMALL, 0.85, 0.85, 0.85, 1.0,
                       PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_RIGHT);
         sys_draw_bar(cr, sxp + 44, ry + (SYS_STAT_H - 4) / 2.0,
-                     avail - 88, g_sys.pct[k],
-                     colors[k][0], colors[k][1], colors[k][2]);
+                     avail - 88, g_sys.pct[k], bar_color);
     }
 }
 
@@ -8807,7 +9089,7 @@ wspop_row_box_draw(cairo_t *cr, double bx, double by, double bw, int hover)
 }
 
 /* Every icon in the workspace popup occupies exactly the WS_WP_ICON square, so
- * the icons in a row line up. The two below are drawn on a unit grid (0..1 in
+ * the icons in a row line up. The icons below are drawn on a unit grid (0..1 in
  * both axes, origin at the top-left of that square) and scaled by isz; each one
  * is built to touch all four edges. Keep it that way when editing them, and
  * mirror it in the wallpaper and night-light icons above. */
@@ -8894,6 +9176,37 @@ wspop_terminal_icon(cairo_t *cr, double ix, double iy, double isz)
     cairo_stroke(cr);
 }
 
+/* Updater icon: a download arrow over a baseline, filling the unit square.
+ * The shaft reaches the top edge, the baseline spans the full width, and both
+ * are stroked so the path is inset by WS_ICON_INSET. */
+static void
+wspop_updater_icon(cairo_t *cr, double ix, double iy, double isz)
+{
+    const double x0 = WS_ICON_INSET;
+    const double x1 = isz - WS_ICON_INSET;
+    const double y0 = WS_ICON_INSET;
+    const double y1 = isz - WS_ICON_INSET;
+    const double cx = isz * 0.5;
+    const double head = 0.66;      /* arrow tip, fraction of the icon box */
+
+    /* shaft */
+    cairo_new_path(cr);
+    cairo_move_to(cr, ix + cx, iy + y0);
+    cairo_line_to(cr, ix + cx, iy + head * isz);
+
+    /* arrow head */
+    cairo_move_to(cr, ix + isz * 0.26, iy + isz * 0.40);
+    cairo_line_to(cr, ix + cx, iy + head * isz);
+    cairo_line_to(cr, ix + isz * 0.74, iy + isz * 0.40);
+    cairo_stroke(cr);
+
+    /* baseline */
+    cairo_new_path(cr);
+    cairo_move_to(cr, ix + x0, iy + y1);
+    cairo_line_to(cr, ix + x1, iy + y1);
+    cairo_stroke(cr);
+}
+
 /* One quick-action button of the workspace popup. */
 static void
 wspop_action_draw(cairo_t *cr, int i)
@@ -8917,6 +9230,9 @@ wspop_action_draw(cairo_t *cr, int i)
         break;
     case WS_ACT_FASTFETCH:
         wspop_terminal_icon(cr, ix, iy, isz);
+        break;
+    case WS_ACT_UPDATER:
+        wspop_updater_icon(cr, ix, iy, isz);
         break;
     default:
         wspop_speedtest_icon(cr, ix, iy, isz);
@@ -8964,11 +9280,48 @@ wspop_action_activate(int i)
          * terminal would vanish before the output could be read. */
         run_cmd_ex("fastfetch", 1, 1);
         break;
-    case WS_ACT_SPEEDTEST:
-        /* Not held: the run takes long enough to read as it happens, and the
-         * window closing on its own signals it finished. */
-        run_cmd("speedtest-cli", 1);
+    case WS_ACT_SPEEDTEST: {
+        /* jtspeedtest opens its own native Wayland window, so no terminal
+         * wrapper is needed.  The quick-action button toggles that window:
+         * close it if it is already up, otherwise launch it. */
+        static int64_t launched_at_ms;
+        int closed = 0;
+        for (int k = 0; k < g_n_toplevels; k++) {
+            const char *id = g_toplevels[k].app_id;
+            if (id && strcasecmp(id, "jtspeedtest") == 0) {
+                zwlr_foreign_toplevel_handle_v1_close(g_toplevels[k].handle);
+                closed = 1;
+            }
+        }
+        if (closed) {
+            launched_at_ms = 0;
+        } else if (now_ms() - launched_at_ms > 1500) {
+            theme_run_app(SPEEDTEST_CMD);
+            launched_at_ms = now_ms();
+        }
         break;
+    }
+    case WS_ACT_UPDATER: {
+        /* Same toggle behavior as Speedtest; launching through theme_run_app()
+         * hands jtupdate the live wallpaper accent, and the control socket
+         * keeps it in sync while it runs. */
+        static int64_t launched_at_ms;
+        int closed = 0;
+        for (int k = 0; k < g_n_toplevels; k++) {
+            const char *id = g_toplevels[k].app_id;
+            if (id && strcasecmp(id, "jtupdate") == 0) {
+                zwlr_foreign_toplevel_handle_v1_close(g_toplevels[k].handle);
+                closed = 1;
+            }
+        }
+        if (closed) {
+            launched_at_ms = 0;
+        } else if (now_ms() - launched_at_ms > 1500) {
+            theme_run_app(UPDATER_CMD);
+            launched_at_ms = now_ms();
+        }
+        break;
+    }
     default:
         break;
     }
@@ -9192,7 +9545,7 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
                 double rcy = ry + VOL_DEV_ROW_H / 2.0;
                 double dx = px + MENU_PADDING + 5;
                 if (it->is_default) {
-                    cairo_set_source_rgba(cr, 0.4, 0.8, 0.4, 1.0);
+                    cairo_set_source_rgba(cr, COLOR(g_theme.accent), 1.0);
                     cairo_arc(cr, dx, rcy, 4, 0, 2 * M_PI);
                     cairo_fill(cr);
                 } else {
@@ -9249,7 +9602,7 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
         double sw = g_volpop.slider_x_max - g_volpop.slider_x_min;
         draw_slider(cr, sx, g_volpop.slider_y, sw, VOL_SLIDER_H,
                     g_box.vol_snap.has_value ? vol / VOLUME_MAX * 100.0 : 0.0,
-                    VOL_KNOB_R, 0, VOL_SLIDER_FILL_A, 1.0, 0);
+                    VOL_KNOB_R, g_theme.accent, VOL_SLIDER_FILL_A, 1.0, 0);
 
         char vlabel[8];
         snprintf(vlabel, sizeof(vlabel), "%d%%",
@@ -9313,7 +9666,7 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
                           PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_LEFT);
         }
 
-        /* Quick-action row: Speedtest / Screenshot / Fastfetch */
+        /* Quick-action row: Speedtest / Screenshot / Fastfetch / Updater */
         for (int i = 0; i < WS_ACT_COUNT; i++)
             wspop_action_draw(cr, i);
 
@@ -9371,7 +9724,7 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
             int thover = (g_wspop.hover_row == -3);
             draw_toggle(cr, g_wspop.blue_toggle_x, g_wspop.blue_toggle_y,
                         BLUE_TOGGLE_W, BLUE_TOGGLE_H, ton,
-                        BLUE_ACCENT_HEX, thover);
+                        g_theme.accent, thover);
         }
 
         /* Night light slider row (blue filter) */
@@ -9379,7 +9732,7 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
             int ton = g_wspop.blue_on;
             draw_slider(cr, g_wspop.blue_sx, g_wspop.blue_sy,
                         g_wspop.blue_sxmax - g_wspop.blue_sx, BLUE_SLIDER_H,
-                        g_wspop.blue_pct, BLUE_KNOB_R, BLUE_ACCENT_HEX,
+                        g_wspop.blue_pct, BLUE_KNOB_R, g_theme.accent,
                         ton ? 1.0 : 0.45, ton ? 1.0 : 0.7,
                         g_wspop.blue_dragging);
 
@@ -9403,8 +9756,9 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
 
             if (hover && active) {
                 ws_button_draw(cr, bx, by, name,
-                               (double[4]){ 0.55, 0.9, 0.55, 1.0 }, NULL,
-                               (double[4]){ 0.1, 0.1, 0.1, 1.0 });
+                               (double[4]){ COLOR(g_theme.accent), 1.0 },
+                               (double[4]){ COLOR(FG_HEX), 0.8 },
+                               (double[4]){ COLOR(FG_HEX), 1.0 });
             } else if (hover) {
                 ws_button_draw(cr, bx, by, name,
                                (double[4]){ COLOR(MENU_HOVER_HEX), MENU_HOVER_A },
@@ -9412,8 +9766,8 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
                                (double[4]){ COLOR(FG_HEX), 1.0 });
             } else if (active) {
                 ws_button_draw(cr, bx, by, name,
-                               (double[4]){ 0.4, 0.8, 0.4, 1.0 }, NULL,
-                               (double[4]){ 0.1, 0.1, 0.1, 1.0 });
+                               (double[4]){ COLOR(g_theme.accent), 1.0 }, NULL,
+                               (double[4]){ COLOR(FG_HEX), 1.0 });
             } else {
                 ws_button_draw(cr, bx, by, name,
                                NULL, (double[4]){ COLOR(FG_HEX), 0.45 },
@@ -9524,12 +9878,12 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
 
             if (is_today) {
                 double ir = dh / 2.0 + 6.0;
-                cairo_set_source_rgba(cr, COLOR(FG_HEX), FG_A);
+                cairo_set_source_rgba(cr, COLOR(g_theme.accent), 1.0);
                 cairo_new_path(cr);
                 cairo_arc(cr, cx0 + cell_w / 2.0, cy0 + CAL_CELL_H / 2.0,
                           ir, 0, 2 * M_PI);
                 cairo_fill(cr);
-                cairo_set_source_rgba(cr, 0.1, 0.1, 0.1, 1.0);
+                cairo_set_source_rgba(cr, COLOR(FG_HEX), 1.0);
             } else {
                 cairo_set_source_rgba(cr, COLOR(FG_HEX), 0.85);
             }
@@ -9865,7 +10219,7 @@ bar_draw(struct bar *b)
                 double cx = gx + c * (csz + 3);
                 double cy = gy + r * (csz + 3);
                 if (active) {
-                    cairo_set_source_rgba(cr, COLOR(FG_HEX), 1.0);
+                    cairo_set_source_rgba(cr, COLOR(g_theme.accent), 1.0);
                     cairo_new_path(cr);
                     rounded_rect(cr, cx, cy, csz, csz, 1.5);
                     cairo_fill(cr);
@@ -10012,7 +10366,7 @@ bar_draw(struct bar *b)
         cairo_fill(cr);
 
         if (notif_unread_count() > 0) {
-            cairo_set_source_rgba(cr, 0.9, 0.25, 0.25, 1.0);
+            cairo_set_source_rgba(cr, COLOR(g_theme.accent), 1.0);
             cairo_arc(cr, cx + bell_sz / 2.0 - 2, bell_y + 3, 3, 0, 2 * M_PI);
             cairo_fill(cr);
         }
@@ -11735,6 +12089,32 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
         } else {
             close_all_popups();
             calpop_open();
+        }
+        render_request();
+        return;
+    }
+
+    if (button == BTN_LEFT && on_bar_surface() &&
+        g_box.net_status != NET_NONE &&
+        net_hit_test(g_pointer.x, g_pointer.y)) {
+        /* The network glyph doubles as a launcher.  If the app already owns a
+         * toplevel, close it; otherwise start it.  Ignore repeat clicks while
+         * a fresh launch is still waiting for its first window. */
+        static int64_t launched_at_ms;
+        int closed = 0;
+        for (int i = 0; i < g_n_toplevels; i++) {
+            const char *id = g_toplevels[i].app_id;
+            if (id && strcasecmp(id, "jtnetworks") == 0) {
+                zwlr_foreign_toplevel_handle_v1_close(g_toplevels[i].handle);
+                closed = 1;
+            }
+        }
+        close_all_popups();
+        if (closed) {
+            launched_at_ms = 0;
+        } else if (now_ms() - launched_at_ms > 1500) {
+            theme_run_app(NETWORKS_CMD);
+            launched_at_ms = now_ms();
         }
         render_request();
         return;

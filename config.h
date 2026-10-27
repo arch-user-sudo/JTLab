@@ -26,6 +26,12 @@
 #define FG_HEX          0xFFFFFF
 #define FG_A            1.0
 
+/* Fallback accent. At runtime JTLab derives a matching accent from the
+ * current wallpaper and uses that single color for every accent surface
+ * (toggles, sliders, usage bars, workspace UI and indicators). This value is
+ * used until a wallpaper color is available. */
+#define ACCENT_HEX      0xE8A03C
+
 /* App menu pill (bar-left launcher button) */
 #define MENU_PILL_W     32
 #define MENU_PILL_H     12
@@ -80,7 +86,6 @@
 #define MENU_FG_HEX     0xFFFFFF
 #define MENU_HOVER_HEX  0x404040
 #define MENU_HOVER_A    1.0
-#define FOCUS_HOVER_A   0.4
 /* Popup border: the frame drawn around every panel, and the hue reused for the
  * dimmer inner dividers and card outlines.
  *
@@ -118,6 +123,16 @@
 
 /* Terminal */
 #define TERMINAL_CMD    "footclient"
+/* Speedtest GUI. Native Wayland client, launched directly (no terminal). */
+#define SPEEDTEST_CMD   "/usr/local/bin/jtspeedtest"
+/* Network control GUI. The bar's network icon toggles this window. */
+#define NETWORKS_CMD    "/usr/local/bin/jtnetworks"
+/* Repository updater GUI. The workspace popup's Updater button toggles it. */
+#define UPDATER_CMD     "/usr/local/bin/jtupdate"
+/* All three GUIs are launched with the current wallpaper accent appended as a
+ * quoted #RRGGBB argument (for example: "... \'#36B4EB\'"). When one is already
+ * running, JTLab sends the new accent to its control socket so the color
+ * changes live instead of restarting the window. */
 /* Shell exec'd after a "held" command finishes, so the terminal window stays
  * open and interactive. $SHELL is the user's login shell; the :- fallback keeps
  * it working in sessions where $SHELL is unset. */
@@ -231,7 +246,9 @@
 #define BLUE_TOGGLE_W     34
 #define BLUE_TOGGLE_H     18
 #define BLUE_TOGGLE_RPAD  8
-#define BLUE_ACCENT_HEX   0xE8A03C
+/* Retained for compatibility. The night-light accent now follows the
+ * wallpaper; ACCENT_HEX is the fallback. */
+#define BLUE_ACCENT_HEX   ACCENT_HEX
 #define BLUE_TEMP_OFF     6500
 #define BLUE_TEMP_MIN     2500
 
@@ -266,6 +283,7 @@
 #define VOL_SLIDER_H    4
 #define VOL_SLIDER_BG_HEX   0x4D4D4D
 #define VOL_SLIDER_BG_A     1.0
+/* Fallback fill; the live volume slider uses the wallpaper accent. */
 #define VOL_SLIDER_FILL_HEX 0x66B366
 #define VOL_SLIDER_FILL_A   1.0
 #define VOL_KNOB_R      5
