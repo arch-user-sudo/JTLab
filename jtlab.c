@@ -52,6 +52,8 @@ static struct {
     struct wl_surface *cursor_surface;
     struct wl_seat *seat;
     struct wl_keyboard *keyboard;
+    struct wl_data_device_manager *data_device_mgr;
+    struct wl_data_device *data_device;
     struct zwlr_layer_shell_v1 *layer_shell;
     struct zwlr_foreign_toplevel_manager_v1 *toplevel_mgr;
     struct ext_workspace_manager_v1 *ext_ws_mgr;
@@ -61,6 +63,7 @@ static struct {
     struct xkb_state *xkb_state;
     uint32_t compositor_name, shm_name, seat_name, layer_shell_name;
     uint32_t toplevel_mgr_name, ext_ws_mgr_name, gamma_mgr_name;
+    uint32_t data_device_mgr_name;
 } g_wl = { 0 };
 
 static void
@@ -7384,9 +7387,10 @@ draw_launcher_item(cairo_t *cr, cairo_surface_t *icon, double px_x, double item_
     double hx = px_x + (item_w - icon_size) / 2.0 - 4;
     double hw = icon_size + 8, hh = bar_h - 4;
 
-    /* The accent bar under a focused app is its focus cue; do not add the
-     * hover background there. Unfocused apps keep the normal hover highlight. */
-    if (hovered && !focused)
+    /* Show the hover background for every item, including the focused one.
+     * The accent bar under a focused app still marks focus, but hover is a
+     * separate cue and should follow the pointer regardless. */
+    if (hovered)
         draw_hover_row(cr, hx, bar_y + 2, hw, hh, hh / 2.0, MENU_HOVER_A);
 
     draw_icon_fit(cr, icon, px_x, row_y, item_w, icon_size, icon_size, 1);
@@ -11663,13 +11667,12 @@ pointer_handle_enter(void *data, struct wl_pointer *pointer,
     pointer_refresh_hover();
 }
 
+/* Clear every hover state. Shared by the normal pointer leave path and by
+ * drag-and-drop, which takes over pointer focus and therefore never receives
+ * wl_pointer.leave for the bar surfaces. */
 static void
-pointer_handle_leave(void *data, struct wl_pointer *pointer,
-                     uint32_t serial, struct wl_surface *surface)
+hover_clear_all(void)
 {
-    (void)data; (void)pointer; (void)serial;
-    if (surface != g_pointer.enter_surface) return;
-    g_pointer.enter_surface = NULL;
     cpop_clear_hover();
     gpopup_clear_hover();
     volpop_clear_hover();
@@ -11678,6 +11681,16 @@ pointer_handle_leave(void *data, struct wl_pointer *pointer,
     ctx_hover_refresh(0);
     menu_hover_refresh(0);
     bar_hover_refresh(0, 0);
+}
+
+static void
+pointer_handle_leave(void *data, struct wl_pointer *pointer,
+                     uint32_t serial, struct wl_surface *surface)
+{
+    (void)data; (void)pointer; (void)serial;
+    if (surface != g_pointer.enter_surface) return;
+    g_pointer.enter_surface = NULL;
+    hover_clear_all();
     render_request();
 }
 
@@ -12171,6 +12184,340 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
     }
 }
 
+/* Scroll wheel over a grouped app: focus the next/previous window in the
+ * group, wrapping around so the whole group is reachable without opening the
+ * window list. The currently activated window is the starting point. */
+static void
+group_scroll_windows(const int *windows, int count, int dir)
+{
+    if (count < 2 || dir == 0) return;
+
+    int cur = -1;
+    for (int i = 0; i < count; i++) {
+        int t = windows[i];
+        if (t >= 0 && t < g_n_toplevels && g_toplevels[t].activated) {
+            cur = i;
+            break;
+        }
+    }
+
+    int next;
+    if (cur < 0)
+        next = dir > 0 ? 0 : count - 1;
+    else
+        next = (cur + dir + count) % count;
+
+    int tl = windows[next];
+    if (tl >= 0 && tl < g_n_toplevels)
+        zwlr_foreign_toplevel_handle_v1_activate(g_toplevels[tl].handle,
+                                                 g_wl.seat);
+}
+
+/* Drag-and-drop awareness: the bar never accepts the dropped data. It only
+ * watches the drag pointer, and after the pointer rests on an app icon for
+ * 500ms it focuses that app (or opens its grouped-window list). The user can
+ * then move off the bar and drop into the now-focused window. */
+enum dnd_target_kind {
+    DND_TARGET_NONE = 0,
+    DND_TARGET_PINNED,
+    DND_TARGET_GROUP,
+    DND_TARGET_GROUP_WINDOW,
+};
+
+struct dnd_state {
+    struct wl_data_offer *offer;
+    struct wl_data_offer *pending_offer;
+    GSource *timer;
+    struct wl_surface *surface;
+    double x, y;
+    int active;
+    int target_kind;
+    int target_idx;
+    int target_done;
+};
+
+static struct dnd_state g_dnd = {
+    .target_kind = DND_TARGET_NONE,
+    .target_idx = -1,
+};
+
+static void
+dnd_timer_cancel(void)
+{
+    if (!g_dnd.timer) return;
+    g_source_destroy(g_dnd.timer);
+    g_source_unref(g_dnd.timer);
+    g_dnd.timer = NULL;
+}
+
+static void
+dnd_activate_target(void)
+{
+    if (g_dnd.target_kind == DND_TARGET_PINNED) {
+        int p = g_dnd.target_idx;
+        if (p < 0 || p >= g_box.n_pl || p >= g_app.n_pinned) return;
+        int app_idx = g_app.pinned[p];
+        if (app_idx < 0 || app_idx >= g_app.n_apps) return;
+
+        int wins[MAX_WINDOWS_PER_GROUP];
+        int count = windows_of_app(&g_app.apps[app_idx], wins,
+                                   MAX_WINDOWS_PER_GROUP);
+        if (count == 1) {
+            if (g_bar.menu_open) menu_close(&g_bar);
+            zwlr_foreign_toplevel_handle_v1_activate(
+                g_toplevels[wins[0]].handle, g_wl.seat);
+        } else if (count > 1) {
+            if (g_bar.menu_open) menu_close(&g_bar);
+            gpopup_open_pinned(p, g_box.pl[p].x);
+        }
+        return;
+    }
+
+    if (g_dnd.target_kind == DND_TARGET_GROUP) {
+        int gidx = g_dnd.target_idx;
+        if (gidx < 0 || gidx >= g_box.n_taskbar_groups) return;
+        struct taskbar_group *g = &g_box.taskbar_groups[gidx];
+        if (g->n_windows == 1) {
+            if (g_bar.menu_open) menu_close(&g_bar);
+            zwlr_foreign_toplevel_handle_v1_activate(
+                g_toplevels[g->windows[0]].handle, g_wl.seat);
+        } else if (g->n_windows > 1) {
+            if (g_bar.menu_open) menu_close(&g_bar);
+            gpopup_open(gidx, g->x);
+        }
+        return;
+    }
+
+    if (g_dnd.target_kind == DND_TARGET_GROUP_WINDOW) {
+        int row = g_dnd.target_idx;
+        if (!g_gpopup.open || row < 0 || row >= g_gpopup.n_windows) return;
+        int tl = g_gpopup.windows[row];
+        if (tl >= 0 && tl < g_n_toplevels)
+            zwlr_foreign_toplevel_handle_v1_activate(g_toplevels[tl].handle,
+                                                     g_wl.seat);
+    }
+}
+
+static gboolean
+dnd_timer_fired(gpointer data)
+{
+    (void)data;
+    g_dnd.target_done = 1;
+    dnd_activate_target();
+    if (g_dnd.timer) {
+        g_source_unref(g_dnd.timer);
+        g_dnd.timer = NULL;
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void
+dnd_timer_start(void)
+{
+    dnd_timer_cancel();
+    if (!g_sni.glib_ctx) return;
+    GSource *src = g_timeout_source_new(500);
+    g_source_set_callback(src, dnd_timer_fired, NULL, NULL);
+    g_source_attach(src, g_sni.glib_ctx);
+    g_dnd.timer = src;
+}
+
+static void
+dnd_update_target(struct wl_surface *surface, double x, double y)
+{
+    int kind = DND_TARGET_NONE;
+    int idx = -1;
+
+    if (surface == g_bar.surface) {
+        int p = pinned_hit_test(x, y);
+        if (p >= 0) {
+            kind = DND_TARGET_PINNED;
+            idx = p;
+        } else {
+            int gidx = toplevel_hit_test(x, y);
+            if (gidx >= 0) {
+                kind = DND_TARGET_GROUP;
+                idx = gidx;
+            }
+        }
+    } else if (g_bar.fly_surface && surface == g_bar.fly_surface &&
+               g_gpopup.open) {
+        int row = group_popup_hit_test(x, y);
+        if (row >= 0) {
+            kind = DND_TARGET_GROUP_WINDOW;
+            idx = row;
+        }
+    }
+
+    if (kind != g_dnd.target_kind || idx != g_dnd.target_idx) {
+        g_dnd.target_kind = kind;
+        g_dnd.target_idx = idx;
+        g_dnd.target_done = 0;
+        dnd_timer_cancel();
+        if (kind != DND_TARGET_NONE)
+            dnd_timer_start();
+    } else if (kind != DND_TARGET_NONE && !g_dnd.target_done &&
+               !g_dnd.timer) {
+        dnd_timer_start();
+    }
+}
+
+static void
+dnd_clear_offer(void)
+{
+    if (g_dnd.offer) {
+        wl_data_offer_destroy(g_dnd.offer);
+        g_dnd.offer = NULL;
+    }
+}
+
+static void
+dnd_reset(void)
+{
+    dnd_timer_cancel();
+    g_dnd.active = 0;
+    g_dnd.surface = NULL;
+    g_dnd.target_kind = DND_TARGET_NONE;
+    g_dnd.target_idx = -1;
+    g_dnd.target_done = 0;
+    dnd_clear_offer();
+}
+
+static void
+dnd_handle_data_offer(void *data, struct wl_data_device *dev,
+                      struct wl_data_offer *offer)
+{
+    (void)data; (void)dev;
+    if (g_dnd.pending_offer && g_dnd.pending_offer != offer)
+        wl_data_offer_destroy(g_dnd.pending_offer);
+    g_dnd.pending_offer = offer;
+}
+
+/* Drag-and-drop owns pointer focus, so wl_pointer.motion never arrives while a
+ * drag is active. Feed the drag coordinates into the normal hover machinery so
+ * the item under the drag pointer highlights exactly as it does for a plain
+ * pointer. */
+static void
+dnd_refresh_hover(struct wl_surface *surface, double x, double y)
+{
+    g_pointer.x = x;
+    g_pointer.y = y;
+    g_pointer.enter_surface = surface;
+    pointer_refresh_hover();
+}
+
+static void
+dnd_handle_enter(void *data, struct wl_data_device *dev, uint32_t serial,
+                 struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy,
+                 struct wl_data_offer *offer)
+{
+    (void)data; (void)dev; (void)serial;
+    if (g_dnd.pending_offer && g_dnd.pending_offer != offer) {
+        wl_data_offer_destroy(g_dnd.pending_offer);
+        g_dnd.pending_offer = NULL;
+    }
+    if (g_dnd.pending_offer == offer)
+        g_dnd.pending_offer = NULL;
+    if (g_dnd.offer && g_dnd.offer != offer)
+        dnd_clear_offer();
+    g_dnd.offer = offer;
+
+    g_dnd.active = 1;
+    g_dnd.surface = surface;
+    g_dnd.x = wl_fixed_to_double(sx);
+    g_dnd.y = wl_fixed_to_double(sy);
+    g_dnd.target_kind = DND_TARGET_NONE;
+    g_dnd.target_idx = -1;
+    g_dnd.target_done = 0;
+    dnd_refresh_hover(surface, g_dnd.x, g_dnd.y);
+    dnd_update_target(surface, g_dnd.x, g_dnd.y);
+}
+
+static void
+dnd_handle_leave(void *data, struct wl_data_device *dev)
+{
+    (void)data; (void)dev;
+    dnd_reset();
+    g_pointer.enter_surface = NULL;
+    hover_clear_all();
+    render_request();
+}
+
+static void
+dnd_handle_motion(void *data, struct wl_data_device *dev, uint32_t time,
+                  wl_fixed_t sx, wl_fixed_t sy)
+{
+    (void)data; (void)dev; (void)time;
+    if (!g_dnd.active) return;
+    g_dnd.x = wl_fixed_to_double(sx);
+    g_dnd.y = wl_fixed_to_double(sy);
+    dnd_refresh_hover(g_dnd.surface, g_dnd.x, g_dnd.y);
+    dnd_update_target(g_dnd.surface, g_dnd.x, g_dnd.y);
+}
+
+static void
+dnd_handle_drop(void *data, struct wl_data_device *dev)
+{
+    (void)data; (void)dev;
+    dnd_reset();
+}
+
+static void
+dnd_handle_selection(void *data, struct wl_data_device *dev,
+                     struct wl_data_offer *offer)
+{
+    (void)data; (void)dev;
+    /* Clipboard selection is not used by the bar; drop the offer so it does
+     * not linger. */
+    if (g_dnd.pending_offer == offer)
+        g_dnd.pending_offer = NULL;
+    if (g_dnd.offer == offer)
+        g_dnd.offer = NULL;
+    if (offer)
+        wl_data_offer_destroy(offer);
+}
+
+static const struct wl_data_device_listener dnd_device_listener = {
+    .data_offer = dnd_handle_data_offer,
+    .enter = dnd_handle_enter,
+    .leave = dnd_handle_leave,
+    .motion = dnd_handle_motion,
+    .drop = dnd_handle_drop,
+    .selection = dnd_handle_selection,
+};
+
+static void
+dnd_init(void)
+{
+    if (!g_wl.data_device_mgr || !g_wl.seat || g_wl.data_device) return;
+    g_wl.data_device =
+        wl_data_device_manager_get_data_device(g_wl.data_device_mgr, g_wl.seat);
+    if (g_wl.data_device)
+        wl_data_device_add_listener(g_wl.data_device, &dnd_device_listener, NULL);
+}
+
+static void
+dnd_cleanup(void)
+{
+    dnd_reset();
+    if (g_dnd.pending_offer) {
+        wl_data_offer_destroy(g_dnd.pending_offer);
+        g_dnd.pending_offer = NULL;
+    }
+    if (g_wl.data_device) {
+        if (wl_data_device_get_version(g_wl.data_device) >=
+            WL_DATA_DEVICE_RELEASE_SINCE_VERSION)
+            wl_data_device_release(g_wl.data_device);
+        else
+            wl_data_device_destroy(g_wl.data_device);
+        g_wl.data_device = NULL;
+    }
+    if (g_wl.data_device_mgr) {
+        wl_data_device_manager_destroy(g_wl.data_device_mgr);
+        g_wl.data_device_mgr = NULL;
+    }
+}
+
 static void
 pointer_handle_axis(void *d, struct wl_pointer *p, uint32_t t,
     uint32_t a, wl_fixed_t v)
@@ -12204,6 +12551,30 @@ pointer_handle_axis(void *d, struct wl_pointer *p, uint32_t t,
     if (over_ws_btns) {
         workspace_scroll_step(delta > 0 ? -1 : 1);
         return;
+    }
+
+    /* Scrolling over a grouped app (taskbar or pinned) walks through its
+     * windows, focusing one per step. Wheel down moves forward in the list. */
+    int over_group = on_bar ? toplevel_hit_test(g_pointer.x, g_pointer.y) : -1;
+    if (over_group >= 0) {
+        struct taskbar_group *g = &g_box.taskbar_groups[over_group];
+        if (g->n_windows > 1) {
+            group_scroll_windows(g->windows, g->n_windows,
+                                 delta > 0 ? 1 : -1);
+            return;
+        }
+    }
+
+    int over_pinned_group = on_bar ? pinned_hit_test(g_pointer.x, g_pointer.y) : -1;
+    if (over_pinned_group >= 0) {
+        int app_idx = g_app.pinned[over_pinned_group];
+        int wins[MAX_WINDOWS_PER_GROUP];
+        int count = windows_of_app(&g_app.apps[app_idx], wins,
+                                   MAX_WINDOWS_PER_GROUP);
+        if (count > 1) {
+            group_scroll_windows(wins, count, delta > 0 ? 1 : -1);
+            return;
+        }
     }
 
     int over_audio = on_bar && g_box.audio_present && audio_hit_test(g_pointer.x, g_pointer.y);
@@ -12636,6 +13007,7 @@ cleanup()
     toplevels_clear();
     if (g_wl.toplevel_mgr) zwlr_foreign_toplevel_manager_v1_destroy(g_wl.toplevel_mgr);
     if (g_pointer.pointer) wl_pointer_destroy(g_pointer.pointer);
+    dnd_cleanup();
     if (g_wl.seat) wl_seat_destroy(g_wl.seat);
     if (g_wl.shm) wl_shm_destroy(g_wl.shm);
     if (g_wl.compositor) wl_compositor_destroy(g_wl.compositor);
@@ -12677,6 +13049,11 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name,
          * is dispatched -- it is what creates the wl_pointer, and the event
          * can arrive as early as the roundtrip that flushes this bind. */
         wl_seat_add_listener(g_wl.seat, &seat_listener, NULL);
+    } else if (strcmp(interface, wl_data_device_manager_interface.name) == 0) {
+        uint32_t v = version < 3 ? version : 3;
+        g_wl.data_device_mgr =
+            wl_registry_bind(reg, name, &wl_data_device_manager_interface, v);
+        g_wl.data_device_mgr_name = name;
     } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
         g_wl.layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, 3);
         g_wl.layer_shell_name = name;
@@ -12709,12 +13086,15 @@ registry_global_remove(void *data, struct wl_registry *reg, uint32_t name)
         wl_shm_destroy(g_wl.shm);
         g_wl.shm = NULL;
     } else if (g_wl.seat && g_wl.seat_name == name) {
+        dnd_cleanup();
         wl_seat_destroy(g_wl.seat);
         g_wl.seat = NULL;
         if (g_pointer.pointer) {
             wl_pointer_destroy(g_pointer.pointer);
             g_pointer.pointer = NULL;
         }
+    } else if (g_wl.data_device_mgr && g_wl.data_device_mgr_name == name) {
+        dnd_cleanup();
     } else if (g_wl.layer_shell && g_wl.layer_shell_name == name) {
         zwlr_layer_shell_v1_destroy(g_wl.layer_shell);
         g_wl.layer_shell = NULL;
@@ -12813,6 +13193,8 @@ wayland_init(void)
     /* Second roundtrip so the gamma_size events for the controls created above
      * have landed before blue_load() applies the saved filter state. */
     wl_display_roundtrip(g_wl.display);
+
+    dnd_init();
 
     if (!g_wl.compositor || !g_wl.shm || !g_wl.layer_shell) {
         fprintf(stderr, "jtlab: missing wayland globals\n");
