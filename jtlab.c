@@ -6042,12 +6042,27 @@ wlp_cmp_mtime(const void *a, const void *b)
     return 0;
 }
 
+/* Wallpapers live in <home>/Wallpapers. Build the path at runtime instead of
+ * baking in one user's home directory, so the browser works on any PC. */
+static const char *
+wlp_wallpaper_dir(void)
+{
+    static char dir[512];
+    if (dir[0]) return dir;
+
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) home = "/tmp";
+    snprintf(dir, sizeof(dir), "%s/Wallpapers/", home);
+    return dir;
+}
+
 static void
 wlp_scan(void)
 {
     if (g_wlp.n_entries > 0) return;
 
-    DIR *dir = opendir(WALLPAPER_DIR);
+    const char *wdir = wlp_wallpaper_dir();
+    DIR *dir = opendir(wdir);
     if (!dir) return;
 
     struct dirent *entry;
@@ -6062,7 +6077,7 @@ wlp_scan(void)
             continue;
 
         struct wall_entry *we = &g_wlp.entries[g_wlp.n_entries];
-        snprintf(we->path, sizeof(we->path), "%s%s", WALLPAPER_DIR, n);
+        snprintf(we->path, sizeof(we->path), "%s%s", wdir, n);
         snprintf(we->name, sizeof(we->name), "%.*s", (int)(l > 20 ? 17 : l), n);
         if (l > 20) strcat(we->name, "...");
         we->thumb = NULL;

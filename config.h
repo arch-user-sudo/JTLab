@@ -253,8 +253,7 @@
 #define BLUE_TEMP_MIN     2500
 
 /* Wallpaper browser popup (click Wallpaper button in workspace popup).
- * Scans WALLPAPER_DIR for images, shows a scrollable grid of thumbnails. */
-#define WALLPAPER_DIR   "/home/lynch/Wallpapers/"
+ * Scans $HOME/Wallpapers for images, shows a scrollable grid of thumbnails. */
 #define WALL_VISIBLE_ROWS 3
 #define WALL_THUMB_W    130
 #define WALL_THUMB_H    80
