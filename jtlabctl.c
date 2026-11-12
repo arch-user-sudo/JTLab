@@ -1,8 +1,9 @@
 /* jtlabctl — send a command to a running jtlab bar over its control socket.
  *
  * Usage: jtlabctl <command>
- *   menu   toggle the app menu open/closed
- *   quit   exit the bar
+ *   menu        toggle the app menu open/closed
+ *   screenshot  start the interactive screenshot region selector
+ *   quit        exit the bar
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +24,7 @@ int
 main(int argc, char *argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <command> (menu|quit)\n", argv[0]);
+        fprintf(stderr, "usage: %s <command> (menu|screenshot|quit)\n", argv[0]);
         return 1;
     }
 

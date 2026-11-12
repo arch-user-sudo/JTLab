@@ -201,6 +201,22 @@
 /* Workspace (tags) indicator icon, left of the tray cluster */
 #define WS_ICON_SIZE    16
 
+/* On-screen keyboard toggle, immediately right of the workspace icon. It sits
+ * inside the status pill with the workspace icon, so right_cluster_limit()
+ * reserves both when clamping the taskbar. */
+#define OSK_ICON_SIZE   16
+#define OSK_ICON_GAP    8
+
+/* On-screen keyboard panel. The strip is sized from these: five rows of keys
+ * with even padding and gaps, plus PPADDING below the panel like every other
+ * flyout. */
+#define OSK_WIDTH       860
+#define OSK_PAD         10
+#define OSK_KEY_H       40
+#define OSK_KEY_GAP     6
+#define OSK_KEY_R       6
+#define OSK_ROWS        5
+
 /* Workspace popup (wallpaper button + horizontal row of numbered buttons) */
 #define WS_BTN_SIZE     26
 #define WS_BTN_GAP      6

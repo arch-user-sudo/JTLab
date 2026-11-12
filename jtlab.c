@@ -42,6 +42,8 @@
 #include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
 #include "ext-workspace-v1-client-protocol.h"
 #include "wlr-gamma-control-unstable-v1-client-protocol.h"
+#include "wlr-screencopy-unstable-v1-client-protocol.h"
+#include "virtual-keyboard-unstable-v1-client-protocol.h"
 
 static struct {
     struct wl_display *display;
@@ -60,12 +62,17 @@ static struct {
     struct zwlr_foreign_toplevel_manager_v1 *toplevel_mgr;
     struct ext_workspace_manager_v1 *ext_ws_mgr;
     struct zwlr_gamma_control_manager_v1 *gamma_mgr;
+    struct zwlr_screencopy_manager_v1 *screencopy_mgr;
+    struct zwp_virtual_keyboard_manager_v1 *vk_mgr;
+    struct zwp_virtual_keyboard_v1 *vk;
     struct xkb_context *xkb_ctx;
     struct xkb_keymap *xkb_keymap;
     struct xkb_state *xkb_state;
     uint32_t compositor_name, shm_name, seat_name, layer_shell_name;
     uint32_t xdg_wm_base_name;
     uint32_t toplevel_mgr_name, ext_ws_mgr_name, gamma_mgr_name;
+    uint32_t screencopy_mgr_name;
+    uint32_t vk_mgr_name;
     uint32_t data_device_mgr_name;
 } g_wl = { 0 };
 
@@ -138,6 +145,7 @@ struct pointer_state {
     int hover_tray;
     int hover_ws;
     int hover_wx;
+    int hover_osk;
 };
 
 static struct pointer_state g_pointer = { .hover_tray = -1 };
@@ -285,6 +293,21 @@ struct bar {
     _Atomic int menu_needs_render;
     struct wl_callback *menu_frame_cb;
     int menu_frame_pending;
+
+    struct wl_surface *osk_surface;
+    struct xdg_surface *osk_xdg_surface;
+    struct xdg_popup *osk_popup;
+    int osk_surf_width, osk_surf_height, osk_surf_configured;
+    int osk_req_width, osk_req_height;
+    int osk_cfg_width, osk_cfg_height;
+    uint32_t osk_reposition_token;
+    int osk_dismissed;
+    struct shm_pool osk_pool;
+    cairo_surface_t *osk_cairo;
+    cairo_t *osk_cr;
+    _Atomic int osk_needs_render;
+    struct wl_callback *osk_frame_cb;
+    int osk_frame_pending;
 };
 
 static struct bar g_bar = { 0 };
@@ -320,6 +343,8 @@ render_request(void)
     g_bar.fly_needs_render = 1;
     if (g_bar.menu_open)
         g_bar.menu_needs_render = 1;
+    if (g_bar.osk_popup)
+        g_bar.osk_needs_render = 1;
 }
 
 struct power_menu {
@@ -494,7 +519,7 @@ clock_layout(cairo_t *cr)
 static double
 snap_px(double v)
 {
-    return (double)lround(v);
+    return round(v);
 }
 
 static double
@@ -989,7 +1014,10 @@ node_event_param(void *data, int seq, uint32_t id, uint32_t index,
 
     uint32_t off = 0;
     while (off + 8 <= body_size) {
-        const struct spa_pod_prop *prop = (const struct spa_pod_prop *)(body + off);
+        /* spa pods are 8-byte aligned; the intermediate void pointer keeps
+         * -Wcast-align from treating this known-aligned cast as a bug. */
+        const void *raw = body + off;
+        const struct spa_pod_prop *prop = raw;
         uint32_t padded = (uint32_t)SPA_ROUND_UP_N(SPA_POD_PROP_SIZE(prop), 8);
         if (padded == 0 || off + padded > body_size) break;
 
@@ -1431,6 +1459,11 @@ static void bar_draw(struct bar *b);
 static void bar_render(struct bar *b);
 static void flyout_draw(cairo_t *cr, PangoLayout *pl);
 static void flyout_update_size(struct bar *b);
+static void osk_surface_create(struct bar *b);
+static void osk_surface_destroy(struct bar *b);
+static void osk_surface_close(struct bar *b);
+static void osk_update_size(struct bar *b);
+static void osk_x_anim_stop(void);
 static const struct wl_callback_listener frame_listener;
 static void bar_update_size(struct bar *b);
 static double popup_place_x(double anchor_x, double w, double edge);
@@ -1980,7 +2013,6 @@ apps_data_dirs(const char **dirs, int max)
 
 static void menu_filter_update(void);
 static void pinned_save(void);
-static void cpop_close(void);
 
 static void
 pinned_drop(int p)
@@ -2302,10 +2334,15 @@ scroll_anim_cancel(struct scroll_anim *a)
  * would be blank; the snapshot is what lets the content slide away instead of
  * vanishing.
  *
- * A 16ms timeout only pokes the surface's needs_render flag each tick. The
- * actual buffer upload is paced by the compositor's frame callbacks in
- * main_loop(), so the transition runs at the display refresh rate, matching the
- * existing scroll animations.
+ * The animation is driven by elapsed time, not by a fixed number of timer
+ * ticks. A 16ms timeout pokes the surface's needs_render flag, but every
+ * position is computed from the monotonic clock. This matters because the
+ * timeout and the compositor's frame callbacks are not in phase: a 16ms timer
+ * against a 16.67ms refresh occasionally fires twice between two frames, and a
+ * fixed 25%-per-tick step would then jump twice as far on that frame. Time
+ * based easing makes each presented frame advance by the real elapsed time, so
+ * the motion stays smooth (and keeps its duration) regardless of refresh rate
+ * or scheduling jitter.
  * ------------------------------------------------------------------------- */
 
 struct transition {
@@ -2315,6 +2352,9 @@ struct transition {
     int pending_open;       /* a freshly created surface should ease in */
     double y, y_target;     /* vertical offset, logical px */
     double alpha, alpha_target;
+    double start_y;         /* values when the current run began */
+    double start_alpha;
+    gint64 start_us;        /* monotonic start of the current run */
     cairo_surface_t *snapshot;  /* device-pixel frame being animated out */
     int snap_scale;
     _Atomic int *flag;      /* the surface's needs_render flag to poke */
@@ -2323,9 +2363,11 @@ struct transition {
 
 static struct transition g_fly_trans;
 static struct transition g_menu_trans;
+static struct transition g_osk_trans;
 
-/* Exponential approach, matching the feel of the scroll animations above. */
-#define TRANS_EASE 0.25
+/* Exponential approach. 18/s is the continuous-time equivalent of the old
+ * 25% per 16ms step: exp(-18 * 0.016) ~= 0.75. */
+#define TRANS_RATE 18.0
 
 static void
 transition_free_snapshot(struct transition *t)
@@ -2336,14 +2378,28 @@ transition_free_snapshot(struct transition *t)
     }
 }
 
+/* Recompute the current position from the monotonic clock. Called both from
+ * the timer and from the render path, so a frame always reflects the time it
+ * is actually presented, not the time of the last timer tick. */
+static void
+transition_advance(struct transition *t)
+{
+    if (!t->active) return;
+    double elapsed =
+        (double)(g_get_monotonic_time() - t->start_us) / 1000000.0;
+    double p = 1.0 - exp(-TRANS_RATE * elapsed);
+    t->y = t->start_y + (t->y_target - t->start_y) * p;
+    t->alpha = t->start_alpha + (t->alpha_target - t->start_alpha) * p;
+}
+
 static gboolean
 transition_tick(void *data)
 {
     struct transition *t = data;
-    double dy = t->y_target - t->y;
-    double da = t->alpha_target - t->alpha;
+    transition_advance(t);
 
-    if (fabs(dy) < 0.5 && fabs(da) < 0.01) {
+    if (fabs(t->y_target - t->y) < 0.5 &&
+        fabs(t->alpha_target - t->alpha) < 0.01) {
         t->y = t->y_target;
         t->alpha = t->alpha_target;
         t->src = NULL;
@@ -2358,8 +2414,6 @@ transition_tick(void *data)
         }
         return G_SOURCE_REMOVE;
     }
-    t->y += dy * TRANS_EASE;
-    t->alpha += da * TRANS_EASE;
     if (t->flag) *t->flag = 1;
     return G_SOURCE_CONTINUE;
 }
@@ -2408,6 +2462,9 @@ transition_begin_open(struct transition *t, double dist, _Atomic int *flag)
     t->alpha = 0.0;
     t->y_target = 0.0;
     t->alpha_target = 1.0;
+    t->start_y = t->y;
+    t->start_alpha = t->alpha;
+    t->start_us = g_get_monotonic_time();
     if (t->flag) *t->flag = 1;
     transition_start(t);
 }
@@ -2446,6 +2503,9 @@ transition_begin_close(struct transition *t, cairo_surface_t *live,
     t->alpha = 1.0;
     t->y_target = dist;
     t->alpha_target = 0.0;
+    t->start_y = t->y;
+    t->start_alpha = t->alpha;
+    t->start_us = g_get_monotonic_time();
     if (t->flag) *t->flag = 1;
     transition_start(t);
     return 1;
@@ -2457,7 +2517,8 @@ transition_begin_close(struct transition *t, cairo_surface_t *live,
 static int
 transition_begin_frame(cairo_t *cr, struct transition *t)
 {
-    if (!t->active && t->y == 0.0 && t->alpha == 1.0)
+    transition_advance(t);
+    if (!t->active && fabs(t->y) < 1e-9 && t->alpha >= 1.0)
         return 0;
     cairo_push_group(cr);
     cairo_translate(cr, 0, t->y);
@@ -2478,6 +2539,7 @@ transition_draw_snapshot(cairo_t *cr, struct transition *t)
 {
     if (!t->snapshot) return 0;
     int scale = t->snap_scale ? t->snap_scale : 1;
+    transition_advance(t);
     cairo_save(cr);
     cairo_scale(cr, 1.0 / scale, 1.0 / scale);
     cairo_set_source_surface(cr, t->snapshot, 0, t->y * scale);
@@ -2542,13 +2604,29 @@ right_cluster_limit(void)
     else if (g_box.net_status != NET_NONE) left = net_icon_x();
     else left = g_bar.width - TRAY_EDGE_PAD - NOTIF_ICON_SIZE
                     - TRAY_GAP - time_text_width();
-    return left - gap - WS_ICON_SIZE - 4;
+    /* The workspace and on-screen-keyboard toggles share the left end of the
+     * pill. Reserve both, plus the gap between them, so the taskbar clamp in
+     * center_taskbar_items() never runs underneath either icon. */
+    return left - gap - WS_ICON_SIZE - OSK_ICON_GAP - OSK_ICON_SIZE - 4;
 }
 
 static double
 workspace_icon_x(void)
 {
     return right_cluster_limit() + 4;
+}
+
+static double
+osk_icon_x(void)
+{
+    return workspace_icon_x() + WS_ICON_SIZE + OSK_ICON_GAP;
+}
+
+static int
+osk_icon_hit_test(double px, double py)
+{
+    return bar_icon_hit_test(px, py, osk_icon_x(), OSK_ICON_SIZE,
+                             OSK_ICON_SIZE);
 }
 
 /* Centre of the notification bell. The volume and notification panels anchor
@@ -3528,7 +3606,8 @@ static void
 pinned_save(void)
 {
     char dir[512];
-    snprintf(dir, sizeof(dir), "%s/.config/jtlab", getenv("HOME") ?: "/tmp");
+    const char *home = getenv("HOME");
+    snprintf(dir, sizeof(dir), "%s/.config/jtlab", home ? home : "/tmp");
     mkdir(dir, 0755);
 
     FILE *f = fopen(pinned_config_path(), "w");
@@ -4064,11 +4143,14 @@ gpopup_fill(int count, const int *windows, double cx)
 }
 
 static void close_sibling_popups(void);
+static void close_sibling_popups_keep_osk(void);
+static void close_siblings_for_popup(void);
+static void close_all_popups(void);
 
 static void
 gpopup_open(int group_idx, double x)
 {
-    close_sibling_popups();
+    close_siblings_for_popup();
     struct taskbar_group *g = &g_box.taskbar_groups[group_idx];
     gpopup_fill(g->n_windows, g->windows, x + g->w / 2.0);
 }
@@ -4079,7 +4161,7 @@ gpopup_open_pinned(int pinned_idx, double x)
     const struct app_entry *a = &g_app.apps[g_app.pinned[pinned_idx]];
     int count = windows_of_app(a, g_gpopup.windows, MAX_WINDOWS_PER_GROUP);
     if (count < 2) return;
-    close_sibling_popups();
+    close_siblings_for_popup();
     gpopup_fill(count, g_gpopup.windows, x + g_box.pl[pinned_idx].w / 2.0);
 }
 
@@ -4318,8 +4400,8 @@ volpop_set_from_x(double px)
     double range = g_volpop.slider_x_max - g_volpop.slider_x_min;
     if (range <= 0) return;
     float pct = (float)((px - g_volpop.slider_x_min) / range * VOLUME_MAX);
-    if (pct < VOLUME_MIN) pct = (float)VOLUME_MIN;
-    if (pct > VOLUME_MAX) pct = (float)VOLUME_MAX;
+    if (pct < (float)VOLUME_MIN) pct = (float)VOLUME_MIN;
+    if (pct > (float)VOLUME_MAX) pct = (float)VOLUME_MAX;
     pw_set_volume(pct);
     render_request();
 }
@@ -4352,8 +4434,8 @@ volpop_scroll(double delta)
     pw_thread_loop_unlock(g_pw.thread_loop);
     if (!has_dev) return;
     vol += (float)delta;
-    if (vol < VOLUME_MIN) vol = (float)VOLUME_MIN;
-    if (vol > VOLUME_MAX) vol = (float)VOLUME_MAX;
+    if (vol < (float)VOLUME_MIN) vol = (float)VOLUME_MIN;
+    if (vol > (float)VOLUME_MAX) vol = (float)VOLUME_MAX;
     pw_set_volume(vol);
     render_request();
 }
@@ -5254,6 +5336,7 @@ output_gamma_create_all(void)
 static void output_bg_surface_create(struct output_entry *o);
 static void output_bg_surface_create_all(void);
 static void output_bg_surface_destroy(struct output_entry *o);
+static void shot_output_removed(struct output_entry *o);
 
 static void
 output_add(struct wl_registry *reg, uint32_t name, uint32_t version)
@@ -5279,6 +5362,7 @@ output_remove(uint32_t name)
 {
     for (int i = 0; i < g_n_outputs; i++) {
         if (g_outputs[i]->global_name != name) continue;
+        shot_output_removed(g_outputs[i]);
         output_bg_surface_destroy(g_outputs[i]);
         if (g_outputs[i]->gamma)
             zwlr_gamma_control_v1_destroy(g_outputs[i]->gamma);
@@ -5430,6 +5514,34 @@ static struct {
     double x, y;
     double w, h;
 } g_wxpop;
+
+/* ---------------------------------------------------------------------------
+ * On-screen keyboard
+ *
+ * The keyboard reuses the flyout strip but deliberately does not take an
+ * xdg_popup grab. A grab would move keyboard focus to the popup, so the
+ * virtual-keyboard events would be delivered back to JTLab instead of the
+ * application being typed into. Without a grab the application keeps focus,
+ * the keyboard stays open until the bar toggle (or another popup) closes it,
+ * and clicks on the desktop go straight to whatever is underneath.
+ * ------------------------------------------------------------------------- */
+struct osk_state {
+    int open;
+    int suspended;      /* hidden for the wallpaper picker; reopen on close */
+    int hover_key;
+    int shift;
+    int ctrl;
+    int alt;
+    int super;
+    double x, y;
+    double x_target;    /* where the panel is sliding to, for the menu shift */
+    double x_from;      /* panel position when the current slide began */
+    gint64 x_start_us;  /* monotonic start of the current slide */
+    GSource *x_src;     /* menu-shift animation timer */
+    double w, h;
+};
+
+static struct osk_state g_osk = { .hover_key = -1 };
 
 static PangoFontDescription *
 wx_font(void)
@@ -5829,7 +5941,7 @@ notifpop_trash_hit_test(double px, double py)
     if (!g_npop.open) return 0;
     int row = notifpop_row_hit_test(px, py);
     if (row < 0) return 0;
-    double tcy = g_npop.list_y + row * NOTIF_ROW_H - (double)lround(g_npop.scroll) +
+    double tcy = g_npop.list_y + row * NOTIF_ROW_H - round(g_npop.scroll) +
                  NOTIF_ROW_H / 2.0;
     return in_rect(px, py, g_npop.trash_cx - NOTIF_TRASH_ICON / 2.0 - 5,
                    tcy - NOTIF_TRASH_ICON / 2.0 - 5,
@@ -5871,7 +5983,7 @@ notifpop_scroll(double delta)
     if (g_npop.target_scroll < 0) g_npop.target_scroll = 0;
     if (g_npop.target_scroll > g_npop.max_scroll)
         g_npop.target_scroll = g_npop.max_scroll;
-    if (g_npop.target_scroll == old) return;
+    if (fabs(g_npop.target_scroll - old) < 1e-9) return;
     notifpop_anim_start();
     render_request();
 }
@@ -6509,6 +6621,617 @@ output_bg_surface_destroy_all(void)
         output_bg_surface_destroy(g_outputs[i]);
 }
 
+/* ---------------------------------------------------------------------------
+ * Built-in screenshot capture
+ *
+ * The Screenshot quick action used to shell out to slurp + grim.  This is the
+ * native path: one overlay layer surface per output dims the desktop and lets
+ * the pointer drag out a region, then wlr-screencopy grabs that output and the
+ * selection is cropped and written as a PNG.  A click without a drag captures
+ * the whole output; Escape or a non-left click cancels.
+ *
+ * The overlay must not appear in the captured frame.  Rather than racing the
+ * compositor by unmapping it and hoping a fresh frame has been rendered, the
+ * overlay is repainted fully transparent and the capture is started from its
+ * frame callback: that callback means the transparent frame is on screen.
+ * ------------------------------------------------------------------------- */
+
+#define SHOT_DIM_ALPHA 0.45
+
+struct shot_overlay {
+    struct output_entry *out;
+    struct wl_surface *surface;
+    struct zwlr_layer_surface_v1 *layer;
+    struct shm_pool pool;
+    cairo_surface_t *cairo;
+    cairo_t *cr;
+    int configured;
+    int width, height, scale;
+    struct wl_callback *frame_cb;
+    int frame_pending;
+    int dirty;
+};
+
+struct shot_capture {
+    struct zwlr_screencopy_frame_v1 *frame;
+    struct shm_pool pool;
+    int width, height, stride;
+    uint32_t format;
+    int y_invert;
+    int crop_x, crop_y, crop_w, crop_h;
+    char *path;
+};
+
+static struct {
+    int active;
+    int dragging;
+    int capturing;
+    int capture_started;
+    struct shot_overlay *overlays[MAX_OUTPUTS];
+    int n_overlays;
+    struct shot_overlay *sel;
+    double x0, y0, x1, y1;
+    int crop_x, crop_y, crop_w, crop_h;
+} g_shot;
+
+static void shot_overlay_render(struct shot_overlay *ov);
+static void shot_capture_start(void);
+
+static void
+shot_overlay_destroy(struct shot_overlay *ov)
+{
+    for (int i = 0; i < g_shot.n_overlays; i++) {
+        if (g_shot.overlays[i] != ov) continue;
+        memmove(&g_shot.overlays[i], &g_shot.overlays[i + 1],
+                (size_t)(g_shot.n_overlays - i - 1) * sizeof(g_shot.overlays[0]));
+        g_shot.n_overlays--;
+        break;
+    }
+    if (g_shot.sel == ov) g_shot.sel = NULL;
+    if (ov->frame_cb) { wl_callback_destroy(ov->frame_cb); ov->frame_cb = NULL; }
+    if (ov->layer) { zwlr_layer_surface_v1_destroy(ov->layer); ov->layer = NULL; }
+    if (ov->surface) { wl_surface_destroy(ov->surface); ov->surface = NULL; }
+    if (ov->cr) { cairo_destroy(ov->cr); ov->cr = NULL; }
+    if (ov->cairo) { cairo_surface_destroy(ov->cairo); ov->cairo = NULL; }
+    shm_pool_cleanup(&ov->pool);
+    free(ov);
+}
+
+static void
+shot_end(void)
+{
+    while (g_shot.n_overlays > 0)
+        shot_overlay_destroy(g_shot.overlays[g_shot.n_overlays - 1]);
+    memset(&g_shot, 0, sizeof(g_shot));
+    render_request();
+}
+
+static void
+shot_cancel(void)
+{
+    if (g_shot.active)
+        shot_end();
+}
+
+static void
+shot_output_removed(struct output_entry *o)
+{
+    for (int i = g_shot.n_overlays - 1; i >= 0; i--) {
+        if (g_shot.overlays[i]->out == o)
+            shot_overlay_destroy(g_shot.overlays[i]);
+    }
+    if (g_shot.active && g_shot.n_overlays == 0)
+        shot_end();
+}
+
+static int
+shot_capture_save(struct shot_capture *cap)
+{
+    int x = cap->crop_x;
+    int y = cap->crop_y;
+    int w = cap->crop_w;
+    int h = cap->crop_h;
+
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x < cap->width && x + w > cap->width) w = cap->width - x;
+    if (y < cap->height && y + h > cap->height) h = cap->height - y;
+    if (w <= 0 || h <= 0) return 0;
+
+    cairo_surface_t *dst = cairo_image_surface_create(CAIRO_FORMAT_RGB24, w, h);
+    if (cairo_surface_status(dst) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(dst);
+        return 0;
+    }
+    cairo_surface_flush(dst);
+
+    uint8_t *dd = cairo_image_surface_get_data(dst);
+    const uint8_t *sd = cap->pool.data;
+    if (!dd || !sd) {
+        cairo_surface_destroy(dst);
+        return 0;
+    }
+
+    /* wlroots' GLES2 renderer prefers DRM_FORMAT_ABGR8888, whose bytes are
+     * R,G,B,A in memory; the XRGB/ARGB formats are B,G,R,A.  Cairo's RGB24
+     * image surface is native-endian 0xXXRRGGBB, i.e. B,G,R,X on little
+     * endian, so the ABGR case has to swap red and blue while copying. */
+    int bgr = cap->format == WL_SHM_FORMAT_XRGB8888 ||
+              cap->format == WL_SHM_FORMAT_ARGB8888;
+    int ds = cairo_image_surface_get_stride(dst);
+    for (int row = 0; row < h; row++) {
+        int sy = cap->y_invert ? (cap->height - 1 - (y + row)) : (y + row);
+        if (sy < 0 || sy >= cap->height) continue;
+        const uint8_t *src = sd + (size_t)sy * (size_t)cap->stride +
+                             (size_t)x * 4u;
+        uint8_t *drow = dd + (size_t)row * (size_t)ds;
+        if (bgr) {
+            memcpy(drow, src, (size_t)w * 4u);
+        } else {
+            for (int col = 0; col < w; col++) {
+                drow[0] = src[2];
+                drow[1] = src[1];
+                drow[2] = src[0];
+                drow[3] = 0xFF;
+                drow += 4;
+                src += 4;
+            }
+        }
+    }
+    cairo_surface_mark_dirty(dst);
+    cairo_status_t st = cairo_surface_write_to_png(dst, cap->path);
+    cairo_surface_destroy(dst);
+    return st == CAIRO_STATUS_SUCCESS;
+}
+
+static void
+shot_capture_free(struct shot_capture *cap)
+{
+    if (cap->frame) {
+        zwlr_screencopy_frame_v1_destroy(cap->frame);
+        cap->frame = NULL;
+    }
+    shm_pool_cleanup(&cap->pool);
+    g_free(cap->path);
+    free(cap);
+}
+
+static void
+shot_capture_buffer(void *data, struct zwlr_screencopy_frame_v1 *frame,
+                    uint32_t format, uint32_t width, uint32_t height,
+                    uint32_t stride)
+{
+    struct shot_capture *cap = data;
+    cap->width = (int)width;
+    cap->height = (int)height;
+    cap->stride = (int)stride;
+    cap->format = format;
+
+    size_t size = (size_t)stride * (size_t)height;
+    if (width == 0 || height == 0 || size == 0 ||
+        shm_pool_init(&cap->pool, size) < 0) {
+        shot_capture_free(cap);
+        notif_add("Screenshot", "jtlab", "Screenshot failed",
+                  "Could not allocate the capture buffer.", 0);
+        shot_end();
+        return;
+    }
+
+    cap->pool.buffer = shm_pool_create_buffer(&cap->pool, (int)width,
+                                              (int)height, (int)stride,
+                                              format);
+    if (!cap->pool.buffer) {
+        shot_capture_free(cap);
+        notif_add("Screenshot", "jtlab", "Screenshot failed",
+                  "Could not create the capture buffer.", 0);
+        shot_end();
+        return;
+    }
+    zwlr_screencopy_frame_v1_copy(frame, cap->pool.buffer);
+}
+
+static void
+shot_capture_flags(void *data, struct zwlr_screencopy_frame_v1 *frame,
+                   uint32_t flags)
+{
+    (void)frame;
+    struct shot_capture *cap = data;
+    if (flags & ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT)
+        cap->y_invert = 1;
+}
+
+static void
+shot_capture_ready(void *data, struct zwlr_screencopy_frame_v1 *frame,
+                   uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec)
+{
+    (void)frame; (void)tv_sec_hi; (void)tv_sec_lo; (void)tv_nsec;
+    struct shot_capture *cap = data;
+
+    int ok = shot_capture_save(cap);
+    char *path = cap->path ? g_strdup(cap->path) : NULL;
+    shot_capture_free(cap);
+
+    if (ok && path)
+        notif_add("Screenshot", "jtlab", "Screenshot", path, 0);
+    else
+        notif_add("Screenshot", "jtlab", "Screenshot failed",
+                  "Could not save the capture.", 0);
+    g_free(path);
+    shot_end();
+}
+
+static void
+shot_capture_failed(void *data, struct zwlr_screencopy_frame_v1 *frame)
+{
+    (void)frame;
+    struct shot_capture *cap = data;
+    shot_capture_free(cap);
+    notif_add("Screenshot", "jtlab", "Screenshot failed",
+              "The compositor could not copy the output.", 0);
+    shot_end();
+}
+
+static const struct zwlr_screencopy_frame_v1_listener shot_capture_listener = {
+    .buffer = shot_capture_buffer,
+    .flags = shot_capture_flags,
+    .ready = shot_capture_ready,
+    .failed = shot_capture_failed,
+};
+
+static void
+shot_capture_start(void)
+{
+    if (g_shot.capture_started) return;
+    g_shot.capture_started = 1;
+
+    struct shot_overlay *ov = g_shot.sel;
+    if (!ov || !ov->out || !ov->out->output || !g_wl.screencopy_mgr) {
+        shot_end();
+        return;
+    }
+
+    struct shot_capture *cap = calloc(1, sizeof(*cap));
+    if (!cap) {
+        shot_end();
+        return;
+    }
+    cap->pool.fd = -1;
+    cap->crop_x = g_shot.crop_x;
+    cap->crop_y = g_shot.crop_y;
+    cap->crop_w = g_shot.crop_w;
+    cap->crop_h = g_shot.crop_h;
+
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    char *dir = g_strdup_printf("%s/Screenshots", home);
+    if (dir) {
+        mkdir(dir, 0755);
+        cap->path = g_strdup_printf("%s/screenshot-%lld.png", dir,
+                                    (long long)time(NULL));
+        g_free(dir);
+    }
+    if (!cap->path) {
+        free(cap);
+        shot_end();
+        return;
+    }
+
+    cap->frame = zwlr_screencopy_manager_v1_capture_output(
+        g_wl.screencopy_mgr, 0, ov->out->output);
+    if (!cap->frame) {
+        shot_capture_free(cap);
+        shot_end();
+        return;
+    }
+    zwlr_screencopy_frame_v1_add_listener(cap->frame, &shot_capture_listener, cap);
+    wl_display_flush(g_wl.display);
+}
+
+static int
+shot_overlay_alloc(struct shot_overlay *ov, int width, int height, int scale)
+{
+    if (ov->cr) { cairo_destroy(ov->cr); ov->cr = NULL; }
+    if (ov->cairo) { cairo_surface_destroy(ov->cairo); ov->cairo = NULL; }
+    ov->width = width;
+    ov->height = height;
+    ov->scale = scale;
+
+    int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32,
+                                               width * scale);
+    size_t size = (size_t)stride * (size_t)height * (size_t)scale;
+    if (shm_pool_init(&ov->pool, size) < 0) return 0;
+    pool_cairo_init(&ov->pool, &ov->cairo, &ov->cr,
+                    width * scale, height * scale, stride, scale);
+    return ov->cr != NULL;
+}
+
+static void
+shot_frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    (void)time;
+    struct shot_overlay *ov = data;
+    if (ov->frame_cb == cb) ov->frame_cb = NULL;
+    wl_callback_destroy(cb);
+    ov->frame_pending = 0;
+
+    if (ov->dirty) {
+        ov->dirty = 0;
+        shot_overlay_render(ov);
+    }
+    if (g_shot.capturing && !g_shot.capture_started &&
+        ov == g_shot.sel && !ov->frame_pending)
+        shot_capture_start();
+}
+
+static const struct wl_callback_listener shot_frame_listener = {
+    .done = shot_frame_done,
+};
+
+/* Round a logical coordinate to a whole pixel.  The intermediate variable
+ * keeps -Wbad-function-cast happy about converting lround()'s long. */
+static int
+shot_px(double v)
+{
+    long n = lround(v);
+    return (int)n;
+}
+
+static void
+shot_overlay_render(struct shot_overlay *ov)
+{
+    if (!ov->surface || !ov->cr || !ov->configured) return;
+    if (ov->frame_pending) {
+        ov->dirty = 1;
+        return;
+    }
+
+    int scale = ov->scale > 0 ? ov->scale : 1;
+    int phys_w = ov->width * scale;
+    int phys_h = ov->height * scale;
+    int stride = cairo_image_surface_get_stride(ov->cairo);
+    cairo_t *cr = ov->cr;
+
+    cairo_save(cr);
+    if (g_shot.capturing) {
+        /* Transparent frame: the compositor composites the overlay away
+         * before the screencopy request lands. */
+        cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+        cairo_paint(cr);
+        cairo_restore(cr);
+    } else {
+        cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+        cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, SHOT_DIM_ALPHA);
+        cairo_paint(cr);
+
+        double sx = fmin(g_shot.x0, g_shot.x1);
+        double sy = fmin(g_shot.y0, g_shot.y1);
+        double sw = fabs(g_shot.x1 - g_shot.x0);
+        double sh = fabs(g_shot.y1 - g_shot.y0);
+        if (g_shot.sel == ov && sw > 0.5 && sh > 0.5) {
+            cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+            cairo_rectangle(cr, sx, sy, sw, sh);
+            cairo_fill(cr);
+
+            cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+            cairo_set_source_rgba(cr, COLOR(ACCENT_HEX), 1.0);
+            cairo_set_line_width(cr, 1.0);
+            cairo_rectangle(cr, sx + 0.5, sy + 0.5, sw - 1.0, sh - 1.0);
+            cairo_stroke(cr);
+
+            char label[64];
+            snprintf(label, sizeof(label), "%d x %d",
+                     shot_px(sw), shot_px(sh));
+            cairo_select_font_face(cr, "sans", CAIRO_FONT_SLANT_NORMAL,
+                                   CAIRO_FONT_WEIGHT_NORMAL);
+            cairo_set_font_size(cr, 12.0);
+            cairo_text_extents_t ext;
+            cairo_text_extents(cr, label, &ext);
+            double bw = ext.width + 12.0;
+            double bh = ext.height + 8.0;
+            double bx = sx + 4.0;
+            double by = sy + 4.0;
+            if (by + bh > (double)ov->height - 4.0) by = sy - bh - 4.0;
+            if (bx + bw > (double)ov->width - 4.0) bx = (double)ov->width - bw - 4.0;
+            if (bx < 4.0) bx = 4.0;
+            if (by < 4.0) by = 4.0;
+            cairo_set_source_rgba(cr, 0.0, 0.0, 0.0, 0.7);
+            cairo_rectangle(cr, bx, by, bw, bh);
+            cairo_fill(cr);
+            cairo_set_source_rgba(cr, COLOR(ACCENT_HEX), 1.0);
+            cairo_move_to(cr, bx + 6.0, by + 4.0 + ext.height);
+            cairo_show_text(cr, label);
+        }
+        cairo_restore(cr);
+    }
+
+    if (!ov->pool.buffer)
+        ov->pool.buffer = shm_pool_create_buffer(&ov->pool, phys_w, phys_h,
+                                                 stride, WL_SHM_FORMAT_ARGB8888);
+    if (!ov->pool.buffer) return;
+
+    cairo_surface_flush(ov->cairo);
+    wl_surface_set_buffer_scale(ov->surface, scale);
+    wl_surface_attach(ov->surface, ov->pool.buffer, 0, 0);
+    wl_surface_damage_buffer(ov->surface, 0, 0, phys_w, phys_h);
+
+    if (ov->frame_cb) wl_callback_destroy(ov->frame_cb);
+    ov->frame_cb = wl_surface_frame(ov->surface);
+    wl_callback_add_listener(ov->frame_cb, &shot_frame_listener, ov);
+    ov->frame_pending = 1;
+    wl_surface_commit(ov->surface);
+}
+
+static void
+shot_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
+                     uint32_t serial, uint32_t width, uint32_t height)
+{
+    struct shot_overlay *ov = data;
+    zwlr_layer_surface_v1_ack_configure(surface, serial);
+    if (!ov->surface || width == 0 || height == 0) return;
+
+    int scale = ov->out && ov->out->scale > 0 ? ov->out->scale : 1;
+    if (!ov->cr || (int)width != ov->width || (int)height != ov->height ||
+        scale != ov->scale) {
+        if (!shot_overlay_alloc(ov, (int)width, (int)height, scale)) return;
+    }
+    ov->configured = 1;
+    shot_overlay_render(ov);
+}
+
+static void
+shot_layer_closed(void *data, struct zwlr_layer_surface_v1 *surface)
+{
+    (void)surface;
+    shot_overlay_destroy(data);
+    if (g_shot.active && g_shot.n_overlays == 0)
+        shot_end();
+}
+
+static const struct zwlr_layer_surface_v1_listener shot_layer_listener = {
+    .configure = shot_layer_configure,
+    .closed = shot_layer_closed,
+};
+
+static void
+shot_overlay_create(struct output_entry *o)
+{
+    if (!g_wl.compositor || !g_wl.layer_shell || !o->output) return;
+    if (g_shot.n_overlays >= MAX_OUTPUTS) return;
+
+    struct shot_overlay *ov = calloc(1, sizeof(*ov));
+    if (!ov) return;
+    ov->pool.fd = -1;
+    ov->out = o;
+
+    struct wl_surface *surf = wl_compositor_create_surface(g_wl.compositor);
+    if (!surf) { free(ov); return; }
+    struct zwlr_layer_surface_v1 *ls =
+        zwlr_layer_shell_v1_get_layer_surface(g_wl.layer_shell, surf, o->output,
+            ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "jtlab-screenshot");
+    if (!ls) { wl_surface_destroy(surf); free(ov); return; }
+
+    ov->surface = surf;
+    ov->layer = ls;
+    g_shot.overlays[g_shot.n_overlays++] = ov;
+    zwlr_layer_surface_v1_add_listener(ls, &shot_layer_listener, ov);
+    zwlr_layer_surface_v1_set_anchor(ls,
+        ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT |
+        ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM);
+    zwlr_layer_surface_v1_set_size(ls, 0, 0);
+    zwlr_layer_surface_v1_set_exclusive_zone(ls, -1);
+    zwlr_layer_surface_v1_set_keyboard_interactivity(ls,
+        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
+    wl_surface_commit(surf);
+}
+
+static void
+shot_begin(void)
+{
+    if (g_shot.active) return;
+    if (!g_wl.screencopy_mgr) {
+        notif_add("Screenshot", "jtlab", "Screenshot failed",
+                  "The compositor does not support wlr-screencopy.", 0);
+        return;
+    }
+
+    memset(&g_shot, 0, sizeof(g_shot));
+    g_shot.active = 1;
+    for (int i = 0; i < g_n_outputs; i++)
+        shot_overlay_create(g_outputs[i]);
+
+    if (g_shot.n_overlays == 0) {
+        shot_end();
+        notif_add("Screenshot", "jtlab", "Screenshot failed",
+                  "No outputs available to capture.", 0);
+    }
+}
+
+static struct shot_overlay *
+shot_overlay_at(struct wl_surface *surface)
+{
+    if (!surface) return NULL;
+    for (int i = 0; i < g_shot.n_overlays; i++) {
+        if (g_shot.overlays[i]->surface == surface)
+            return g_shot.overlays[i];
+    }
+    return NULL;
+}
+
+static void
+shot_finish(void)
+{
+    struct shot_overlay *ov = g_shot.sel;
+    if (!ov || !ov->configured || !ov->out || !ov->out->output) {
+        shot_end();
+        return;
+    }
+
+    double sx = fmin(g_shot.x0, g_shot.x1);
+    double sy = fmin(g_shot.y0, g_shot.y1);
+    double sw = fabs(g_shot.x1 - g_shot.x0);
+    double sh = fabs(g_shot.y1 - g_shot.y0);
+    if (sw < 2.0 || sh < 2.0) {
+        sx = 0.0;
+        sy = 0.0;
+        sw = (double)ov->width;
+        sh = (double)ov->height;
+    }
+
+    int scale = ov->scale > 0 ? ov->scale : 1;
+    g_shot.crop_x = shot_px(sx * (double)scale);
+    g_shot.crop_y = shot_px(sy * (double)scale);
+    g_shot.crop_w = shot_px(sw * (double)scale);
+    g_shot.crop_h = shot_px(sh * (double)scale);
+    g_shot.capturing = 1;
+
+    shot_overlay_render(ov);
+    if (!ov->frame_pending)
+        shot_capture_start();
+}
+
+static int
+shot_handle_button(uint32_t button, uint32_t state)
+{
+    if (!g_shot.active) return 0;
+    if (g_shot.capturing) return 1;
+
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+        if (button != BTN_LEFT) {
+            shot_cancel();
+            return 1;
+        }
+        struct shot_overlay *ov = shot_overlay_at(g_pointer.enter_surface);
+        if (!ov) return 1;
+        g_shot.sel = ov;
+        g_shot.dragging = 1;
+        g_shot.x0 = clampd(g_pointer.x, 0.0, (double)ov->width);
+        g_shot.y0 = clampd(g_pointer.y, 0.0, (double)ov->height);
+        g_shot.x1 = g_shot.x0;
+        g_shot.y1 = g_shot.y0;
+        shot_overlay_render(ov);
+        return 1;
+    }
+
+    if (button != BTN_LEFT) return 1;
+    if (!g_shot.dragging) return 1;
+    g_shot.dragging = 0;
+    shot_finish();
+    return 1;
+}
+
+static int
+shot_handle_motion(void)
+{
+    if (!g_shot.active || !g_shot.dragging || g_shot.capturing) return 0;
+
+    struct shot_overlay *ov = g_shot.sel;
+    if (!ov || g_pointer.enter_surface != ov->surface) return 1;
+    g_shot.x1 = clampd(g_pointer.x, 0.0, (double)ov->width);
+    g_shot.y1 = clampd(g_pointer.y, 0.0, (double)ov->height);
+    shot_overlay_render(ov);
+    return 1;
+}
+
 static char *
 wlp_state_path(void)
 {
@@ -6573,9 +7296,9 @@ theme_rgb_hue(double r, double g, double b, double max, double min)
     if (d <= 0.0)
         return 0.0;
     double h;
-    if (max == r)
+    if (max <= r)
         h = fmod((g - b) / d, 6.0);
-    else if (max == g)
+    else if (max <= g)
         h = (b - r) / d + 2.0;
     else
         h = (r - g) / d + 4.0;
@@ -6988,7 +7711,7 @@ static void
 notif_draw_row(cairo_t *cr, PangoLayout *pl, int row)
 {
     struct notif_entry *e = &g_notifs[g_n_notifs - 1 - row];
-    double ry = g_npop.list_y + row * NOTIF_ROW_H - (double)lround(g_npop.scroll);
+    double ry = g_npop.list_y + row * NOTIF_ROW_H - round(g_npop.scroll);
     double row_w = g_npop.rows_w;
     double box_y = ry + NOTIF_BOX_GAP / 2.0;
     double box_h = NOTIF_ROW_H - NOTIF_BOX_GAP;
@@ -7724,6 +8447,8 @@ draw_power_icon(int action, cairo_t *cr, double cx, double cy)
         cairo_close_path(cr);
         cairo_fill(cr);
         break;
+    default:
+        break;
     }
 }
 
@@ -8375,7 +9100,8 @@ sys_stats_refresh(void)
         }
     }
 
-    double t = (double)now_ms() / 1000.0;
+    int64_t now = now_ms();
+    double t = (double)now / 1000.0;
     double g = 18 + 14 * sin(t / 13.0) + 7 * sin(t / 4.3);
     g = clampd(g, 0, 100);
     g_sys.pct[SYS_STAT_GPU] = g;
@@ -8934,7 +9660,7 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
         cairo_rectangle(cr, mx + POWER_COL_W, list_top, MENU_WIDTH, list_h);
         cairo_clip(cr);
     }
-    double sofs = (double)lround(g_bar.menu_anim_px);
+    double sofs = round(g_bar.menu_anim_px);
     int first_pos = (int)(sofs / MENU_ROW_HEIGHT);
     for (int ri = 0; ri <= vis_rows; ri++) {
         int pos = first_pos + ri;
@@ -9278,26 +10004,14 @@ wspop_action_draw(cairo_t *cr, int i)
                   PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_LEFT);
 }
 
-/* Screenshot: slurp picks a region, grim captures it, and the PNG is saved as
- * screenshot-<unix-time>.png in ~/Screenshots. The geometry comes back as a
- * command substitution, so the region selection stays interactive.
- *
- * grim is chained to notify-send with && rather than notified unconditionally,
- * so backing out of slurp stays silent and only a capture that actually landed
- * is announced. mkdir -p first, or a missing ~/Screenshots would fail the save
- * and swallow the notification that would have explained why. */
+/* Screenshot: the bar's own region selector dims every output, then captures
+ * the chosen area with wlr-screencopy and writes it to
+ * ~/Screenshots/screenshot-<unix-time>.png.  A plain click captures the whole
+ * output.  No external slurp/grim/notify-send is involved. */
 static void
 wspop_action_screenshot(void)
 {
-    const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
-
-    char cmd[768];
-    snprintf(cmd, sizeof(cmd),
-             "mkdir -p \"%s/Screenshots\"; f=\"%s/Screenshots/screenshot-%lld.png\"; "
-             "grim -g \"$(slurp)\" \"$f\" && notify-send 'Screenshot' \"Saved to $f\"",
-             home, home, (long long)time(NULL));
-    run_cmd(cmd, 0);
+    shot_begin();
 }
 
 /* Runs the action behind quick-action button i. */
@@ -9358,6 +10072,529 @@ wspop_action_activate(int i)
     default:
         break;
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * On-screen keyboard layout, drawing and key injection
+ * ------------------------------------------------------------------------- */
+
+enum osk_action {
+    OSK_ACT_KEY = 0,
+    OSK_ACT_SHIFT,
+    OSK_ACT_CTRL,
+    OSK_ACT_ALT,
+    OSK_ACT_SUPER,
+};
+
+struct osk_key {
+    const char *label;
+    const char *shift_label;
+    uint32_t code;
+    double units;
+    enum osk_action action;
+};
+
+/* Hover/press indices encode the row and column as row * OSK_ROW_STRIDE + col.
+ * 32 is comfortably above the widest row and keeps the arithmetic obvious. */
+#define OSK_ROW_STRIDE 32
+
+static const struct osk_key osk_row0[] = {
+    { "`", "~", KEY_GRAVE, 1.0, OSK_ACT_KEY },
+    { "1", "!", KEY_1, 1.0, OSK_ACT_KEY },
+    { "2", "@", KEY_2, 1.0, OSK_ACT_KEY },
+    { "3", "#", KEY_3, 1.0, OSK_ACT_KEY },
+    { "4", "$", KEY_4, 1.0, OSK_ACT_KEY },
+    { "5", "%", KEY_5, 1.0, OSK_ACT_KEY },
+    { "6", "^", KEY_6, 1.0, OSK_ACT_KEY },
+    { "7", "&", KEY_7, 1.0, OSK_ACT_KEY },
+    { "8", "*", KEY_8, 1.0, OSK_ACT_KEY },
+    { "9", "(", KEY_9, 1.0, OSK_ACT_KEY },
+    { "0", ")", KEY_0, 1.0, OSK_ACT_KEY },
+    { "-", "_", KEY_MINUS, 1.0, OSK_ACT_KEY },
+    { "=", "+", KEY_EQUAL, 1.0, OSK_ACT_KEY },
+    { "Backspace", NULL, KEY_BACKSPACE, 2.0, OSK_ACT_KEY },
+};
+
+static const struct osk_key osk_row1[] = {
+    { "Tab", NULL, KEY_TAB, 1.5, OSK_ACT_KEY },
+    { "q", "Q", KEY_Q, 1.0, OSK_ACT_KEY },
+    { "w", "W", KEY_W, 1.0, OSK_ACT_KEY },
+    { "e", "E", KEY_E, 1.0, OSK_ACT_KEY },
+    { "r", "R", KEY_R, 1.0, OSK_ACT_KEY },
+    { "t", "T", KEY_T, 1.0, OSK_ACT_KEY },
+    { "y", "Y", KEY_Y, 1.0, OSK_ACT_KEY },
+    { "u", "U", KEY_U, 1.0, OSK_ACT_KEY },
+    { "i", "I", KEY_I, 1.0, OSK_ACT_KEY },
+    { "o", "O", KEY_O, 1.0, OSK_ACT_KEY },
+    { "p", "P", KEY_P, 1.0, OSK_ACT_KEY },
+    { "[", "{", KEY_LEFTBRACE, 1.0, OSK_ACT_KEY },
+    { "]", "}", KEY_RIGHTBRACE, 1.0, OSK_ACT_KEY },
+    { "\\", "|", KEY_BACKSLASH, 1.5, OSK_ACT_KEY },
+};
+
+static const struct osk_key osk_row2[] = {
+    { "a", "A", KEY_A, 1.0, OSK_ACT_KEY },
+    { "s", "S", KEY_S, 1.0, OSK_ACT_KEY },
+    { "d", "D", KEY_D, 1.0, OSK_ACT_KEY },
+    { "f", "F", KEY_F, 1.0, OSK_ACT_KEY },
+    { "g", "G", KEY_G, 1.0, OSK_ACT_KEY },
+    { "h", "H", KEY_H, 1.0, OSK_ACT_KEY },
+    { "j", "J", KEY_J, 1.0, OSK_ACT_KEY },
+    { "k", "K", KEY_K, 1.0, OSK_ACT_KEY },
+    { "l", "L", KEY_L, 1.0, OSK_ACT_KEY },
+    { ";", ":", KEY_SEMICOLON, 1.0, OSK_ACT_KEY },
+    { "'", "\"", KEY_APOSTROPHE, 1.0, OSK_ACT_KEY },
+    { "Enter", NULL, KEY_ENTER, 2.25, OSK_ACT_KEY },
+};
+
+static const struct osk_key osk_row3[] = {
+    { "Shift", NULL, KEY_LEFTSHIFT, 2.25, OSK_ACT_SHIFT },
+    { "z", "Z", KEY_Z, 1.0, OSK_ACT_KEY },
+    { "x", "X", KEY_X, 1.0, OSK_ACT_KEY },
+    { "c", "C", KEY_C, 1.0, OSK_ACT_KEY },
+    { "v", "V", KEY_V, 1.0, OSK_ACT_KEY },
+    { "b", "B", KEY_B, 1.0, OSK_ACT_KEY },
+    { "n", "N", KEY_N, 1.0, OSK_ACT_KEY },
+    { "m", "M", KEY_M, 1.0, OSK_ACT_KEY },
+    { ",", "<", KEY_COMMA, 1.0, OSK_ACT_KEY },
+    { ".", ">", KEY_DOT, 1.0, OSK_ACT_KEY },
+    { "/", "?", KEY_SLASH, 1.0, OSK_ACT_KEY },
+    { "Shift", NULL, KEY_LEFTSHIFT, 2.25, OSK_ACT_SHIFT },
+};
+
+static const struct osk_key osk_row4[] = {
+    { "Esc", NULL, KEY_ESC, 1.25, OSK_ACT_KEY },
+    { "Ctrl", NULL, KEY_LEFTCTRL, 1.25, OSK_ACT_CTRL },
+    { "Alt", NULL, KEY_LEFTALT, 1.25, OSK_ACT_ALT },
+    { "Super", NULL, KEY_LEFTMETA, 1.25, OSK_ACT_SUPER },
+    { "Space", NULL, KEY_SPACE, 5.0, OSK_ACT_KEY },
+    { "←", NULL, KEY_LEFT, 1.0, OSK_ACT_KEY },
+    { "↑", NULL, KEY_UP, 1.0, OSK_ACT_KEY },
+    { "↓", NULL, KEY_DOWN, 1.0, OSK_ACT_KEY },
+    { "→", NULL, KEY_RIGHT, 1.0, OSK_ACT_KEY },
+};
+
+static const struct osk_key *const osk_rows[OSK_ROWS] = {
+    osk_row0, osk_row1, osk_row2, osk_row3, osk_row4,
+};
+
+static const size_t osk_row_counts[OSK_ROWS] = {
+    sizeof(osk_row0) / sizeof(osk_row0[0]),
+    sizeof(osk_row1) / sizeof(osk_row1[0]),
+    sizeof(osk_row2) / sizeof(osk_row2[0]),
+    sizeof(osk_row3) / sizeof(osk_row3[0]),
+    sizeof(osk_row4) / sizeof(osk_row4[0]),
+};
+
+/* Height of the open flyouts on the shared strip. The keyboard lives on its own
+ * surface and deliberately does not contribute to this. */
+static int
+flyout_other_height(void)
+{
+    int ph = g_gpopup.open ? g_gpopup.height : 0;
+    int cph = g_cpop.open ? (int)g_cpop.h : 0;
+    int vh = g_volpop.open ? volpop_height() : 0;
+    int th = g_tm.open ? g_tm.height : 0;
+    int wh = g_wspop.open ? wspop_height() : 0;
+    int nh = g_npop.open ? notif_height() : 0;
+    int ch = g_calpop.open ? calpop_height() : 0;
+    int wlh = g_wlp.open ? wlp_height() : 0;
+    int xxh = g_wxpop.open ? wxpop_height() : 0;
+    return ph + cph + vh + th + wh + nh + ch + wlh + xxh;
+}
+
+static double
+osk_body_h(void)
+{
+    return 2.0 * OSK_PAD + OSK_ROWS * OSK_KEY_H +
+           (OSK_ROWS - 1) * OSK_KEY_GAP;
+}
+
+static double
+osk_row_y(int row)
+{
+    return g_osk.y + OSK_PAD + (double)row * (OSK_KEY_H + OSK_KEY_GAP);
+}
+
+static void
+osk_recalc_geometry(void)
+{
+    g_osk.w = OSK_WIDTH;
+    double max_w = g_bar.width - 2.0 * PPADDING;
+    if (g_osk.w > max_w)
+        g_osk.w = max_w;
+    if (g_osk.w < 1.0)
+        g_osk.w = 1.0;
+
+    double x = (g_bar.width - g_osk.w) / 2.0;
+    if (g_bar.menu_open) {
+        /* The launcher panel occupies the left edge of the bar. Slide the
+         * keyboard clear of it, leaving the same gap a panel keeps from the
+         * bar, and keep it on screen if the output is too narrow. */
+        double menu_right = MENU_MARGIN_L + MENU_WIDTH + POWER_COL_W + SYS_COL_W;
+        double shifted = menu_right + PPADDING;
+        if (shifted + g_osk.w <= g_bar.width - PPADDING)
+            x = shifted;
+    }
+    g_osk.x_target = x;
+    g_osk.y = 0.0;
+    g_osk.h = osk_body_h() + PPADDING;
+}
+
+static void
+osk_key_slot(int row, size_t col, double *x, double *w)
+{
+    double total = 0.0;
+    size_t n = osk_row_counts[row];
+
+    for (size_t i = 0; i < n; i++)
+        total += osk_rows[row][i].units;
+
+    double inner_x = g_osk.x + OSK_PAD;
+    double inner_w = g_osk.w - 2.0 * OSK_PAD;
+    double slot_x = inner_x;
+    for (size_t i = 0; i < col; i++)
+        slot_x += inner_w * osk_rows[row][i].units / total;
+
+    double slot_w = inner_w * osk_rows[row][col].units / total;
+    *x = slot_x + OSK_KEY_GAP / 2.0;
+    *w = slot_w - OSK_KEY_GAP;
+    if (*w < 1.0)
+        *w = 1.0;
+}
+
+static int
+osk_hit_test(double px, double py)
+{
+    if (!g_osk.open)
+        return -1;
+
+    for (int row = 0; row < OSK_ROWS; row++) {
+        double y = osk_row_y(row);
+        if (py < y || py > y + OSK_KEY_H)
+            continue;
+
+        size_t n = osk_row_counts[row];
+        for (size_t col = 0; col < n; col++) {
+            double x, w;
+            osk_key_slot(row, col, &x, &w);
+            if (px >= x && px <= x + w)
+                return row * OSK_ROW_STRIDE + (int)col;
+        }
+    }
+    return -1;
+}
+
+static int
+osk_create_keyboard(void)
+{
+    if (g_wl.vk)
+        return 1;
+    if (!g_wl.vk_mgr || !g_wl.seat)
+        return 0;
+
+    if (!g_wl.xkb_ctx)
+        g_wl.xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (!g_wl.xkb_ctx)
+        return 0;
+
+    struct xkb_rule_names names = {
+        .rules = NULL,
+        .model = NULL,
+        .layout = "us",
+        .variant = NULL,
+        .options = NULL,
+    };
+    struct xkb_keymap *km =
+        xkb_keymap_new_from_names(g_wl.xkb_ctx, &names,
+                                  XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (!km)
+        return 0;
+
+    char *str = xkb_keymap_get_as_string(km, XKB_KEYMAP_FORMAT_TEXT_V1);
+    xkb_keymap_unref(km);
+    if (!str)
+        return 0;
+
+    size_t len = strlen(str) + 1;
+    int fd = memfd_create("jtlab-osk-keymap", 0);
+    if (fd < 0) {
+        free(str);
+        return 0;
+    }
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+
+    int ok = 1;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, str + off, len - off);
+        if (n <= 0) {
+            ok = 0;
+            break;
+        }
+        off += (size_t)n;
+    }
+    free(str);
+    if (!ok) {
+        close(fd);
+        return 0;
+    }
+
+    g_wl.vk = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
+        g_wl.vk_mgr, g_wl.seat);
+    if (!g_wl.vk) {
+        close(fd);
+        return 0;
+    }
+    zwp_virtual_keyboard_v1_keymap(g_wl.vk,
+        WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd, (uint32_t)len);
+    close(fd);
+    wl_display_flush(g_wl.display);
+    return 1;
+}
+
+static void
+osk_send_key(uint32_t code, int shift, int ctrl, int alt, int super)
+{
+    if (!g_wl.vk)
+        return;
+
+    uint32_t t = (uint32_t)now_ms();
+    if (ctrl)
+        zwp_virtual_keyboard_v1_key(g_wl.vk, t, KEY_LEFTCTRL,
+            WL_KEYBOARD_KEY_STATE_PRESSED);
+    if (alt)
+        zwp_virtual_keyboard_v1_key(g_wl.vk, t, KEY_LEFTALT,
+            WL_KEYBOARD_KEY_STATE_PRESSED);
+    if (super)
+        zwp_virtual_keyboard_v1_key(g_wl.vk, t, KEY_LEFTMETA,
+            WL_KEYBOARD_KEY_STATE_PRESSED);
+    if (shift)
+        zwp_virtual_keyboard_v1_key(g_wl.vk, t, KEY_LEFTSHIFT,
+            WL_KEYBOARD_KEY_STATE_PRESSED);
+
+    zwp_virtual_keyboard_v1_key(g_wl.vk, t, code,
+        WL_KEYBOARD_KEY_STATE_PRESSED);
+    zwp_virtual_keyboard_v1_key(g_wl.vk, t, code,
+        WL_KEYBOARD_KEY_STATE_RELEASED);
+
+    if (shift)
+        zwp_virtual_keyboard_v1_key(g_wl.vk, t, KEY_LEFTSHIFT,
+            WL_KEYBOARD_KEY_STATE_RELEASED);
+    if (super)
+        zwp_virtual_keyboard_v1_key(g_wl.vk, t, KEY_LEFTMETA,
+            WL_KEYBOARD_KEY_STATE_RELEASED);
+    if (alt)
+        zwp_virtual_keyboard_v1_key(g_wl.vk, t, KEY_LEFTALT,
+            WL_KEYBOARD_KEY_STATE_RELEASED);
+    if (ctrl)
+        zwp_virtual_keyboard_v1_key(g_wl.vk, t, KEY_LEFTCTRL,
+            WL_KEYBOARD_KEY_STATE_RELEASED);
+
+    wl_display_flush(g_wl.display);
+}
+
+static void
+osk_press(int idx)
+{
+    int row = idx / OSK_ROW_STRIDE;
+    int col = idx % OSK_ROW_STRIDE;
+    if (row < 0 || row >= OSK_ROWS || col < 0 ||
+        (size_t)col >= osk_row_counts[row])
+        return;
+
+    const struct osk_key *k = &osk_rows[row][(size_t)col];
+    switch (k->action) {
+    case OSK_ACT_SHIFT:
+        g_osk.shift = !g_osk.shift;
+        break;
+    case OSK_ACT_CTRL:
+        g_osk.ctrl = !g_osk.ctrl;
+        break;
+    case OSK_ACT_ALT:
+        g_osk.alt = !g_osk.alt;
+        break;
+    case OSK_ACT_SUPER:
+        g_osk.super = !g_osk.super;
+        break;
+    case OSK_ACT_KEY:
+        osk_send_key(k->code, g_osk.shift, g_osk.ctrl,
+                     g_osk.alt, g_osk.super);
+        /* Modifiers are one-shot: a chord is the modifier latch followed by
+         * one key, then everything returns to the base layer. */
+        g_osk.shift = 0;
+        g_osk.ctrl = 0;
+        g_osk.alt = 0;
+        g_osk.super = 0;
+        break;
+    default:
+        break;
+    }
+    render_request();
+}
+
+static void
+osk_draw_key(cairo_t *cr, PangoLayout *pl, const struct osk_key *k,
+             double x, double y, double w, int active, int hover)
+{
+    double h = OSK_KEY_H;
+
+    if (active)
+        cairo_set_source_rgba(cr, COLOR(g_theme.accent), 0.95);
+    else if (hover)
+        cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
+    else
+        cairo_set_source_rgba(cr, COLOR(PBCOLOR), 0.30);
+    cairo_new_path(cr);
+    rounded_rect(cr, x, y, w, h, OSK_KEY_R);
+    cairo_fill(cr);
+
+    const char *label = (g_osk.shift && k->shift_label) ? k->shift_label
+                                                        : k->label;
+    pango_layout_set_text(pl, label, -1);
+    pango_layout_set_width(pl, -1);
+    int tw, th;
+    pango_layout_get_pixel_size(pl, &tw, &th);
+
+    if (active)
+        cairo_set_source_rgba(cr, COLOR(BG_HEX), 1.0);
+    else if (k->code == KEY_ENTER)
+        cairo_set_source_rgba(cr, COLOR(g_theme.accent), 1.0);
+    else
+        cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 0.95);
+    cairo_move_to(cr, snap_px(x + (w - (double)tw) / 2.0),
+                  snap_px(y + (h - (double)th) / 2.0));
+    pango_cairo_show_layout(cr, pl);
+}
+
+static void
+osk_draw(cairo_t *cr, PangoLayout *pl)
+{
+    double body_h = g_osk.h - PPADDING;
+    panel_begin(cr, g_osk.x, g_osk.y, g_osk.w, body_h,
+                PRADIUS, MENU_SHADOW_W, MENU_SHADOW_A, 1);
+
+    for (int row = 0; row < OSK_ROWS; row++) {
+        double y = osk_row_y(row);
+        size_t n = osk_row_counts[row];
+        for (size_t col = 0; col < n; col++) {
+            double x, w;
+            osk_key_slot(row, col, &x, &w);
+
+            const struct osk_key *k = &osk_rows[row][col];
+            int active = 0;
+            switch (k->action) {
+            case OSK_ACT_SHIFT: active = g_osk.shift; break;
+            case OSK_ACT_CTRL: active = g_osk.ctrl; break;
+            case OSK_ACT_ALT: active = g_osk.alt; break;
+            case OSK_ACT_SUPER: active = g_osk.super; break;
+            case OSK_ACT_KEY:
+            default:
+                break;
+            }
+
+            int idx = row * OSK_ROW_STRIDE + (int)col;
+            osk_draw_key(cr, pl, k, x, y, w, active,
+                         g_osk.hover_key == idx);
+        }
+    }
+
+    cairo_restore(cr);
+}
+
+static void
+osk_open(void)
+{
+    if (g_osk.open)
+        return;
+
+    (void)osk_create_keyboard();
+
+    /* A previous instance may still be easing out; reclaim the surface rather
+     * than letting its teardown fire under the new keyboard. */
+    if (g_osk_trans.closing) {
+        transition_cancel(&g_osk_trans);
+        osk_surface_destroy(&g_bar);
+    }
+
+    g_osk.open = 1;
+    g_osk.hover_key = -1;
+    g_osk.shift = 0;
+    g_osk.ctrl = 0;
+    g_osk.alt = 0;
+    g_osk.super = 0;
+    osk_recalc_geometry();
+    osk_x_anim_stop();
+    g_osk.x = g_osk.x_target;
+    osk_surface_create(&g_bar);
+
+    render_request();
+}
+
+static void
+osk_close(void)
+{
+    if (!g_osk.open)
+        return;
+
+    g_osk.open = 0;
+    g_osk.hover_key = -1;
+    g_osk.shift = 0;
+    g_osk.ctrl = 0;
+    g_osk.alt = 0;
+    g_osk.super = 0;
+    osk_x_anim_stop();
+    osk_surface_close(&g_bar);
+    render_request();
+}
+
+static void
+osk_resume(void)
+{
+    if (!g_osk.suspended)
+        return;
+    g_osk.suspended = 0;
+    osk_open();
+}
+
+static void
+osk_toggle(void)
+{
+    if (g_osk.open) {
+        osk_close();
+    } else {
+        close_all_popups();
+        osk_open();
+    }
+}
+
+static void
+draw_osk_icon(cairo_t *cr, double x, double y, double sz, int active)
+{
+    double ix = x + 1.5;
+    double iy = y + 3.5;
+    double iw = sz - 3.0;
+    double ih = sz - 7.0;
+
+    cairo_set_line_width(cr, 1.3);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_source_rgba(cr, COLOR(active ? g_theme.accent : FG_HEX),
+                          active ? 1.0 : 0.85);
+    cairo_new_path(cr);
+    rounded_rect(cr, ix, iy, iw, ih, 2.0);
+    cairo_stroke(cr);
+
+    for (int i = 0; i < 3; i++) {
+        double kx = ix + iw * (0.25 + 0.25 * (double)i);
+        double ky = iy + ih * 0.42;
+        cairo_new_path(cr);
+        cairo_arc(cr, kx, ky, 0.8, 0, 2 * M_PI);
+        cairo_fill(cr);
+    }
+
+    cairo_move_to(cr, ix + iw * 0.30, iy + ih * 0.72);
+    cairo_line_to(cr, ix + iw * 0.70, iy + ih * 0.72);
+    cairo_stroke(cr);
 }
 
 /* The nine flyouts that hang off the top of the bar. They live on their
@@ -10084,7 +11321,7 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
         cairo_clip(cr);
         int first = (int)(lround(g_npop.scroll) / NOTIF_ROW_H);
         for (int i = first; i < g_n_notifs; i++) {
-            double ry = g_npop.list_y + i * NOTIF_ROW_H - (double)lround(g_npop.scroll);
+            double ry = g_npop.list_y + i * NOTIF_ROW_H - round(g_npop.scroll);
             if (ry >= g_npop.list_y + g_npop.list_h) break;
             if (ry + NOTIF_ROW_H <= g_npop.list_y) continue;
             notif_draw_row(cr, pl, i);
@@ -10264,6 +11501,18 @@ bar_draw(struct bar *b)
                 }
             }
         }
+    }
+
+    {
+        double osz = OSK_ICON_SIZE;
+        double ox = osk_icon_x();
+        double oy = bar_y + (bar_h - osz) / 2.0;
+        double ocx = ox + osz / 2.0;
+        double ocy = oy + osz / 2.0;
+
+        if (g_pointer.hover_osk)
+            draw_hover_circle(cr, ocx, ocy, osz, 6);
+        draw_osk_icon(cr, ox, oy, osz, g_osk.open);
     }
 
     if (g_box.net_status != NET_NONE) {
@@ -10555,6 +11804,7 @@ bar_popup_positioner(struct bar *b, int width, int height)
     xdg_positioner_set_anchor_rect(pos, 0, 0, b->width, b->height);
     xdg_positioner_set_anchor(pos, XDG_POSITIONER_ANCHOR_TOP_LEFT);
     xdg_positioner_set_gravity(pos, XDG_POSITIONER_GRAVITY_TOP_LEFT);
+    xdg_positioner_set_offset(pos, 0, 0);
     xdg_positioner_set_constraint_adjustment(pos,
         XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
         XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y);
@@ -10878,11 +12128,18 @@ flyout_popup_done(void *data, struct xdg_popup *popup)
     struct bar *b = &g_bar;
     /* The compositor dismissed the grab: the surface is already unmapped, so
      * skip the close animation and drop every flyout's state at once. */
+    int resume_osk = g_osk.suspended;
     b->fly_dismissed = 1;
-    close_sibling_popups();
+    /* Dismissing a normal flyout must leave the keyboard alone; only the
+     * wallpaper picker suspended it, and that one brings it back on close. */
+    close_sibling_popups_keep_osk();
     b->fly_dismissed = 0;
     if (b->fly_popup)
         flyout_surface_destroy(b);
+    if (resume_osk) {
+        g_osk.suspended = 0;
+        osk_open();
+    }
 }
 
 static const struct xdg_popup_listener flyout_popup_listener = {
@@ -10963,7 +12220,10 @@ flyout_surface_create(struct bar *b, int width, int height)
     xdg_surface_add_listener(b->fly_xdg_surface,
                              &flyout_xdg_surface_listener, NULL);
 
-    struct xdg_positioner *pos = bar_popup_positioner(b, width, height);
+    /* Flyouts always hang directly off the bar, even while the keyboard is
+     * open: the keyboard is its own popup, not part of the bar's height. */
+    struct xdg_positioner *pos =
+        bar_popup_positioner(b, width, height);
     b->fly_popup = xdg_surface_get_popup(b->fly_xdg_surface, NULL, pos);
     xdg_positioner_destroy(pos);
     xdg_popup_add_listener(b->fly_popup, &flyout_popup_listener, NULL);
@@ -11015,6 +12275,391 @@ flyout_close_done(void)
     flyout_surface_destroy(&g_bar);
 }
 
+/* ---------------------------------------------------------------------------
+ * On-screen keyboard surface
+ *
+ * The keyboard is an xdg_popup of its own, like the launcher menu, so it can
+ * stay open while other flyouts come and go. It deliberately does not request
+ * an xdg_popup grab: a grab moves keyboard focus to the popup, which would
+ * send the virtual-keyboard events back to JTLab instead of the application
+ * being typed into. Without the grab the focused application keeps receiving
+ * the keys, and the keyboard stays up until its bar toggle (or the wallpaper
+ * picker) closes it.
+ * ------------------------------------------------------------------------- */
+
+static void
+osk_frame_done(void *data, struct wl_callback *cb, uint32_t time)
+{
+    struct bar *b = data;
+    (void)time;
+    if (b->osk_frame_cb == cb)
+        b->osk_frame_cb = NULL;
+    wl_callback_destroy(cb);
+    b->osk_frame_pending = 0;
+}
+
+static const struct wl_callback_listener osk_frame_listener = {
+    .done = osk_frame_done,
+};
+
+static void
+osk_commit(struct bar *b)
+{
+    struct surf_commit c = {
+        .ready = b->osk_surf_configured,
+        .surface = b->osk_surface,
+        .pool = &b->osk_pool,
+        .cairo = b->osk_cairo,
+        .width = b->osk_surf_width,
+        .height = b->osk_surf_height,
+        .scale = b->scale,
+        .frame_cb = &b->osk_frame_cb,
+        .frame_pending = &b->osk_frame_pending,
+        .listener = &osk_frame_listener,
+        .listener_data = b,
+    };
+    surf_commit(&c);
+}
+
+static void
+osk_surface_size_alloc(struct bar *b, int width, int height)
+{
+    int scale = b->scale ? b->scale : 1;
+    int phys_w = width * scale;
+    int phys_h = height * scale;
+    int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, phys_w);
+
+    if (b->osk_cairo && width == b->osk_surf_width &&
+        height == b->osk_surf_height)
+        return;
+    b->osk_surf_width = width;
+    b->osk_surf_height = height;
+    size_t buf_size = (size_t)stride * (size_t)phys_h;
+    shm_pool_init(&b->osk_pool, buf_size);
+    if (b->osk_pool.fd < 0) return;
+    pool_cairo_init(&b->osk_pool, &b->osk_cairo, &b->osk_cr,
+                    phys_w, phys_h, stride, scale);
+}
+
+static void
+osk_surface_free(struct bar *b)
+{
+    transition_cancel(&g_osk_trans);
+    if (b->osk_frame_cb) { wl_callback_destroy(b->osk_frame_cb); b->osk_frame_cb = NULL; }
+    b->osk_frame_pending = 0;
+    if (b->osk_cairo) { cairo_surface_destroy(b->osk_cairo); b->osk_cairo = NULL; }
+    if (b->osk_cr) { cairo_destroy(b->osk_cr); b->osk_cr = NULL; }
+    shm_pool_cleanup(&b->osk_pool);
+    b->osk_surf_configured = 0;
+    b->osk_needs_render = 0;
+    b->osk_surf_width = 0;
+    b->osk_surf_height = 0;
+}
+
+static void
+osk_popup_configure(void *data, struct xdg_popup *popup,
+                    int32_t x, int32_t y, int32_t width, int32_t height)
+{
+    (void)data; (void)popup; (void)x; (void)y;
+    struct bar *b = &g_bar;
+    if (width <= 0 || height <= 0) return;
+    b->osk_cfg_width = (int)width;
+    b->osk_cfg_height = (int)height;
+}
+
+static void
+osk_popup_repositioned(void *data, struct xdg_popup *popup, uint32_t token)
+{
+    (void)data; (void)popup; (void)token;
+}
+
+static void
+osk_popup_done(void *data, struct xdg_popup *popup)
+{
+    (void)data; (void)popup;
+    struct bar *b = &g_bar;
+    /* The compositor already unmapped the popup, so skip the close ease. */
+    b->osk_dismissed = 1;
+    if (g_osk.open) {
+        g_osk.open = 0;
+        g_osk.hover_key = -1;
+    }
+    osk_surface_destroy(b);
+    b->osk_dismissed = 0;
+}
+
+static const struct xdg_popup_listener osk_popup_listener = {
+    .configure = osk_popup_configure,
+    .popup_done = osk_popup_done,
+    .repositioned = osk_popup_repositioned,
+};
+
+static void
+osk_xdg_surface_configure(void *data, struct xdg_surface *xdg_surface,
+                          uint32_t serial)
+{
+    (void)data;
+    xdg_surface_ack_configure(xdg_surface, serial);
+    struct bar *b = &g_bar;
+    if (!b->osk_popup) return;
+    if (b->osk_cfg_width <= 0 || b->osk_cfg_height <= 0) return;
+    osk_surface_size_alloc(b, b->osk_cfg_width, b->osk_cfg_height);
+    b->osk_surf_configured = 1;
+    b->osk_needs_render = 1;
+    if (g_osk_trans.pending_open) {
+        g_osk_trans.pending_open = 0;
+        transition_begin_open(&g_osk_trans, (double)b->osk_cfg_height,
+                              &b->osk_needs_render);
+    }
+}
+
+static const struct xdg_surface_listener osk_xdg_surface_listener = {
+    .configure = osk_xdg_surface_configure,
+};
+
+static void
+osk_surface_render(struct bar *b)
+{
+    if (!b->osk_surf_configured || !b->osk_cr) return;
+
+    cairo_t *cr = b->osk_cr;
+    cairo_save(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(cr);
+    cairo_restore(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+
+    if (transition_draw_snapshot(cr, &g_osk_trans)) {
+        cairo_surface_flush(b->osk_cairo);
+        osk_commit(b);
+        return;
+    }
+
+    PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
+    pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
+    PangoLayout *pl = pango_ctx_layout(cr);
+    pango_layout_set_font_description(pl, fd);
+
+    int grouped = transition_begin_frame(cr, &g_osk_trans);
+    osk_draw(cr, pl);
+    transition_end_frame(cr, &g_osk_trans, grouped);
+
+    g_object_unref(pl);
+    pango_font_description_free(fd);
+
+    cairo_surface_flush(b->osk_cairo);
+    osk_commit(b);
+}
+
+static void
+osk_apply_input_region(struct bar *b)
+{
+    if (!b->osk_surface) return;
+    /* Only the keyboard panel takes input; the transparent margins around it
+     * stay click-through so the desktop underneath is still reachable. */
+    struct wl_region *region = wl_compositor_create_region(g_wl.compositor);
+    if (!region) return;
+    wl_region_add(region, (int32_t)g_osk.x, 0,
+                  (int32_t)g_osk.w,
+                  (int32_t)(g_osk.h - PPADDING));
+    wl_surface_set_input_region(b->osk_surface, region);
+    wl_region_destroy(region);
+}
+
+/* The keyboard slides sideways when the launcher opens or closes. Ease the
+ * panel toward its new slot at the same rate as the popup transitions, moving
+ * the input region with it so clicks stay aligned while it travels. */
+static gboolean
+osk_x_tick(void *data)
+{
+    (void)data;
+    double elapsed =
+        (double)(g_get_monotonic_time() - g_osk.x_start_us) / 1000000.0;
+    double p = 1.0 - exp(-TRANS_RATE * elapsed);
+    g_osk.x = g_osk.x_from + (g_osk.x_target - g_osk.x_from) * p;
+
+    if (fabs(g_osk.x_target - g_osk.x) < 0.5) {
+        g_osk.x = g_osk.x_target;
+        g_osk.x_src = NULL;
+        osk_apply_input_region(&g_bar);
+        g_bar.osk_needs_render = 1;
+        return G_SOURCE_REMOVE;
+    }
+    osk_apply_input_region(&g_bar);
+    g_bar.osk_needs_render = 1;
+    return G_SOURCE_CONTINUE;
+}
+
+static void
+osk_x_anim_stop(void)
+{
+    if (g_osk.x_src) {
+        g_source_destroy(g_osk.x_src);
+        g_osk.x_src = NULL;
+    }
+}
+
+static void
+osk_x_anim_start(void)
+{
+    if (!g_bar.osk_surface) return;
+    if (fabs(g_osk.x_target - g_osk.x) < 0.5) {
+        g_osk.x = g_osk.x_target;
+        osk_x_anim_stop();
+        osk_apply_input_region(&g_bar);
+        g_bar.osk_needs_render = 1;
+        return;
+    }
+    /* Rebase from the current position so changing the destination mid-flight
+     * (menu toggled again while the panel is still travelling) does not make
+     * the panel jump. */
+    g_osk.x_from = g_osk.x;
+    g_osk.x_start_us = g_get_monotonic_time();
+    if (g_osk.x_src) return;
+    GSource *src = g_timeout_source_new(16);
+    g_source_set_callback(src, osk_x_tick, NULL, NULL);
+    g_source_attach(src, g_sni.glib_ctx);
+    g_osk.x_src = src;
+    g_source_unref(src);
+}
+
+static void
+osk_surface_create(struct bar *b)
+{
+    if (b->osk_popup) return;
+    if (!g_wl.compositor || !g_wl.xdg_wm_base || !b->layer_surface) return;
+
+    osk_recalc_geometry();
+    osk_x_anim_stop();
+    g_osk.x = g_osk.x_target;
+    int w = b->width;
+    int h = (int)g_osk.h;
+    if (w <= 0 || h <= 0) return;
+
+    struct wl_surface *surf = wl_compositor_create_surface(g_wl.compositor);
+    b->osk_surface = surf;
+
+    b->osk_xdg_surface =
+        xdg_wm_base_get_xdg_surface(g_wl.xdg_wm_base, surf);
+    xdg_surface_add_listener(b->osk_xdg_surface,
+                             &osk_xdg_surface_listener, NULL);
+
+    struct xdg_positioner *pos = bar_popup_positioner(b, w, h);
+    b->osk_popup = xdg_surface_get_popup(b->osk_xdg_surface, NULL, pos);
+    xdg_positioner_destroy(pos);
+    xdg_popup_add_listener(b->osk_popup, &osk_popup_listener, NULL);
+
+    /* Adopt the popup without grabbing, so the focused application keeps
+     * keyboard focus while the on-screen keys are typed. */
+    zwlr_layer_surface_v1_get_popup(b->layer_surface, b->osk_popup);
+
+    osk_apply_input_region(b);
+
+    b->osk_req_width = w;
+    b->osk_req_height = h;
+    b->osk_cfg_width = w;
+    b->osk_cfg_height = h;
+    b->osk_surf_configured = 0;
+    b->osk_reposition_token = 0;
+    wl_surface_commit(surf);
+    /* The configure that follows is what kicks off the ease-in. */
+    g_osk_trans.pending_open = 1;
+}
+
+static void
+osk_surface_destroy(struct bar *b)
+{
+    if (!b->osk_popup && !b->osk_xdg_surface && !b->osk_surface) return;
+    osk_x_anim_stop();
+    transition_cancel(&g_osk_trans);
+    if (b->osk_popup) {
+        xdg_popup_destroy(b->osk_popup);
+        b->osk_popup = NULL;
+    }
+    if (b->osk_xdg_surface) {
+        xdg_surface_destroy(b->osk_xdg_surface);
+        b->osk_xdg_surface = NULL;
+    }
+    if (b->osk_surface) wl_surface_destroy(b->osk_surface);
+    b->osk_surface = NULL;
+    b->osk_req_width = 0;
+    b->osk_req_height = 0;
+    b->osk_cfg_width = 0;
+    b->osk_cfg_height = 0;
+    osk_surface_free(b);
+}
+
+static void
+osk_close_done(void)
+{
+    /* Runs from the transition tick once the keyboard has eased out. */
+    osk_surface_destroy(&g_bar);
+}
+
+static void
+osk_surface_close(struct bar *b)
+{
+    if (!b->osk_popup && !b->osk_xdg_surface && !b->osk_surface) return;
+    osk_x_anim_stop();
+    if (b->osk_dismissed) {
+        osk_surface_destroy(b);
+        return;
+    }
+    int animating = 0;
+    if (b->osk_popup && b->osk_surf_configured && b->osk_cairo) {
+        int scale = b->scale ? b->scale : 1;
+        animating = transition_begin_close(&g_osk_trans, b->osk_cairo,
+                                           b->osk_surf_width * scale,
+                                           b->osk_surf_height * scale,
+                                           scale, b->osk_surf_height,
+                                           &b->osk_needs_render,
+                                           osk_close_done);
+    }
+    if (!animating)
+        osk_surface_destroy(b);
+}
+
+static void
+osk_update_size(struct bar *b)
+{
+    if (!b->configured || !b->osk_popup) return;
+    osk_recalc_geometry();
+    osk_x_anim_stop();
+    g_osk.x = g_osk.x_target;
+    int w = b->width;
+    int h = (int)g_osk.h;
+    if (w <= 0 || h <= 0) return;
+
+    if (b->osk_req_width != w || b->osk_req_height != h) {
+        if (xdg_popup_get_version(b->osk_popup) >=
+            XDG_POPUP_REPOSITION_SINCE_VERSION) {
+            struct xdg_positioner *pos = bar_popup_positioner(b, w, h);
+            xdg_popup_reposition(b->osk_popup, pos, ++b->osk_reposition_token);
+            xdg_positioner_destroy(pos);
+            b->osk_req_width = w;
+            b->osk_req_height = h;
+        }
+    } else {
+        b->osk_needs_render = 1;
+    }
+    /* The centred panel moved with the bar width; keep its input region in
+     * step even when the popup size itself did not change. */
+    osk_apply_input_region(b);
+}
+
+/* The keyboard shares the screen with the launcher, which occupies the left
+ * edge. Re-lay it out when the launcher opens or closes so it clears the menu
+ * and returns to the centre afterwards. */
+static void
+osk_menu_layout_changed(void)
+{
+    if (!g_bar.osk_surface) return;
+    osk_recalc_geometry();
+    osk_x_anim_start();
+    osk_apply_input_region(&g_bar);
+    g_bar.osk_needs_render = 1;
+}
+
 /* Size the strip to whichever flyout is open, creating or dropping it as
  * needed. The reallocation happens in the configure handler; all that happens
  * here is ask for the right size and let the render flag follow. */
@@ -11023,6 +12668,9 @@ flyout_update_size(struct bar *b)
 {
     if (!b->configured) return;
     int h = bar_y_offset();
+
+    if (b->fly_surface)
+        b->fly_needs_render = 1;
 
     if (h <= 0) {
         /* The compositor already dismissed the grab, so there is no mapped
@@ -11065,6 +12713,13 @@ flyout_update_size(struct bar *b)
              * popup flashes in at full opacity and *then* animates. */
             g_fly_trans.y = (double)h;
             g_fly_trans.alpha = 0.0;
+            /* Hold the transparent frame still until the resize configure
+             * starts the real ease-in; target == start keeps advance a no-op. */
+            g_fly_trans.y_target = (double)h;
+            g_fly_trans.alpha_target = 0.0;
+            g_fly_trans.start_y = (double)h;
+            g_fly_trans.start_alpha = 0.0;
+            g_fly_trans.start_us = g_get_monotonic_time();
             g_fly_trans.active = 1;
             g_fly_trans.pending_open = 1;
             b->fly_needs_render = 1;
@@ -11085,7 +12740,8 @@ flyout_update_size(struct bar *b)
     if (b->fly_req_width != b->width || b->fly_req_height != h) {
         if (xdg_popup_get_version(b->fly_popup) >=
             XDG_POPUP_REPOSITION_SINCE_VERSION) {
-            struct xdg_positioner *pos = bar_popup_positioner(b, b->width, h);
+            struct xdg_positioner *pos =
+                bar_popup_positioner(b, b->width, h);
             xdg_popup_reposition(b->fly_popup, pos, ++b->fly_reposition_token);
             xdg_positioner_destroy(pos);
             b->fly_req_width = b->width;
@@ -11284,6 +12940,7 @@ menu_close(struct bar *b)
     if (!b->menu_open) return;
     b->menu_open = 0;
     b->menu_height = 0;
+    osk_menu_layout_changed();
     menu_scroll_anim_cancel();
     menu_hover_reset();
     ctx_close();
@@ -11314,7 +12971,7 @@ menu_close(struct bar *b)
 }
 
 static void
-close_sibling_popups(void)
+close_sibling_popups_keep_osk(void)
 {
     gpopup_close();
     cpop_close();
@@ -11329,12 +12986,43 @@ close_sibling_popups(void)
 }
 
 static void
+close_sibling_popups(void)
+{
+    close_sibling_popups_keep_osk();
+    osk_close();
+    g_osk.suspended = 0;
+}
+
+/* Close the other flyouts without dismissing the keyboard. Opening any popup
+ * (including the launcher menu) leaves the keyboard up and stacks above it;
+ * only the wallpaper picker suspends it. If the keyboard was suspended by that
+ * picker, closing the picker through this path brings it back. */
+static void
+close_siblings_for_popup(void)
+{
+    close_sibling_popups_keep_osk();
+    osk_resume();
+}
+
+static void
 close_all_popups(void)
+{
+    /* The launcher menu lives on its own surface and is not part of the
+     * sibling set, so close both groups. The keyboard is deliberately kept:
+     * it stays open until its own toggle (or the wallpaper picker) closes it,
+     * and any other flyout is stacked above it. */
+    if (g_bar.menu_open)
+        menu_close(&g_bar);
+    close_sibling_popups_keep_osk();
+    osk_resume();
+}
+
+static void
+close_all_popups_full(void)
 {
     if (g_bar.menu_open)
         menu_close(&g_bar);
-    else
-        close_sibling_popups();
+    close_sibling_popups();
 }
 
 static void
@@ -11352,7 +13040,7 @@ menu_open(struct bar *b)
      * than letting its teardown fire under the new menu. */
     if (g_menu_trans.closing)
         transition_cancel(&g_menu_trans);
-    close_sibling_popups();
+    close_siblings_for_popup();
     menu_search_clear();
     b->menu_scroll = 0;
     b->menu_anim_px = 0;
@@ -11363,6 +13051,7 @@ menu_open(struct bar *b)
     b->menu_height = calc_menu_height();
     b->menu_open = 1;
     menu_hover_reset();
+    osk_menu_layout_changed();
     sys_stats_refresh();
     mpris_refresh();
     menu_surface_create(b);
@@ -11456,19 +13145,10 @@ pinned_running(int pinned_idx)
 static int
 bar_y_offset(void)
 {
-    int ph = g_gpopup.open ? g_gpopup.height : 0;
-    int cph = g_cpop.open ? (int)g_cpop.h : 0;
-    int vh = g_volpop.open ? volpop_height() : 0;
-    int th = g_tm.open ? g_tm.height : 0;
-    int wh = g_wspop.open ? wspop_height() : 0;
-    int nh = g_npop.open ? notif_height() : 0;
-    int ch = g_calpop.open ? calpop_height() : 0;
-    int wlh = g_wlp.open ? wlp_height() : 0;
-    int xxh = g_wxpop.open ? wxpop_height() : 0;
     /* Each panel's height already carries its bottom pad, so the strip is
-     * exactly as tall as the open panel. A top inset would go here too, once
-     * the bar can spawn at the top of the screen. */
-    return ph + cph + vh + th + wh + nh + ch + wlh + xxh;
+     * exactly as tall as the open panels stacked on it. A top inset would go
+     * here too, once the bar can spawn at the top of the screen. */
+    return flyout_other_height();
 }
 
 static int
@@ -11541,7 +13221,7 @@ menu_hit_test(double px, double py)
     double list_top, list_bottom;
     menu_list_area(mh_body, &list_top, &list_bottom);
     if (ry < list_top || ry >= list_bottom) return -1;
-    double sofs = (double)lround(g_bar.menu_anim_px);
+    double sofs = round(g_bar.menu_anim_px);
     int pos = (int)((ry - list_top + sofs) / MENU_ROW_HEIGHT);
     if (pos >= 0 && pos < g_app.menu_n) return g_app.menu_idx[pos];
     return -1;
@@ -11610,12 +13290,18 @@ bar_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
     pinned_recalc_layout();
     toplevel_recalc_layout();
     b->needs_render = 1;
+    /* A toggle can race the initial layer configure; create the keyboard as
+     * soon as the bar is ready. */
+    if (g_osk.open && !b->osk_popup)
+        osk_surface_create(b);
     /* An output resize changes the bar width the popups span. Reposition them
      * against the new geometry; the heights are unchanged. */
     if (w_changed && b->fly_popup)
         flyout_update_size(b);
     if (w_changed && b->menu_popup)
         menu_update_size(b);
+    if (w_changed && b->osk_popup)
+        osk_update_size(b);
 }
 
 static void
@@ -11654,6 +13340,14 @@ on_menu_surface(void)
      * NULL whenever the pointer is over no surface at all, so the NULL test is
      * what stops a plain desktop click from reading as a launcher click. */
     return g_bar.menu_surface && g_pointer.enter_surface == g_bar.menu_surface;
+}
+
+static int
+on_osk_surface(void)
+{
+    /* The keyboard owns its own popup surface now, separate from the flyout
+     * strip, so its pointer hits have to be routed by surface. */
+    return g_bar.osk_surface && g_pointer.enter_surface == g_bar.osk_surface;
 }
 
 struct bar_hover_ent {
@@ -11717,6 +13411,15 @@ tm_hover_refresh(int on_bar)
 }
 
 static int
+osk_hover_refresh(int on_osk)
+{
+    int old = g_osk.hover_key;
+    g_osk.hover_key = (g_osk.open && on_osk)
+        ? osk_hit_test(g_pointer.x, g_pointer.y) : -1;
+    return old != g_osk.hover_key;
+}
+
+static int
 ctx_hover_refresh(int on_menu)
 {
     int old = g_pointer.hover_ctx_idx;
@@ -11761,6 +13464,7 @@ bar_hover_refresh(int on_bar, int on_fly)
         { &g_pointer.hover_tray, -1, tray_hit_test },
         { &g_pointer.hover_ws, 0, workspace_icon_hit_test },
         { &g_pointer.hover_wx, 0, wx_hit_test },
+        { &g_pointer.hover_osk, 0, osk_icon_hit_test },
     };
     static const struct bar_hover_ent fly_tbl[] = {
         { &g_wspop.hover_row, -1, wspop_hit_test },
@@ -11791,6 +13495,7 @@ pointer_refresh_hover(void)
     int on_bar = on_bar_surface();
     int on_fly = on_flyout_surface();
     int on_menu = on_menu_surface();
+    int on_osk = on_osk_surface();
     int changed = 0;
 
     changed |= cpop_hover_refresh(on_fly);
@@ -11810,6 +13515,7 @@ pointer_refresh_hover(void)
     }
     changed |= ctx_hover_refresh(on_menu);
     changed |= menu_hover_refresh(on_menu);
+    changed |= osk_hover_refresh(on_osk);
     changed |= bar_hover_refresh(on_bar, on_fly);
     if (g_wspop.blue_dragging)
         blue_set_from_x(g_pointer.x);
@@ -11862,6 +13568,7 @@ hover_clear_all(void)
     notifpop_hover_refresh(0);
     ctx_hover_refresh(0);
     menu_hover_refresh(0);
+    osk_hover_refresh(0);
     bar_hover_refresh(0, 0);
 }
 
@@ -11884,6 +13591,7 @@ pointer_handle_motion(void *data, struct wl_pointer *pointer,
     g_box.last_motion_at_ms = time;
     g_pointer.x = wl_fixed_to_double(sx);
     g_pointer.y = wl_fixed_to_double(sy);
+    if (shot_handle_motion()) return;
     pointer_refresh_hover();
 }
 
@@ -11894,6 +13602,8 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
 {
     (void)data; (void)pointer; (void)time;
     g_pointer.last_serial = serial;
+
+    if (shot_handle_button(button, state)) return;
 
     if (state != WL_POINTER_BUTTON_STATE_PRESSED) {
         if (button == BTN_LEFT) {
@@ -11919,6 +13629,14 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
                 g_box.n_taskbar_groups,
                 g_box.n_taskbar_groups > 0 ? g_box.taskbar_groups[0].x : -1.0,
                 g_box.n_taskbar_groups > 1 ? g_box.taskbar_groups[1].x : -1.0);
+
+    if (button == BTN_LEFT && popup_coords_safe(time) && g_osk.open &&
+        on_osk_surface()) {
+        int key = osk_hit_test(g_pointer.x, g_pointer.y);
+        if (key >= 0)
+            osk_press(key);
+        return;
+    }
 
     if (popup_coords_safe(time) && g_volpop.open && on_flyout_surface()) {
         if (button == BTN_LEFT && volpop_hit_test(g_pointer.x, g_pointer.y)) {
@@ -11975,6 +13693,13 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
         int row = wspop_hit_test(g_pointer.x, g_pointer.y);
         if (row == -2) {
             wspop_close();
+            /* The wallpaper picker is the one flyout that dismisses the
+             * keyboard; remember it was open so closing the picker brings it
+             * back. */
+            if (g_osk.open) {
+                g_osk.suspended = 1;
+                osk_close();
+            }
             wlp_open();
             render_request();
             return;
@@ -12235,6 +13960,13 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
             close_all_popups();
             wspop_open();
         }
+        render_request();
+        return;
+    }
+
+    if (button == BTN_LEFT && on_bar_surface() &&
+        osk_icon_hit_test(g_pointer.x, g_pointer.y)) {
+        osk_toggle();
         render_request();
         return;
     }
@@ -12879,6 +14611,11 @@ keyboard_handle_key(void *data, struct wl_keyboard *kb, uint32_t serial,
     if (state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
 
     xkb_keysym_t sym = xkb_state_key_get_one_sym(g_wl.xkb_state, code);
+    if (g_shot.active) {
+        if (sym == XKB_KEY_Escape)
+            shot_cancel();
+        return;
+    }
     switch (sym) {
     case XKB_KEY_Escape:
         if (g_bar.menu_open) {
@@ -12995,14 +14732,21 @@ static const struct zwlr_foreign_toplevel_handle_v1_listener toplevel_handle_lis
     .parent = toplevel_handle_parent,
 };
 
+enum toplevel_string_field {
+    TOPLEVEL_STRING_TITLE,
+    TOPLEVEL_STRING_APP_ID,
+};
+
 static void
 toplevel_set_string(void *data, struct zwlr_foreign_toplevel_handle_v1 *h,
-                    const char *str, size_t field_off)
+                    const char *str, enum toplevel_string_field field)
 {
     (void)data;
     int idx = find_toplevel(h);
     if (idx < 0) return;
-    char **dst = (char **)((char *)&g_toplevels[idx] + field_off);
+    char **dst = field == TOPLEVEL_STRING_TITLE
+                     ? &g_toplevels[idx].title
+                     : &g_toplevels[idx].app_id;
     free(*dst);
     *dst = strdup(str);
 }
@@ -13010,13 +14754,13 @@ toplevel_set_string(void *data, struct zwlr_foreign_toplevel_handle_v1 *h,
 static void
 toplevel_handle_title(void *data, struct zwlr_foreign_toplevel_handle_v1 *h, const char *title)
 {
-    toplevel_set_string(data, h, title, offsetof(struct toplevel_entry, title));
+    toplevel_set_string(data, h, title, TOPLEVEL_STRING_TITLE);
 }
 
 static void
 toplevel_handle_app_id(void *data, struct zwlr_foreign_toplevel_handle_v1 *h, const char *app_id)
 {
-    toplevel_set_string(data, h, app_id, offsetof(struct toplevel_entry, app_id));
+    toplevel_set_string(data, h, app_id, TOPLEVEL_STRING_APP_ID);
 }
 
 static void
@@ -13160,10 +14904,12 @@ toplevel_manager_finished(void *data, struct zwlr_foreign_toplevel_manager_v1 *m
 }
 
 static void
-cleanup()
+cleanup(void)
 {
+    shot_end();
     transition_cancel(&g_fly_trans);
     transition_cancel(&g_menu_trans);
+    transition_cancel(&g_osk_trans);
     if (g_bar.frame_cb) { wl_callback_destroy(g_bar.frame_cb); g_bar.frame_cb = NULL; }
     if (g_bar.cairo) { cairo_surface_destroy(g_bar.cairo); g_bar.cairo = NULL; }
     if (g_bar.cr) { cairo_destroy(g_bar.cr); g_bar.cr = NULL; }
@@ -13182,12 +14928,22 @@ cleanup()
     if (g_bar.menu_popup) xdg_popup_destroy(g_bar.menu_popup);
     if (g_bar.menu_xdg_surface) xdg_surface_destroy(g_bar.menu_xdg_surface);
     if (g_bar.menu_surface) wl_surface_destroy(g_bar.menu_surface);
+    shm_pool_cleanup(&g_bar.osk_pool);
+    if (g_bar.osk_frame_cb) { wl_callback_destroy(g_bar.osk_frame_cb); g_bar.osk_frame_cb = NULL; }
+    if (g_bar.osk_cairo) { cairo_surface_destroy(g_bar.osk_cairo); g_bar.osk_cairo = NULL; }
+    if (g_bar.osk_cr) { cairo_destroy(g_bar.osk_cr); g_bar.osk_cr = NULL; }
+    if (g_bar.osk_popup) xdg_popup_destroy(g_bar.osk_popup);
+    if (g_bar.osk_xdg_surface) xdg_surface_destroy(g_bar.osk_xdg_surface);
+    if (g_bar.osk_surface) wl_surface_destroy(g_bar.osk_surface);
     if (g_bar.layer_surface) zwlr_layer_surface_v1_destroy(g_bar.layer_surface);
     if (g_bar.surface) wl_surface_destroy(g_bar.surface);
     output_bg_surface_destroy_all();
     if (g_wlp.wall_image) { cairo_surface_destroy(g_wlp.wall_image); g_wlp.wall_image = NULL; }
     if (g_wl.xdg_wm_base) xdg_wm_base_destroy(g_wl.xdg_wm_base);
     if (g_wl.layer_shell) zwlr_layer_shell_v1_destroy(g_wl.layer_shell);
+    if (g_wl.vk) zwp_virtual_keyboard_v1_destroy(g_wl.vk);
+    if (g_wl.vk_mgr) zwp_virtual_keyboard_manager_v1_destroy(g_wl.vk_mgr);
+    if (g_wl.screencopy_mgr) zwlr_screencopy_manager_v1_destroy(g_wl.screencopy_mgr);
     if (g_wl.cursor_surface) wl_surface_destroy(g_wl.cursor_surface);
     if (g_wl.cursor_theme) wl_cursor_theme_destroy(g_wl.cursor_theme);
     toplevels_clear();
@@ -13275,6 +15031,16 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name,
         g_wl.gamma_mgr = wl_registry_bind(reg, name, &zwlr_gamma_control_manager_v1_interface, 1);
         g_wl.gamma_mgr_name = name;
         output_gamma_create_all();
+    } else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) {
+        /* Version 1 keeps the shm buffer event unconditional; newer versions
+         * may advertise dmabuf formats first, which this client cannot use. */
+        g_wl.screencopy_mgr = wl_registry_bind(reg, name,
+            &zwlr_screencopy_manager_v1_interface, 1);
+        g_wl.screencopy_mgr_name = name;
+    } else if (strcmp(interface, zwp_virtual_keyboard_manager_v1_interface.name) == 0) {
+        g_wl.vk_mgr = wl_registry_bind(reg, name,
+            &zwp_virtual_keyboard_manager_v1_interface, 1);
+        g_wl.vk_mgr_name = name;
     }
 }
 
@@ -13290,6 +15056,10 @@ registry_global_remove(void *data, struct wl_registry *reg, uint32_t name)
         g_wl.shm = NULL;
     } else if (g_wl.seat && g_wl.seat_name == name) {
         dnd_cleanup();
+        if (g_wl.vk) {
+            zwp_virtual_keyboard_v1_destroy(g_wl.vk);
+            g_wl.vk = NULL;
+        }
         wl_seat_destroy(g_wl.seat);
         g_wl.seat = NULL;
         if (g_pointer.pointer) {
@@ -13302,7 +15072,7 @@ registry_global_remove(void *data, struct wl_registry *reg, uint32_t name)
         zwlr_layer_shell_v1_destroy(g_wl.layer_shell);
         g_wl.layer_shell = NULL;
     } else if (g_wl.xdg_wm_base && g_wl.xdg_wm_base_name == name) {
-        close_all_popups();
+        close_all_popups_full();
         xdg_wm_base_destroy(g_wl.xdg_wm_base);
         g_wl.xdg_wm_base = NULL;
     } else if (g_wl.toplevel_mgr && g_wl.toplevel_mgr_name == name) {
@@ -13318,6 +15088,16 @@ registry_global_remove(void *data, struct wl_registry *reg, uint32_t name)
         /* Controls created by the manager stay valid; only the manager goes. */
         zwlr_gamma_control_manager_v1_destroy(g_wl.gamma_mgr);
         g_wl.gamma_mgr = NULL;
+    } else if (g_wl.screencopy_mgr && g_wl.screencopy_mgr_name == name) {
+        zwlr_screencopy_manager_v1_destroy(g_wl.screencopy_mgr);
+        g_wl.screencopy_mgr = NULL;
+    } else if (g_wl.vk_mgr && g_wl.vk_mgr_name == name) {
+        if (g_wl.vk) {
+            zwp_virtual_keyboard_v1_destroy(g_wl.vk);
+            g_wl.vk = NULL;
+        }
+        zwp_virtual_keyboard_manager_v1_destroy(g_wl.vk_mgr);
+        g_wl.vk_mgr = NULL;
     }
     output_remove(name);
 }
@@ -13500,6 +15280,11 @@ main_loop(void)
             menu_surface_render(&g_bar);
             g_bar.menu_needs_render = 0;
         }
+        if (g_bar.osk_needs_render && g_bar.osk_surf_configured &&
+            !g_bar.osk_frame_pending) {
+            osk_surface_render(&g_bar);
+            g_bar.osk_needs_render = 0;
+        }
         g_main_context_iteration(g_sni.glib_ctx, TRUE);
         wl_display_dispatch_pending(g_wl.display);
 
@@ -13575,6 +15360,8 @@ ctl_incoming(GSocketService *service, GSocketConnection *conn,
         buf[n] = '\0';
         if (g_str_has_prefix(buf, "menu"))
             menu_toggle_ctl();
+        else if (g_str_has_prefix(buf, "screenshot"))
+            shot_begin();
         else if (g_str_has_prefix(buf, "quit"))
             g_app.running = 0;
     }

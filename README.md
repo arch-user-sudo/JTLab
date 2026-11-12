@@ -42,7 +42,7 @@ A lightweight, highly configurable Wayland status bar for wlroots-based composit
 - **Window grouping** - click grouped apps to see all windows in that group
 - **Active window highlighting**
 - **Workspace indicator** with workspace popup and switching support via `ext-workspace-v1`
-- **Workspace quick actions**: screenshot, screen recording, lock, calculator, terminal shortcuts, etc.
+- **Workspace quick actions**: native screenshot (drag out a region, or click for the whole output), screen recording, lock, calculator, terminal shortcuts, etc. Screenshots are captured with `wlr-screencopy` and saved to `~/Screenshots` without external tools.
 
 ### System Controls & Info
 - **Audio control** via PipeWire with device selection, volume slider and mute toggle
@@ -61,7 +61,7 @@ A lightweight, highly configurable Wayland status bar for wlroots-based composit
 - **Customizable icons** with icon theme support (Adwaita by default)
 
 ### Utilities
-- **External control** via `jtlabctl` unix socket - toggle menu, quit bar
+- **External control** via `jtlabctl` unix socket - toggle menu, start the screenshot selector, quit bar
 - **Live companion accents** via `jtspeedtestctl`, `jtnetworksctl`, and `jtupdatectl` - change colors on the fly or quit any companion window; JTLab uses the same sockets when the wallpaper accent changes
 - **Configurable terminal** and hold-shell behavior for launched commands
 - **Minimal resource usage** with compile-time optimizations
