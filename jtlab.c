@@ -37,6 +37,7 @@
 #include <spa/pod/pod.h>
 
 #include "config.h"
+#include "xdg-shell-client-protocol.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
 #include "ext-workspace-v1-client-protocol.h"
@@ -55,6 +56,7 @@ static struct {
     struct wl_data_device_manager *data_device_mgr;
     struct wl_data_device *data_device;
     struct zwlr_layer_shell_v1 *layer_shell;
+    struct xdg_wm_base *xdg_wm_base;
     struct zwlr_foreign_toplevel_manager_v1 *toplevel_mgr;
     struct ext_workspace_manager_v1 *ext_ws_mgr;
     struct zwlr_gamma_control_manager_v1 *gamma_mgr;
@@ -62,6 +64,7 @@ static struct {
     struct xkb_keymap *xkb_keymap;
     struct xkb_state *xkb_state;
     uint32_t compositor_name, shm_name, seat_name, layer_shell_name;
+    uint32_t xdg_wm_base_name;
     uint32_t toplevel_mgr_name, ext_ws_mgr_name, gamma_mgr_name;
     uint32_t data_device_mgr_name;
 } g_wl = { 0 };
@@ -121,6 +124,7 @@ static struct {
 struct pointer_state {
     struct wl_pointer *pointer;
     double x, y;
+    uint32_t last_serial;
     struct wl_surface *enter_surface;
     int hover_menu_idx;
     int hover_ctx_idx;
@@ -245,8 +249,13 @@ struct bar {
     int size_dirty;
 
     struct wl_surface *fly_surface;
-    struct zwlr_layer_surface_v1 *fly_layer;
+    struct xdg_surface *fly_xdg_surface;
+    struct xdg_popup *fly_popup;
     int fly_surf_width, fly_surf_height, fly_surf_configured;
+    int fly_req_width, fly_req_height;
+    int fly_cfg_width, fly_cfg_height;
+    uint32_t fly_reposition_token;
+    int fly_dismissed;
     struct shm_pool fly_pool;
     cairo_surface_t *fly_cairo;
     cairo_t *fly_cr;
@@ -263,8 +272,13 @@ struct bar {
     int prev_height;
 
     struct wl_surface *menu_surface;
-    struct zwlr_layer_surface_v1 *menu_layer;
+    struct xdg_surface *menu_xdg_surface;
+    struct xdg_popup *menu_popup;
     int menu_surf_width, menu_surf_height, menu_surf_configured;
+    int menu_req_width, menu_req_height;
+    int menu_cfg_width, menu_cfg_height;
+    uint32_t menu_reposition_token;
+    int menu_dismissed;
     struct shm_pool menu_pool;
     cairo_surface_t *menu_cairo;
     cairo_t *menu_cr;
@@ -10528,23 +10542,87 @@ menu_surface_size_alloc(struct bar *b, int width, int height)
                     phys_w, phys_h, stride, scale);
 }
 
+/* Build a positioner that puts a bar popup directly above the bar, spanning its
+ * full width. The bar layer surface is the popup's parent, so the anchor
+ * rectangle is in bar-local coordinates: its top-left corner is the bar's
+ * top-left, and top-left gravity grows the popup upwards from there. */
+static struct xdg_positioner *
+bar_popup_positioner(struct bar *b, int width, int height)
+{
+    struct xdg_positioner *pos =
+        xdg_wm_base_create_positioner(g_wl.xdg_wm_base);
+    xdg_positioner_set_size(pos, width, height);
+    xdg_positioner_set_anchor_rect(pos, 0, 0, b->width, b->height);
+    xdg_positioner_set_anchor(pos, XDG_POSITIONER_ANCHOR_TOP_LEFT);
+    xdg_positioner_set_gravity(pos, XDG_POSITIONER_GRAVITY_TOP_LEFT);
+    xdg_positioner_set_constraint_adjustment(pos,
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+        XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y);
+    return pos;
+}
+
+static void menu_surface_destroy(struct bar *b);
+
 static void
-menu_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
-                     uint32_t serial, uint32_t width, uint32_t height)
+menu_popup_configure(void *data, struct xdg_popup *popup,
+                     int32_t x, int32_t y, int32_t width, int32_t height)
+{
+    (void)data; (void)popup; (void)x; (void)y;
+    struct bar *b = &g_bar;
+    if (width <= 0 || height <= 0) return;
+    b->menu_cfg_width = (int)width;
+    b->menu_cfg_height = (int)height;
+}
+
+static void
+menu_popup_repositioned(void *data, struct xdg_popup *popup, uint32_t token)
+{
+    (void)data; (void)popup; (void)token;
+}
+
+static void
+menu_popup_done(void *data, struct xdg_popup *popup)
+{
+    (void)data; (void)popup;
+    struct bar *b = &g_bar;
+    /* The compositor dismissed the grab: the surface is already unmapped, so
+     * skip the close animation and drop the menu state at once. */
+    b->menu_dismissed = 1;
+    if (b->menu_open)
+        menu_close(b);
+    else
+        menu_surface_destroy(b);
+    b->menu_dismissed = 0;
+}
+
+static const struct xdg_popup_listener menu_popup_listener = {
+    .configure = menu_popup_configure,
+    .popup_done = menu_popup_done,
+    .repositioned = menu_popup_repositioned,
+};
+
+static void
+menu_xdg_surface_configure(void *data, struct xdg_surface *xdg_surface,
+                           uint32_t serial)
 {
     (void)data;
-    zwlr_layer_surface_v1_ack_configure(surface, serial);
+    xdg_surface_ack_configure(xdg_surface, serial);
     struct bar *b = &g_bar;
-    if (!b->menu_layer) return;
-    menu_surface_size_alloc(b, (int)width, (int)height);
+    if (!b->menu_popup) return;
+    if (b->menu_cfg_width <= 0 || b->menu_cfg_height <= 0) return;
+    menu_surface_size_alloc(b, b->menu_cfg_width, b->menu_cfg_height);
     b->menu_surf_configured = 1;
     b->menu_needs_render = 1;
     if (g_menu_trans.pending_open) {
         g_menu_trans.pending_open = 0;
-        transition_begin_open(&g_menu_trans, (double)height,
+        transition_begin_open(&g_menu_trans, (double)b->menu_cfg_height,
                               &b->menu_needs_render);
     }
 }
+
+static const struct xdg_surface_listener menu_xdg_surface_listener = {
+    .configure = menu_xdg_surface_configure,
+};
 
 static void
 menu_hover_reset(void)
@@ -10566,24 +10644,6 @@ menu_surface_free(struct bar *b)
     b->menu_surf_configured = 0;
     b->menu_needs_render = 0;
 }
-
-static void
-menu_layer_closed(void *data, struct zwlr_layer_surface_v1 *surface)
-{
-    (void)data; (void)surface;
-    struct bar *b = &g_bar;
-    b->menu_open = 0;
-    b->menu_height = 0;
-    b->menu_layer = NULL;
-    b->menu_surface = NULL;
-    menu_surface_free(b);
-    menu_hover_reset();
-}
-
-static const struct zwlr_layer_surface_v1_listener menu_layer_listener = {
-    .configure = menu_layer_configure,
-    .closed = menu_layer_closed,
-};
 
 static void
 menu_surface_render(struct bar *b)
@@ -10622,32 +10682,46 @@ menu_surface_render(struct bar *b)
 static void
 menu_surface_create(struct bar *b)
 {
-    if (b->menu_layer) return;
-    if (!g_wl.compositor || !g_wl.layer_shell) return;
+    if (b->menu_popup) return;
+    if (!g_wl.compositor || !g_wl.xdg_wm_base || !b->layer_surface) return;
+    if (b->width <= 0 || b->menu_height <= 0) return;
 
     struct wl_surface *surf = wl_compositor_create_surface(g_wl.compositor);
     b->menu_surface = surf;
 
-    struct zwlr_layer_surface_v1 *ls =
-        zwlr_layer_shell_v1_get_layer_surface(g_wl.layer_shell, surf, NULL,
-            ZWLR_LAYER_SHELL_V1_LAYER_TOP, "jtlab-menu");
-    b->menu_layer = ls;
-    zwlr_layer_surface_v1_add_listener(ls, &menu_layer_listener, NULL);
+    b->menu_xdg_surface =
+        xdg_wm_base_get_xdg_surface(g_wl.xdg_wm_base, surf);
+    xdg_surface_add_listener(b->menu_xdg_surface,
+                             &menu_xdg_surface_listener, NULL);
 
-    uint32_t anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-                      ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT |
-                      ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM;
-    zwlr_layer_surface_v1_set_anchor(ls, anchor);
-    zwlr_layer_surface_v1_set_size(ls, 0, (uint32_t)b->menu_height);
-    zwlr_layer_surface_v1_set_exclusive_zone(ls, 0);
-    zwlr_layer_surface_v1_set_keyboard_interactivity(ls,
-        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE);
+    struct xdg_positioner *pos =
+        bar_popup_positioner(b, b->width, b->menu_height);
+    b->menu_popup = xdg_surface_get_popup(b->menu_xdg_surface, NULL, pos);
+    xdg_positioner_destroy(pos);
+    xdg_popup_add_listener(b->menu_popup, &menu_popup_listener, NULL);
+
+    /* The popup has to be adopted by the bar before its initial commit. The
+     * grab gives the menu the same click-away dismissal as the flyouts; the
+     * serial may be 0 when the menu is opened from the control socket. */
+    zwlr_layer_surface_v1_get_popup(b->layer_surface, b->menu_popup);
+    if (g_wl.seat)
+        xdg_popup_grab(b->menu_popup, g_wl.seat, g_pointer.last_serial);
+
+    /* Keep the transparent full-width remainder click-through so a press there
+     * dismisses the grab instead of being swallowed by the popup. */
     struct wl_region *region = wl_compositor_create_region(g_wl.compositor);
     wl_region_add(region, 0, 0,
                   MENU_MARGIN_L + MENU_WIDTH + POWER_COL_W + SYS_COL_W,
                   b->menu_height);
     wl_surface_set_input_region(surf, region);
     wl_region_destroy(region);
+
+    b->menu_req_width = b->width;
+    b->menu_req_height = b->menu_height;
+    b->menu_cfg_width = b->width;
+    b->menu_cfg_height = b->menu_height;
+    b->menu_surf_configured = 0;
+    b->menu_reposition_token = 0;
     wl_surface_commit(surf);
     /* The configure that follows is what kicks off the ease-in. */
     g_menu_trans.pending_open = 1;
@@ -10656,12 +10730,45 @@ menu_surface_create(struct bar *b)
 static void
 menu_surface_destroy(struct bar *b)
 {
-    if (!b->menu_layer) return;
-    zwlr_layer_surface_v1_destroy(b->menu_layer);
-    b->menu_layer = NULL;
+    if (!b->menu_popup && !b->menu_xdg_surface && !b->menu_surface) return;
+    transition_cancel(&g_menu_trans);
+    if (b->menu_popup) {
+        xdg_popup_destroy(b->menu_popup);
+        b->menu_popup = NULL;
+    }
+    if (b->menu_xdg_surface) {
+        xdg_surface_destroy(b->menu_xdg_surface);
+        b->menu_xdg_surface = NULL;
+    }
     if (b->menu_surface) wl_surface_destroy(b->menu_surface);
     b->menu_surface = NULL;
+    b->menu_req_width = 0;
+    b->menu_req_height = 0;
+    b->menu_cfg_width = 0;
+    b->menu_cfg_height = 0;
     menu_surface_free(b);
+}
+
+static void
+menu_update_size(struct bar *b)
+{
+    if (!b->configured || !b->menu_popup) return;
+    int w = b->width;
+    int h = b->menu_height;
+    if (w <= 0 || h <= 0) return;
+
+    if (b->menu_req_width != w || b->menu_req_height != h) {
+        if (xdg_popup_get_version(b->menu_popup) >=
+            XDG_POPUP_REPOSITION_SINCE_VERSION) {
+            struct xdg_positioner *pos = bar_popup_positioner(b, w, h);
+            xdg_popup_reposition(b->menu_popup, pos, ++b->menu_reposition_token);
+            xdg_positioner_destroy(pos);
+            b->menu_req_width = w;
+            b->menu_req_height = h;
+        }
+    } else {
+        b->menu_needs_render = 1;
+    }
 }
 
 static void
@@ -10745,40 +10852,66 @@ flyout_surface_free(struct bar *b)
     b->fly_surf_height = 0;
 }
 
+static void flyout_surface_destroy(struct bar *b);
+
 static void
-flyout_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
-                       uint32_t serial, uint32_t width, uint32_t height)
+flyout_popup_configure(void *data, struct xdg_popup *popup,
+                       int32_t x, int32_t y, int32_t width, int32_t height)
+{
+    (void)data; (void)popup; (void)x; (void)y;
+    struct bar *b = &g_bar;
+    if (width <= 0 || height <= 0) return;
+    b->fly_cfg_width = (int)width;
+    b->fly_cfg_height = (int)height;
+}
+
+static void
+flyout_popup_repositioned(void *data, struct xdg_popup *popup, uint32_t token)
+{
+    (void)data; (void)popup; (void)token;
+}
+
+static void
+flyout_popup_done(void *data, struct xdg_popup *popup)
+{
+    (void)data; (void)popup;
+    struct bar *b = &g_bar;
+    /* The compositor dismissed the grab: the surface is already unmapped, so
+     * skip the close animation and drop every flyout's state at once. */
+    b->fly_dismissed = 1;
+    close_sibling_popups();
+    b->fly_dismissed = 0;
+    if (b->fly_popup)
+        flyout_surface_destroy(b);
+}
+
+static const struct xdg_popup_listener flyout_popup_listener = {
+    .configure = flyout_popup_configure,
+    .popup_done = flyout_popup_done,
+    .repositioned = flyout_popup_repositioned,
+};
+
+static void
+flyout_xdg_surface_configure(void *data, struct xdg_surface *xdg_surface,
+                             uint32_t serial)
 {
     (void)data;
-    zwlr_layer_surface_v1_ack_configure(surface, serial);
+    xdg_surface_ack_configure(xdg_surface, serial);
     struct bar *b = &g_bar;
-    if (!b->fly_layer) return;
-    flyout_surface_size_alloc(b, (int)width, (int)height);
+    if (!b->fly_popup) return;
+    if (b->fly_cfg_width <= 0 || b->fly_cfg_height <= 0) return;
+    flyout_surface_size_alloc(b, b->fly_cfg_width, b->fly_cfg_height);
     b->fly_surf_configured = 1;
     b->fly_needs_render = 1;
     if (g_fly_trans.pending_open) {
         g_fly_trans.pending_open = 0;
-        transition_begin_open(&g_fly_trans, (double)height,
+        transition_begin_open(&g_fly_trans, (double)b->fly_cfg_height,
                               &b->fly_needs_render);
     }
 }
 
-static void
-flyout_layer_closed(void *data, struct zwlr_layer_surface_v1 *surface)
-{
-    (void)data; (void)surface;
-    struct bar *b = &g_bar;
-    b->fly_layer = NULL;
-    b->fly_surface = NULL;
-    flyout_surface_free(b);
-    /* The compositor tore the strip down underneath us. Drop whatever flyout
-     * was open so no hit test keeps answering for a surface that is gone. */
-    close_sibling_popups();
-}
-
-static const struct zwlr_layer_surface_v1_listener flyout_layer_listener = {
-    .configure = flyout_layer_configure,
-    .closed = flyout_layer_closed,
+static const struct xdg_surface_listener flyout_xdg_surface_listener = {
+    .configure = flyout_xdg_surface_configure,
 };
 
 static void
@@ -10816,38 +10949,38 @@ flyout_surface_render(struct bar *b)
 }
 
 static void
-flyout_surface_create(struct bar *b)
+flyout_surface_create(struct bar *b, int width, int height)
 {
-    if (b->fly_layer) return;
-    if (!g_wl.compositor || !g_wl.layer_shell) return;
+    if (b->fly_popup) return;
+    if (!g_wl.compositor || !g_wl.xdg_wm_base || !b->layer_surface) return;
+    if (width <= 0 || height <= 0) return;
 
     struct wl_surface *surf = wl_compositor_create_surface(g_wl.compositor);
     b->fly_surface = surf;
 
-    struct zwlr_layer_surface_v1 *ls =
-        zwlr_layer_shell_v1_get_layer_surface(g_wl.layer_shell, surf, NULL,
-            ZWLR_LAYER_SHELL_V1_LAYER_TOP, "jtlab-flyout");
-    b->fly_layer = ls;
-    zwlr_layer_surface_v1_add_listener(ls, &flyout_layer_listener, NULL);
+    b->fly_xdg_surface =
+        xdg_wm_base_get_xdg_surface(g_wl.xdg_wm_base, surf);
+    xdg_surface_add_listener(b->fly_xdg_surface,
+                             &flyout_xdg_surface_listener, NULL);
 
-    /* Bottom-anchored with no margin, like the launcher menu surface: the
-     * layer's exclusive zone (the bar's BAR_HEIGHT) is what lifts this clear of
-     * the bar, so adding a margin here too would count the bar height twice and
-     * float the popups a bar's worth too high. The bar's own exclusive zone
-     * does not move the bar itself, so the zone also puts this surface's bottom
-     * edge exactly on the bar's top edge. */
-    uint32_t anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-                      ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT |
-                      ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM;
-    zwlr_layer_surface_v1_set_anchor(ls, anchor);
-    zwlr_layer_surface_v1_set_margin(ls, 0, 0, 0, 0);
-    zwlr_layer_surface_v1_set_size(ls, 0, (uint32_t)bar_y_offset());
-    zwlr_layer_surface_v1_set_exclusive_zone(ls, 0);
-    zwlr_layer_surface_v1_set_keyboard_interactivity(ls,
-        ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
-    /* No input region: the strip is full-width, and taking input across it is
-     * what makes click-anywhere-to-dismiss work. The strip only exists while a
-     * flyout is open, so the grab lasts exactly as long as the flyout does. */
+    struct xdg_positioner *pos = bar_popup_positioner(b, width, height);
+    b->fly_popup = xdg_surface_get_popup(b->fly_xdg_surface, NULL, pos);
+    xdg_positioner_destroy(pos);
+    xdg_popup_add_listener(b->fly_popup, &flyout_popup_listener, NULL);
+
+    /* The popup has to be adopted by the bar before its initial commit, and
+     * the grab has to come after the parent is assigned: some compositors
+     * reject a grab that arrives before get_popup(). */
+    zwlr_layer_surface_v1_get_popup(b->layer_surface, b->fly_popup);
+    if (g_pointer.last_serial && g_wl.seat)
+        xdg_popup_grab(b->fly_popup, g_wl.seat, g_pointer.last_serial);
+
+    b->fly_req_width = width;
+    b->fly_req_height = height;
+    b->fly_cfg_width = width;
+    b->fly_cfg_height = height;
+    b->fly_surf_configured = 0;
+    b->fly_reposition_token = 0;
     wl_surface_commit(surf);
     /* The configure that follows is what kicks off the ease-in. */
     g_fly_trans.pending_open = 1;
@@ -10856,11 +10989,22 @@ flyout_surface_create(struct bar *b)
 static void
 flyout_surface_destroy(struct bar *b)
 {
-    if (!b->fly_layer) return;
-    zwlr_layer_surface_v1_destroy(b->fly_layer);
-    b->fly_layer = NULL;
+    if (!b->fly_popup && !b->fly_xdg_surface && !b->fly_surface) return;
+    transition_cancel(&g_fly_trans);
+    if (b->fly_popup) {
+        xdg_popup_destroy(b->fly_popup);
+        b->fly_popup = NULL;
+    }
+    if (b->fly_xdg_surface) {
+        xdg_surface_destroy(b->fly_xdg_surface);
+        b->fly_xdg_surface = NULL;
+    }
     if (b->fly_surface) wl_surface_destroy(b->fly_surface);
     b->fly_surface = NULL;
+    b->fly_req_width = 0;
+    b->fly_req_height = 0;
+    b->fly_cfg_width = 0;
+    b->fly_cfg_height = 0;
     flyout_surface_free(b);
 }
 
@@ -10881,11 +11025,17 @@ flyout_update_size(struct bar *b)
     int h = bar_y_offset();
 
     if (h <= 0) {
+        /* The compositor already dismissed the grab, so there is no mapped
+         * surface left to animate; tear the popup down now. */
+        if (b->fly_dismissed) {
+            flyout_surface_destroy(b);
+            return;
+        }
         /* Nothing should be open. If the strip is still up, ease it out and
          * tear it down at the end; otherwise there is nothing to do. */
         if (g_fly_trans.closing)
             return;
-        if (b->fly_layer && b->fly_surf_configured && b->fly_cairo) {
+        if (b->fly_popup && b->fly_surf_configured && b->fly_cairo) {
             int scale = b->scale ? b->scale : 1;
             if (transition_begin_close(&g_fly_trans, b->fly_cairo,
                                        b->fly_surf_width * scale,
@@ -10895,7 +11045,7 @@ flyout_update_size(struct bar *b)
                                        flyout_close_done))
                 return;
         }
-        if (b->fly_layer) flyout_surface_destroy(b);
+        if (b->fly_popup) flyout_surface_destroy(b);
         return;
     }
 
@@ -10905,7 +11055,7 @@ flyout_update_size(struct bar *b)
      * eases open exactly like a fresh open. */
     if (g_fly_trans.closing || g_fly_trans.pending_open) {
         transition_cancel(&g_fly_trans);
-        if (b->fly_layer && b->fly_surf_height == h) {
+        if (b->fly_popup && b->fly_surf_height == h) {
             /* Same height: no configure is coming, so start the ease now. */
             transition_begin_open(&g_fly_trans, (double)h, &b->fly_needs_render);
         } else {
@@ -10921,8 +11071,8 @@ flyout_update_size(struct bar *b)
         }
     }
 
-    if (!b->fly_layer) {
-        flyout_surface_create(b);
+    if (!b->fly_popup) {
+        flyout_surface_create(b, b->width, h);
         /* The pointer has not moved since the click that opened this popup, so
          * its coordinates are still the anchor icon's -- on the bar, not on
          * the strip. Mark it stale so popup_coords_safe() drops the first
@@ -10931,9 +11081,16 @@ flyout_update_size(struct bar *b)
         g_box.resize_at_ms = now_ms();
         return;
     }
-    if (b->fly_surf_height != h) {
-        zwlr_layer_surface_v1_set_size(b->fly_layer, 0, (uint32_t)h);
-        wl_surface_commit(b->fly_surface);
+
+    if (b->fly_req_width != b->width || b->fly_req_height != h) {
+        if (xdg_popup_get_version(b->fly_popup) >=
+            XDG_POPUP_REPOSITION_SINCE_VERSION) {
+            struct xdg_positioner *pos = bar_popup_positioner(b, b->width, h);
+            xdg_popup_reposition(b->fly_popup, pos, ++b->fly_reposition_token);
+            xdg_positioner_destroy(pos);
+            b->fly_req_width = b->width;
+            b->fly_req_height = h;
+        }
     } else {
         b->fly_needs_render = 1;
     }
@@ -11021,8 +11178,9 @@ bar_render(struct bar *b)
         bar_update_size(b);
         if (b->menu_open) {
             menu_surface_create(b);
-            menu_layer_configure(&g_bar, b->menu_layer, 0,
-                b->width, b->menu_height);
+            menu_surface_size_alloc(b, b->width, b->menu_height);
+            b->menu_surf_configured = 1;
+            b->menu_needs_render = 1;
             menu_surface_render(&g_bar);
         }
     }
@@ -11132,8 +11290,16 @@ menu_close(struct bar *b)
     menu_search_clear();
     g_app.menu_sel = 0;
 
+    /* The compositor already dismissed the grab, so there is no mapped
+     * surface left to animate; tear the popup down now. */
+    if (b->menu_dismissed) {
+        menu_surface_destroy(b);
+        bar_update_size(b);
+        return;
+    }
+
     int animating = 0;
-    if (b->menu_layer && b->menu_surf_configured && b->menu_cairo) {
+    if (b->menu_popup && b->menu_surf_configured && b->menu_cairo) {
         int scale = b->scale ? b->scale : 1;
         animating = transition_begin_close(&g_menu_trans, b->menu_cairo,
                                            b->menu_surf_width * scale,
@@ -11200,14 +11366,9 @@ menu_open(struct bar *b)
     sys_stats_refresh();
     mpris_refresh();
     menu_surface_create(b);
-    /* If the surface survived the cancel (still configured), resize it to the
-     * new height ourselves -- menu_surface_create() early-returns when it
-     * exists. */
-    if (b->menu_layer && b->menu_surf_configured &&
-        b->menu_surf_height != b->menu_height) {
-        zwlr_layer_surface_v1_set_size(b->menu_layer, 0, (uint32_t)b->menu_height);
-        wl_surface_commit(b->menu_surface);
-    }
+    /* If the popup survived the cancel, reposition it to the new height;
+     * menu_surface_create() early-returns when it exists. */
+    menu_update_size(b);
     b->menu_needs_render = 1;
     bar_update_size(b);
 }
@@ -11449,6 +11610,12 @@ bar_layer_configure(void *data, struct zwlr_layer_surface_v1 *surface,
     pinned_recalc_layout();
     toplevel_recalc_layout();
     b->needs_render = 1;
+    /* An output resize changes the bar width the popups span. Reposition them
+     * against the new geometry; the heights are unchanged. */
+    if (w_changed && b->fly_popup)
+        flyout_update_size(b);
+    if (w_changed && b->menu_popup)
+        menu_update_size(b);
 }
 
 static void
@@ -11725,7 +11892,8 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
                       uint32_t serial, uint32_t time, uint32_t button,
                       uint32_t state)
 {
-    (void)data; (void)pointer; (void)serial; (void)time;
+    (void)data; (void)pointer; (void)time;
+    g_pointer.last_serial = serial;
 
     if (state != WL_POINTER_BUTTON_STATE_PRESSED) {
         if (button == BTN_LEFT) {
@@ -13004,18 +13172,21 @@ cleanup()
     if (g_bar.fly_cairo) { cairo_surface_destroy(g_bar.fly_cairo); g_bar.fly_cairo = NULL; }
     if (g_bar.fly_cr) { cairo_destroy(g_bar.fly_cr); g_bar.fly_cr = NULL; }
     shm_pool_cleanup(&g_bar.fly_pool);
-    if (g_bar.fly_layer) zwlr_layer_surface_v1_destroy(g_bar.fly_layer);
+    if (g_bar.fly_popup) xdg_popup_destroy(g_bar.fly_popup);
+    if (g_bar.fly_xdg_surface) xdg_surface_destroy(g_bar.fly_xdg_surface);
     if (g_bar.fly_surface) wl_surface_destroy(g_bar.fly_surface);
     shm_pool_cleanup(&g_bar.menu_pool);
     if (g_bar.menu_frame_cb) { wl_callback_destroy(g_bar.menu_frame_cb); g_bar.menu_frame_cb = NULL; }
     if (g_bar.menu_cairo) { cairo_surface_destroy(g_bar.menu_cairo); g_bar.menu_cairo = NULL; }
     if (g_bar.menu_cr) { cairo_destroy(g_bar.menu_cr); g_bar.menu_cr = NULL; }
-    if (g_bar.menu_layer) zwlr_layer_surface_v1_destroy(g_bar.menu_layer);
+    if (g_bar.menu_popup) xdg_popup_destroy(g_bar.menu_popup);
+    if (g_bar.menu_xdg_surface) xdg_surface_destroy(g_bar.menu_xdg_surface);
     if (g_bar.menu_surface) wl_surface_destroy(g_bar.menu_surface);
     if (g_bar.layer_surface) zwlr_layer_surface_v1_destroy(g_bar.layer_surface);
     if (g_bar.surface) wl_surface_destroy(g_bar.surface);
     output_bg_surface_destroy_all();
     if (g_wlp.wall_image) { cairo_surface_destroy(g_wlp.wall_image); g_wlp.wall_image = NULL; }
+    if (g_wl.xdg_wm_base) xdg_wm_base_destroy(g_wl.xdg_wm_base);
     if (g_wl.layer_shell) zwlr_layer_shell_v1_destroy(g_wl.layer_shell);
     if (g_wl.cursor_surface) wl_surface_destroy(g_wl.cursor_surface);
     if (g_wl.cursor_theme) wl_cursor_theme_destroy(g_wl.cursor_theme);
@@ -13047,10 +13218,21 @@ toplevels_clear(void)
 }
 
 static void
+xdg_wm_base_ping(void *data, struct xdg_wm_base *wm_base, uint32_t serial)
+{
+    (void)data;
+    xdg_wm_base_pong(wm_base, serial);
+}
+
+static const struct xdg_wm_base_listener xdg_wm_base_listener = {
+    .ping = xdg_wm_base_ping,
+};
+
+static void
 registry_global(void *data, struct wl_registry *reg, uint32_t name,
                 const char *interface, uint32_t version)
 {
-    (void)data; (void)version;
+    (void)data;
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
         g_wl.compositor = wl_registry_bind(reg, name, &wl_compositor_interface, 4);
         g_wl.compositor_name = name;
@@ -13072,6 +13254,12 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name,
     } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
         g_wl.layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, 3);
         g_wl.layer_shell_name = name;
+    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+        uint32_t v = version < XDG_POPUP_REPOSITION_SINCE_VERSION
+                         ? version : XDG_POPUP_REPOSITION_SINCE_VERSION;
+        g_wl.xdg_wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, v);
+        g_wl.xdg_wm_base_name = name;
+        xdg_wm_base_add_listener(g_wl.xdg_wm_base, &xdg_wm_base_listener, NULL);
     } else if (strcmp(interface, zwlr_foreign_toplevel_manager_v1_interface.name) == 0) {
         g_wl.toplevel_mgr = wl_registry_bind(reg, name, &zwlr_foreign_toplevel_manager_v1_interface, 3);
         g_wl.toplevel_mgr_name = name;
@@ -13113,6 +13301,10 @@ registry_global_remove(void *data, struct wl_registry *reg, uint32_t name)
     } else if (g_wl.layer_shell && g_wl.layer_shell_name == name) {
         zwlr_layer_shell_v1_destroy(g_wl.layer_shell);
         g_wl.layer_shell = NULL;
+    } else if (g_wl.xdg_wm_base && g_wl.xdg_wm_base_name == name) {
+        close_all_popups();
+        xdg_wm_base_destroy(g_wl.xdg_wm_base);
+        g_wl.xdg_wm_base = NULL;
     } else if (g_wl.toplevel_mgr && g_wl.toplevel_mgr_name == name) {
         zwlr_foreign_toplevel_manager_v1_destroy(g_wl.toplevel_mgr);
         g_wl.toplevel_mgr = NULL;
