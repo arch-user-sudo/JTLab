@@ -2598,16 +2598,16 @@ static double
 right_cluster_limit(void)
 {
     double left;
-    int gap = TRAY_GAP;
-    if (g_sni.n_tray > 0) { left = tray_icon_x(0); gap = TRAY_CLUSTER_GAP; }
+    if (g_sni.n_tray > 0) left = tray_icon_x(0);
     else if (g_box.audio_present) left = audio_icon_x();
     else if (g_box.net_status != NET_NONE) left = net_icon_x();
     else left = g_bar.width - TRAY_EDGE_PAD - NOTIF_ICON_SIZE
                     - TRAY_GAP - time_text_width();
     /* The workspace and on-screen-keyboard toggles share the left end of the
-     * pill. Reserve both, plus the gap between them, so the taskbar clamp in
-     * center_taskbar_items() never runs underneath either icon. */
-    return left - gap - WS_ICON_SIZE - OSK_ICON_GAP - OSK_ICON_SIZE - 4;
+     * pill. Reserve both, plus the padding around each, so the taskbar clamp
+     * in center_taskbar_items() never runs underneath either icon. */
+    return left - OSK_RIGHT_GAP - WS_ICON_SIZE - OSK_ICON_GAP -
+           OSK_ICON_SIZE - 4;
 }
 
 static double

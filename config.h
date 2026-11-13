@@ -203,9 +203,11 @@
 
 /* On-screen keyboard toggle, immediately right of the workspace icon. It sits
  * inside the status pill with the workspace icon, so right_cluster_limit()
- * reserves both when clamping the taskbar. */
-#define OSK_ICON_SIZE   16
-#define OSK_ICON_GAP    8
+ * reserves both when clamping the taskbar. OSK_ICON_GAP is the workspace
+ * icon's right padding; OSK_RIGHT_GAP is the keyboard icon's right padding. */
+#define OSK_ICON_SIZE   18
+#define OSK_ICON_GAP    11
+#define OSK_RIGHT_GAP   10
 
 /* On-screen keyboard panel. The strip is sized from these: five rows of keys
  * with even padding and gaps, plus PPADDING below the panel like every other
