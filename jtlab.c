@@ -3825,6 +3825,7 @@ theme_update_open_apps(void)
     theme_send_accent("jtnetworks");
     theme_send_accent("jtspeedtest");
     theme_send_accent("jtupdate");
+    theme_send_accent("jtsettings");
     /* The compositor uses the same line protocol for the SSD close button and
      * the snap overlay, so a missing socket just means jtlabwc is not up yet. */
     theme_send_accent("jtlabwc");
@@ -4006,6 +4007,13 @@ menu_pos_of_app(int app_idx)
     return -1;
 }
 
+/* The four power actions plus the settings gear that sits above them. The
+ * gear's hover/hit index follows the actions so it can share the same state. */
+enum {
+    POWER_ACTION_COUNT = 4,
+    POWER_SETTINGS_IDX = POWER_ACTION_COUNT,
+};
+
 static double
 menu_vert_pad(void)
 {
@@ -4036,13 +4044,21 @@ menu_avatar_band(void)
     return menu_avatar_top() + PROFILE_PHOTO_SIZE + 12;
 }
 
+/* The settings gear occupies its own row directly below the profile photo,
+ * above the four bottom-anchored power actions. */
+static double
+menu_settings_row_base(void)
+{
+    return menu_avatar_band();
+}
+
 /* First power row's y offset within the menu body. Normally bottom-anchored,
- * but never above the profile-photo band so the two cannot overlap. */
+ * but never above the settings row so the two cannot overlap. */
 static double
 menu_power_row_base(double mh_body)
 {
-    double bottom = mh_body - MENU_PADDING - 4 * POWER_ROW_H;
-    double top = menu_avatar_band();
+    double bottom = mh_body - MENU_PADDING - POWER_ACTION_COUNT * POWER_ROW_H;
+    double top = menu_settings_row_base() + POWER_ROW_H + 8;
     return bottom > top ? bottom : top;
 }
 
@@ -4054,7 +4070,8 @@ calc_menu_height(void)
     for (int i = 0; i < 10; i++) {
         double apps_h = 2 * menu_vert_pad() + rows * MENU_ROW_HEIGHT
                         + 2 * menu_search_area();
-        double power_h = menu_avatar_band() + 4 * POWER_ROW_H + MENU_PADDING;
+        double power_h = menu_settings_row_base() + POWER_ROW_H + 8
+                         + POWER_ACTION_COUNT * POWER_ROW_H + MENU_PADDING;
         double sys_h = sys_column_height();
         double b = apps_h > power_h ? apps_h : power_h;
         if (sys_h > b) b = sys_h;
@@ -8452,6 +8469,40 @@ draw_power_icon(int action, cairo_t *cr, double cx, double cy)
     }
 }
 
+/* Settings gear: a ring with eight teeth and a hollow hub, drawn in the menu
+ * foreground colour so it follows the bar's theme like the power icons. */
+static void
+draw_settings_icon(cairo_t *cr, double cx, double cy)
+{
+    cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 1.0);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+
+    double ring = 5.2;
+    double outer = 7.4;
+
+    /* eight teeth radiating from the ring */
+    cairo_set_line_width(cr, 2.2);
+    cairo_new_path(cr);
+    for (int i = 0; i < 8; i++) {
+        double a = (double)i * M_PI / 4.0;
+        double c = cos(a);
+        double s = sin(a);
+        cairo_move_to(cr, cx + c * (ring - 0.8), cy + s * (ring - 0.8));
+        cairo_line_to(cr, cx + c * outer, cy + s * outer);
+    }
+    cairo_stroke(cr);
+
+    /* ring and hollow hub */
+    cairo_set_line_width(cr, 1.5);
+    cairo_new_path(cr);
+    cairo_arc(cr, cx, cy, ring, 0, 2 * M_PI);
+    cairo_stroke(cr);
+    cairo_new_path(cr);
+    cairo_arc(cr, cx, cy, 2.0, 0, 2 * M_PI);
+    cairo_stroke(cr);
+}
+
 /* Profile photo: a circle at the top of the power column, above the power
  * icons. Falls back to a drawn avatar when PROFILE_PHOTO is unset or the file
  * cannot be read, so the column always has something to show. */
@@ -9630,13 +9681,22 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
 
         panel_begin(cr, mx, my, mw, mh_body, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
 
-    static const char *power_labels[4] = {
-        "Power off", "Reboot", "Log out", "Suspend",
+    static const char *power_labels[POWER_ACTION_COUNT + 1] = {
+        "Power off", "Reboot", "Log out", "Suspend", "Settings",
     };
     double apad = menu_vert_pad() * 2;
     double row_base = menu_power_row_base(mh_body);
     avatar_draw(cr);
-    for (int i = 0; i < 4; i++) {
+
+    double settings_y = my + menu_settings_row_base();
+    if (g_pmenu.hover == POWER_SETTINGS_IDX) {
+        draw_hover_row(cr, mx, settings_y, POWER_COL_W, POWER_ROW_H,
+                       0, MENU_HOVER_A);
+    }
+    draw_settings_icon(cr, mx + POWER_COL_W / 2.0,
+                       settings_y + POWER_ROW_H / 2.0);
+
+    for (int i = 0; i < POWER_ACTION_COUNT; i++) {
         double row_y = my + row_base + i * POWER_ROW_H;
 
         if (g_pmenu.hover == i) {
@@ -9758,7 +9818,9 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
         pango_layout_set_text(pl, label, -1);
         int tw, th;
         pango_layout_get_pixel_size(pl, &tw, &th);
-        double hover_y = my + row_base + g_pmenu.hover * POWER_ROW_H;
+        double hover_y = g_pmenu.hover == POWER_SETTINGS_IDX
+            ? my + menu_settings_row_base()
+            : my + row_base + g_pmenu.hover * POWER_ROW_H;
         double tx = mx + POWER_COL_W + 8;
         double ty = hover_y + (POWER_ROW_H - th) / 2.0 - 3;
         double tw_w = tw + 12;
@@ -13078,10 +13140,15 @@ menu_power_hit_test(double px, double py)
     double mx = MENU_MARGIN_L;
     double my = 0;
     double mh_body = g_bar.menu_height - PPADDING;
+    if (in_rect(px, py, mx, my + menu_settings_row_base(),
+                POWER_COL_W, POWER_ROW_H)) {
+        return POWER_SETTINGS_IDX;
+    }
     double row_base = menu_power_row_base(mh_body);
-    if (!in_rect(px, py, mx, my + row_base, POWER_COL_W, 4 * POWER_ROW_H)) return -1;
+    if (!in_rect(px, py, mx, my + row_base,
+                 POWER_COL_W, POWER_ACTION_COUNT * POWER_ROW_H)) return -1;
     int row = (int)((py - my - row_base) / POWER_ROW_H);
-    if (row >= 0 && row < 4) return row;
+    if (row >= 0 && row < POWER_ACTION_COUNT) return row;
     return -1;
 }
 
@@ -13857,8 +13924,31 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
             }
         } else if (button == BTN_LEFT) {
             int prow = menu_power_hit_test(g_pointer.x, g_pointer.y);
+            if (prow == POWER_SETTINGS_IDX) {
+                /* Same launch/toggle pattern as the other companion GUIs:
+                 * close an existing window, otherwise start it with the live
+                 * wallpaper accent. */
+                static int64_t launched_at_ms;
+                int closed = 0;
+                for (int k = 0; k < g_n_toplevels; k++) {
+                    const char *id = g_toplevels[k].app_id;
+                    if (id && strcasecmp(id, "jtsettings") == 0) {
+                        zwlr_foreign_toplevel_handle_v1_close(
+                            g_toplevels[k].handle);
+                        closed = 1;
+                    }
+                }
+                if (closed) {
+                    launched_at_ms = 0;
+                } else if (now_ms() - launched_at_ms > 1500) {
+                    theme_run_app(SETTINGS_CMD);
+                    launched_at_ms = now_ms();
+                }
+                menu_close(&g_bar);
+                return;
+            }
             if (prow >= 0) {
-                static const char *power_cmds[4] = {
+                static const char *power_cmds[POWER_ACTION_COUNT] = {
                     "systemctl poweroff",
                     "systemctl reboot",
                     "loginctl terminate-user $USER",

@@ -129,10 +129,13 @@
 #define NETWORKS_CMD    "/usr/local/bin/jtnetworks"
 /* Repository updater GUI. The workspace popup's Updater button toggles it. */
 #define UPDATER_CMD     "/usr/local/bin/jtupdate"
-/* All three GUIs are launched with the current wallpaper accent appended as a
- * quoted #RRGGBB argument (for example: "... \'#36B4EB\'"). When one is already
- * running, JTLab sends the new accent to its control socket so the color
- * changes live instead of restarting the window. */
+/* Settings GUI. The gear below the profile photo in the app menu's power
+ * column toggles it. */
+#define SETTINGS_CMD    "/usr/local/bin/jtsettings"
+/* The companion GUIs are launched with the current wallpaper accent appended
+ * as a quoted #RRGGBB argument (for example: "... \'#36B4EB\'"). When one is
+ * already running, JTLab sends the new accent to its control socket so the
+ * color changes live instead of restarting the window. */
 /* Shell exec'd after a "held" command finishes, so the terminal window stays
  * open and interactive. $SHELL is the user's login shell; the :- fallback keeps
  * it working in sessions where $SHELL is unset. */
