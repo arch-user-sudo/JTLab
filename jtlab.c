@@ -65,6 +65,7 @@ static struct {
     struct zwlr_screencopy_manager_v1 *screencopy_mgr;
     struct zwp_virtual_keyboard_manager_v1 *vk_mgr;
     struct zwp_virtual_keyboard_v1 *vk;
+    uint32_t vk_mod_shift, vk_mod_ctrl, vk_mod_alt, vk_mod_super;
     struct xkb_context *xkb_ctx;
     struct xkb_keymap *xkb_keymap;
     struct xkb_state *xkb_state;
@@ -10373,6 +10374,19 @@ osk_create_keyboard(void)
     if (!km)
         return 0;
 
+    /* wlroots' virtual keyboard forwards key events with update_state off,
+     * so modifier state has to be supplied through the protocol's explicit
+     * modifiers request.  Resolve the masks from the same keymap we upload. */
+    xkb_mod_index_t mi;
+    mi = xkb_keymap_mod_get_index(km, XKB_MOD_NAME_SHIFT);
+    g_wl.vk_mod_shift = (mi == XKB_MOD_INVALID) ? 0 : 1u << mi;
+    mi = xkb_keymap_mod_get_index(km, XKB_MOD_NAME_CTRL);
+    g_wl.vk_mod_ctrl = (mi == XKB_MOD_INVALID) ? 0 : 1u << mi;
+    mi = xkb_keymap_mod_get_index(km, XKB_MOD_NAME_ALT);
+    g_wl.vk_mod_alt = (mi == XKB_MOD_INVALID) ? 0 : 1u << mi;
+    mi = xkb_keymap_mod_get_index(km, XKB_MOD_NAME_LOGO);
+    g_wl.vk_mod_super = (mi == XKB_MOD_INVALID) ? 0 : 1u << mi;
+
     char *str = xkb_keymap_get_as_string(km, XKB_KEYMAP_FORMAT_TEXT_V1);
     xkb_keymap_unref(km);
     if (!str)
@@ -10421,6 +10435,12 @@ osk_send_key(uint32_t code, int shift, int ctrl, int alt, int super)
     if (!g_wl.vk)
         return;
 
+    uint32_t mods = 0;
+    if (shift) mods |= g_wl.vk_mod_shift;
+    if (ctrl) mods |= g_wl.vk_mod_ctrl;
+    if (alt) mods |= g_wl.vk_mod_alt;
+    if (super) mods |= g_wl.vk_mod_super;
+
     uint32_t t = (uint32_t)now_ms();
     if (ctrl)
         zwp_virtual_keyboard_v1_key(g_wl.vk, t, KEY_LEFTCTRL,
@@ -10435,10 +10455,18 @@ osk_send_key(uint32_t code, int shift, int ctrl, int alt, int super)
         zwp_virtual_keyboard_v1_key(g_wl.vk, t, KEY_LEFTSHIFT,
             WL_KEYBOARD_KEY_STATE_PRESSED);
 
+    /* The compositor does not derive modifier state from the virtual
+     * keyboard's key events, so publish it explicitly for the chord. */
+    if (mods)
+        zwp_virtual_keyboard_v1_modifiers(g_wl.vk, mods, 0, 0, 0);
+
     zwp_virtual_keyboard_v1_key(g_wl.vk, t, code,
         WL_KEYBOARD_KEY_STATE_PRESSED);
     zwp_virtual_keyboard_v1_key(g_wl.vk, t, code,
         WL_KEYBOARD_KEY_STATE_RELEASED);
+
+    if (mods)
+        zwp_virtual_keyboard_v1_modifiers(g_wl.vk, 0, 0, 0, 0);
 
     if (shift)
         zwp_virtual_keyboard_v1_key(g_wl.vk, t, KEY_LEFTSHIFT,
