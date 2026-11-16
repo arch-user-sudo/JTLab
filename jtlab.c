@@ -2601,9 +2601,7 @@ right_cluster_limit(void)
     double left;
     if (g_sni.n_tray > 0) left = tray_icon_x(0);
     else if (g_box.audio_present) left = audio_icon_x();
-    else if (g_box.net_status != NET_NONE) left = net_icon_x();
-    else left = g_bar.width - TRAY_EDGE_PAD - NOTIF_ICON_SIZE
-                    - TRAY_GAP - time_text_width();
+    else left = net_icon_x();
     /* The workspace and on-screen-keyboard toggles share the left end of the
      * pill. Reserve both, plus the padding around each, so the taskbar clamp
      * in center_taskbar_items() never runs underneath either icon. */
@@ -5548,6 +5546,7 @@ struct osk_state {
     int suspended;      /* hidden for the wallpaper picker; reopen on close */
     int hover_key;
     int shift;
+    int bigtext;
     int ctrl;
     int alt;
     int super;
@@ -10144,6 +10143,7 @@ wspop_action_activate(int i)
 enum osk_action {
     OSK_ACT_KEY = 0,
     OSK_ACT_SHIFT,
+    OSK_ACT_BIGTEXT,
     OSK_ACT_CTRL,
     OSK_ACT_ALT,
     OSK_ACT_SUPER,
@@ -10196,6 +10196,7 @@ static const struct osk_key osk_row1[] = {
 };
 
 static const struct osk_key osk_row2[] = {
+    { "Aa", NULL, 0, 1.75, OSK_ACT_BIGTEXT },
     { "a", "A", KEY_A, 1.0, OSK_ACT_KEY },
     { "s", "S", KEY_S, 1.0, OSK_ACT_KEY },
     { "d", "D", KEY_D, 1.0, OSK_ACT_KEY },
@@ -10498,6 +10499,9 @@ osk_press(int idx)
     case OSK_ACT_SHIFT:
         g_osk.shift = !g_osk.shift;
         break;
+    case OSK_ACT_BIGTEXT:
+        g_osk.bigtext = !g_osk.bigtext;
+        break;
     case OSK_ACT_CTRL:
         g_osk.ctrl = !g_osk.ctrl;
         break;
@@ -10523,6 +10527,19 @@ osk_press(int idx)
     render_request();
 }
 
+static PangoFontDescription *
+osk_label_font(int big)
+{
+    static PangoFontDescription *normal, *large;
+    PangoFontDescription **fd = big ? &large : &normal;
+    if (!*fd) {
+        *fd = pango_font_description_from_string(FONT_FAMILY);
+        pango_font_description_set_absolute_size(*fd,
+            (big ? FONT_SIZE * 2.0 : FONT_SIZE) * PANGO_SCALE);
+    }
+    return *fd;
+}
+
 static void
 osk_draw_key(cairo_t *cr, PangoLayout *pl, const struct osk_key *k,
              double x, double y, double w, int active, int hover)
@@ -10541,6 +10558,12 @@ osk_draw_key(cairo_t *cr, PangoLayout *pl, const struct osk_key *k,
 
     const char *label = (g_osk.shift && k->shift_label) ? k->shift_label
                                                         : k->label;
+    /* The "Aa" toggle doubles the size of single-character keycaps.  Word
+     * labels such as Backspace and Shift stay at the base size: at twice
+     * the height they no longer fit inside their key. */
+    int single = label[0] && !label[1];
+    pango_layout_set_font_description(pl,
+        osk_label_font(single && g_osk.bigtext));
     pango_layout_set_text(pl, label, -1);
     pango_layout_set_width(pl, -1);
     int tw, th;
@@ -10575,6 +10598,7 @@ osk_draw(cairo_t *cr, PangoLayout *pl)
             int active = 0;
             switch (k->action) {
             case OSK_ACT_SHIFT: active = g_osk.shift; break;
+            case OSK_ACT_BIGTEXT: active = g_osk.bigtext; break;
             case OSK_ACT_CTRL: active = g_osk.ctrl; break;
             case OSK_ACT_ALT: active = g_osk.alt; break;
             case OSK_ACT_SUPER: active = g_osk.super; break;
@@ -10610,6 +10634,7 @@ osk_open(void)
     g_osk.open = 1;
     g_osk.hover_key = -1;
     g_osk.shift = 0;
+    g_osk.bigtext = 0;
     g_osk.ctrl = 0;
     g_osk.alt = 0;
     g_osk.super = 0;
@@ -10630,6 +10655,7 @@ osk_close(void)
     g_osk.open = 0;
     g_osk.hover_key = -1;
     g_osk.shift = 0;
+    g_osk.bigtext = 0;
     g_osk.ctrl = 0;
     g_osk.alt = 0;
     g_osk.super = 0;
@@ -11605,7 +11631,7 @@ bar_draw(struct bar *b)
         draw_osk_icon(cr, ox, oy, osz, g_osk.open);
     }
 
-    if (g_box.net_status != NET_NONE) {
+    {
         double nsz = NOTIF_ICON_SIZE;
         double nx = net_icon_x();
         double ny = bar_y + (bar_h - nsz) / 2.0;
@@ -11628,7 +11654,7 @@ bar_draw(struct bar *b)
                           205 * M_PI / 180.0, 335 * M_PI / 180.0);
                 cairo_stroke(cr);
             }
-        } else {
+        } else if (g_box.net_status == NET_ETHERNET) {
             double jw = 10, jh = 7;
             cairo_rectangle(cr, ncx - jw / 2.0, ncy - 4.5, jw, jh);
             cairo_stroke(cr);
@@ -11640,6 +11666,19 @@ bar_draw(struct bar *b)
             cairo_move_to(cr, ncx + 3, ncy - 4.5);
             cairo_line_to(cr, ncx + 3, ncy - 2);
             cairo_stroke(cr);
+        } else {
+            /* No carrier on any interface: warning triangle with an
+             * exclamation mark, so the network launcher stays visible. */
+            cairo_move_to(cr, ncx, ncy - 6.0);
+            cairo_line_to(cr, ncx + 6.0, ncy + 5.0);
+            cairo_line_to(cr, ncx - 6.0, ncy + 5.0);
+            cairo_close_path(cr);
+            cairo_stroke(cr);
+            cairo_move_to(cr, ncx, ncy - 2.0);
+            cairo_line_to(cr, ncx, ncy + 1.5);
+            cairo_stroke(cr);
+            cairo_arc(cr, ncx, ncy + 3.4, 0.85, 0, 2 * M_PI);
+            cairo_fill(cr);
         }
     }
 
@@ -14141,7 +14180,6 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
     }
 
     if (button == BTN_LEFT && on_bar_surface() &&
-        g_box.net_status != NET_NONE &&
         net_hit_test(g_pointer.x, g_pointer.y)) {
         /* The network glyph doubles as a launcher.  If the app already owns a
          * toplevel, close it; otherwise start it.  Ignore repeat clicks while

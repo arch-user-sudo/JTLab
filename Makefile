@@ -2,7 +2,7 @@ CC      ?= gcc
 .DEFAULT_GOAL := all
 CFLAGS  ?= -O2 -march=native -std=c11 -D_GNU_SOURCE \
            -flto -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables -fno-unwind-tables \
-           -fno-pie -fno-plt -fno-ident
+           -fno-pie -fno-plt -fno-ident -s
 LDFLAGS ?= -no-pie -Wl,--gc-sections -Wl,--as-needed -Wl,-O1 -s
 # Unoptimized, symbol-rich build for the debug target (keeps backtraces,
 # is PIE, and never gets stripped).
