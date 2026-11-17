@@ -3824,6 +3824,7 @@ theme_update_open_apps(void)
     theme_send_accent("jtnetworks");
     theme_send_accent("jtspeedtest");
     theme_send_accent("jtupdate");
+    theme_send_accent("jtwpi");
     theme_send_accent("jtsettings");
     /* The compositor uses the same line protocol for the SSD close button and
      * the snap overlay, so a missing socket just means jtlabwc is not up yet. */

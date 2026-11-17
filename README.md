@@ -56,13 +56,13 @@ A lightweight, highly configurable Wayland status bar for wlroots-based composit
 
 ### Desktop Customization
 - **Wallpaper management** - rendered natively as a background layer surface per output. Browse and select wallpapers from a configurable directory in the workspace popup.
-- **Wallpaper-derived accent** - toggles, the volume and night-light sliders, the CPU/RAM/GPU meters, the workspace indicator, and the active audio/microphone device markers take their color from the current wallpaper. `jtspeedtest`, `jtnetworks`, and `jtupdate` are launched with the same accent and update it live while they are running when the wallpaper changes.
+- **Wallpaper-derived accent** - toggles, the volume and night-light sliders, the CPU/RAM/GPU meters, the workspace indicator, and the active audio/microphone device markers take their color from the current wallpaper. `jtspeedtest`, `jtnetworks`, and `jtupdate` are launched with the same accent and update it live while they are running when the wallpaper changes. `jtwpi` also follows the accent live for icon selection.
 - **Night light** (blue light filter) with adjustable color temperature (6500K down to 2500K), applied natively to every output via the `wlr-gamma-control` protocol
 - **Customizable icons** with icon theme support (Adwaita by default)
 
 ### Utilities
 - **External control** via `jtlabctl` unix socket - toggle menu, start the screenshot selector, quit bar
-- **Live companion accents** via `jtspeedtestctl`, `jtnetworksctl`, and `jtupdatectl` - change colors on the fly or quit any companion window; JTLab uses the same sockets when the wallpaper accent changes
+- **Live companion accents** via `jtspeedtestctl`, `jtnetworksctl`, `jtupdatectl`, and `jtwpictl` - change colors on the fly or quit any companion window; JTLab uses the same sockets when the wallpaper accent changes
 - **Configurable terminal** and hold-shell behavior for launched commands
 - **Minimal resource usage** with compile-time optimizations
 
