@@ -10076,6 +10076,23 @@ wspop_action_screenshot(void)
     shot_begin();
 }
 
+/* Focus the first toplevel owned by app_id.  Returns 1 if one was found (and
+ * activated), 0 if the app has no window yet.  Companion apps use this so a
+ * second click raises the running app instead of closing it. */
+static int
+focus_app_window(const char *app_id)
+{
+    for (int i = 0; i < g_n_toplevels; i++) {
+        const char *id = g_toplevels[i].app_id;
+        if (id && strcasecmp(id, app_id) == 0) {
+            zwlr_foreign_toplevel_handle_v1_activate(g_toplevels[i].handle,
+                                                     g_wl.seat);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Runs the action behind quick-action button i. */
 static void
 wspop_action_activate(int i)
@@ -10091,41 +10108,23 @@ wspop_action_activate(int i)
         break;
     case WS_ACT_SPEEDTEST: {
         /* jtspeedtest opens its own native Wayland window, so no terminal
-         * wrapper is needed.  The quick-action button toggles that window:
-         * close it if it is already up, otherwise launch it. */
+         * wrapper is needed.  A click focuses the window if it is already
+         * up, otherwise launches it. */
         static int64_t launched_at_ms;
-        int closed = 0;
-        for (int k = 0; k < g_n_toplevels; k++) {
-            const char *id = g_toplevels[k].app_id;
-            if (id && strcasecmp(id, "jtspeedtest") == 0) {
-                zwlr_foreign_toplevel_handle_v1_close(g_toplevels[k].handle);
-                closed = 1;
-            }
-        }
-        if (closed) {
-            launched_at_ms = 0;
-        } else if (now_ms() - launched_at_ms > 1500) {
+        if (!focus_app_window("jtspeedtest")
+                && now_ms() - launched_at_ms > 1500) {
             theme_run_app(SPEEDTEST_CMD);
             launched_at_ms = now_ms();
         }
         break;
     }
     case WS_ACT_UPDATER: {
-        /* Same toggle behavior as Speedtest; launching through theme_run_app()
-         * hands jtupdate the live wallpaper accent, and the control socket
-         * keeps it in sync while it runs. */
+        /* Same launch/focus behavior as Speedtest; launching through
+         * theme_run_app() hands jtupdate the live wallpaper accent, and the
+         * control socket keeps it in sync while it runs. */
         static int64_t launched_at_ms;
-        int closed = 0;
-        for (int k = 0; k < g_n_toplevels; k++) {
-            const char *id = g_toplevels[k].app_id;
-            if (id && strcasecmp(id, "jtupdate") == 0) {
-                zwlr_foreign_toplevel_handle_v1_close(g_toplevels[k].handle);
-                closed = 1;
-            }
-        }
-        if (closed) {
-            launched_at_ms = 0;
-        } else if (now_ms() - launched_at_ms > 1500) {
+        if (!focus_app_window("jtupdate")
+                && now_ms() - launched_at_ms > 1500) {
             theme_run_app(UPDATER_CMD);
             launched_at_ms = now_ms();
         }
@@ -13992,22 +13991,11 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
         } else if (button == BTN_LEFT) {
             int prow = menu_power_hit_test(g_pointer.x, g_pointer.y);
             if (prow == POWER_SETTINGS_IDX) {
-                /* Same launch/toggle pattern as the other companion GUIs:
-                 * close an existing window, otherwise start it with the live
-                 * wallpaper accent. */
+                /* Focus an existing settings window, otherwise start it with
+                 * the live wallpaper accent. */
                 static int64_t launched_at_ms;
-                int closed = 0;
-                for (int k = 0; k < g_n_toplevels; k++) {
-                    const char *id = g_toplevels[k].app_id;
-                    if (id && strcasecmp(id, "jtsettings") == 0) {
-                        zwlr_foreign_toplevel_handle_v1_close(
-                            g_toplevels[k].handle);
-                        closed = 1;
-                    }
-                }
-                if (closed) {
-                    launched_at_ms = 0;
-                } else if (now_ms() - launched_at_ms > 1500) {
+                if (!focus_app_window("jtsettings")
+                        && now_ms() - launched_at_ms > 1500) {
                     theme_run_app(SETTINGS_CMD);
                     launched_at_ms = now_ms();
                 }
@@ -14182,21 +14170,12 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
     if (button == BTN_LEFT && on_bar_surface() &&
         net_hit_test(g_pointer.x, g_pointer.y)) {
         /* The network glyph doubles as a launcher.  If the app already owns a
-         * toplevel, close it; otherwise start it.  Ignore repeat clicks while
+         * toplevel, focus it; otherwise start it.  Ignore repeat clicks while
          * a fresh launch is still waiting for its first window. */
         static int64_t launched_at_ms;
-        int closed = 0;
-        for (int i = 0; i < g_n_toplevels; i++) {
-            const char *id = g_toplevels[i].app_id;
-            if (id && strcasecmp(id, "jtnetworks") == 0) {
-                zwlr_foreign_toplevel_handle_v1_close(g_toplevels[i].handle);
-                closed = 1;
-            }
-        }
         close_all_popups();
-        if (closed) {
-            launched_at_ms = 0;
-        } else if (now_ms() - launched_at_ms > 1500) {
+        if (!focus_app_window("jtnetworks")
+                && now_ms() - launched_at_ms > 1500) {
             theme_run_app(NETWORKS_CMD);
             launched_at_ms = now_ms();
         }
