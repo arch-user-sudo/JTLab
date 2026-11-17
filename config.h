@@ -221,6 +221,17 @@
 #define OSK_KEY_GAP     6
 #define OSK_KEY_R       6
 #define OSK_ROWS        5
+/* Key click feedback: the key stays lit for as long as the button is held.
+ * The color is deliberately lighter than MENU_HOVER_HEX so a held press reads
+ * differently from a plain hover. */
+#define OSK_PRESS_HEX   0x9A9A9A
+#define OSK_PRESS_A     1.0
+/* Key repeat while a key is held: wait OSK_REPEAT_DELAY_MS before the first
+ * repeat, then send the key at OSK_REPEAT_RATE_HZ. Modifier toggles never
+ * repeat. */
+#define OSK_REPEAT_DELAY_MS  220
+#define OSK_REPEAT_RATE_HZ   50
+#define OSK_REPEAT_MS        (1000 / OSK_REPEAT_RATE_HZ)
 
 /* Workspace popup (wallpaper button + horizontal row of numbered buttons) */
 #define WS_BTN_SIZE     26

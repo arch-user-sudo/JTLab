@@ -5545,6 +5545,12 @@ struct osk_state {
     int open;
     int suspended;      /* hidden for the wallpaper picker; reopen on close */
     int hover_key;
+    int press_key;      /* key held down, -1 when idle */
+    int repeat_key;     /* key auto-repeating while held, -1 when idle */
+    uint32_t repeat_code;
+    int rep_shift, rep_ctrl, rep_alt, rep_super;
+    int64_t repeat_start_ms;
+    GSource *repeat_src; /* repeat timer, owned by the GLib context */
     int shift;
     int bigtext;
     int ctrl;
@@ -5558,7 +5564,8 @@ struct osk_state {
     double w, h;
 };
 
-static struct osk_state g_osk = { .hover_key = -1 };
+static struct osk_state g_osk = { .hover_key = -1, .press_key = -1,
+                                  .repeat_key = -1 };
 
 static PangoFontDescription *
 wx_font(void)
@@ -10485,6 +10492,79 @@ osk_send_key(uint32_t code, int shift, int ctrl, int alt, int super)
 }
 
 static void
+osk_press_flash_stop(void)
+{
+    if (g_osk.press_key < 0)
+        return;
+    g_osk.press_key = -1;
+    g_bar.osk_needs_render = 1;
+}
+
+/* Light the key up while the pointer button is down; the release clears it.
+ * Keeping it latched to the button (rather than a timer) means holding a key
+ * leaves it visibly pressed for as long as the user holds it. */
+static void
+osk_press_flash(int idx)
+{
+    g_osk.press_key = idx;
+    g_bar.osk_needs_render = 1;
+}
+
+static void
+osk_repeat_stop(void)
+{
+    if (g_osk.repeat_src) {
+        g_source_destroy(g_osk.repeat_src);
+        g_osk.repeat_src = NULL;
+    }
+    g_osk.repeat_key = -1;
+}
+
+static gboolean
+osk_repeat_tick(gpointer data)
+{
+    (void)data;
+    if (g_osk.repeat_key < 0) {
+        g_osk.repeat_src = NULL;
+        return G_SOURCE_REMOVE;
+    }
+    /* A single timer runs at the repeat rate; the first repeat is held off
+     * until the initial delay has passed. */
+    if (now_ms() - g_osk.repeat_start_ms < OSK_REPEAT_DELAY_MS)
+        return G_SOURCE_CONTINUE;
+    osk_send_key(g_osk.repeat_code, g_osk.rep_shift, g_osk.rep_ctrl,
+                 g_osk.rep_alt, g_osk.rep_super);
+    return G_SOURCE_CONTINUE;
+}
+
+/* Capture the one-shot modifier state now: osk_press() clears it after the
+ * first key, but every repeat of a chord should keep the same modifiers. */
+static void
+osk_repeat_start(int idx, const struct osk_key *k)
+{
+    osk_repeat_stop();
+    g_osk.repeat_key = idx;
+    g_osk.repeat_code = k->code;
+    g_osk.rep_shift = g_osk.shift;
+    g_osk.rep_ctrl = g_osk.ctrl;
+    g_osk.rep_alt = g_osk.alt;
+    g_osk.rep_super = g_osk.super;
+    g_osk.repeat_start_ms = now_ms();
+    GSource *src = g_timeout_source_new(OSK_REPEAT_MS);
+    g_source_set_callback(src, osk_repeat_tick, NULL, NULL);
+    g_source_attach(src, g_sni.glib_ctx);
+    g_osk.repeat_src = src;
+    g_source_unref(src);
+}
+
+static void
+osk_key_release(void)
+{
+    osk_press_flash_stop();
+    osk_repeat_stop();
+}
+
+static void
 osk_press(int idx)
 {
     int row = idx / OSK_ROW_STRIDE;
@@ -10494,6 +10574,10 @@ osk_press(int idx)
         return;
 
     const struct osk_key *k = &osk_rows[row][(size_t)col];
+    osk_press_flash(idx);
+    /* Modifier toggles latch instead of typing, so only real keys repeat. */
+    if (k->action == OSK_ACT_KEY)
+        osk_repeat_start(idx, k);
     switch (k->action) {
     case OSK_ACT_SHIFT:
         g_osk.shift = !g_osk.shift;
@@ -10541,11 +10625,15 @@ osk_label_font(int big)
 
 static void
 osk_draw_key(cairo_t *cr, PangoLayout *pl, const struct osk_key *k,
-             double x, double y, double w, int active, int hover)
+             double x, double y, double w, int active, int hover, int press)
 {
     double h = OSK_KEY_H;
 
-    if (active)
+    /* A press flash outranks the latched-modifier accent so the click is
+     * always visible, even on Shift/Ctrl/Aa. */
+    if (press)
+        cairo_set_source_rgba(cr, COLOR(OSK_PRESS_HEX), OSK_PRESS_A);
+    else if (active)
         cairo_set_source_rgba(cr, COLOR(g_theme.accent), 0.95);
     else if (hover)
         cairo_set_source_rgba(cr, COLOR(MENU_HOVER_HEX), MENU_HOVER_A);
@@ -10568,8 +10656,12 @@ osk_draw_key(cairo_t *cr, PangoLayout *pl, const struct osk_key *k,
     int tw, th;
     pango_layout_get_pixel_size(pl, &tw, &th);
 
-    if (active)
+    if (press)
+        /* Light press fill, so keep the label dark for contrast. */
         cairo_set_source_rgba(cr, COLOR(BG_HEX), 1.0);
+    else if (active)
+        /* Latched modifiers sit on the accent fill; white reads best there. */
+        cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 1.0);
     else if (k->code == KEY_ENTER)
         cairo_set_source_rgba(cr, COLOR(g_theme.accent), 1.0);
     else
@@ -10608,7 +10700,7 @@ osk_draw(cairo_t *cr, PangoLayout *pl)
 
             int idx = row * OSK_ROW_STRIDE + (int)col;
             osk_draw_key(cr, pl, k, x, y, w, active,
-                         g_osk.hover_key == idx);
+                         g_osk.hover_key == idx, g_osk.press_key == idx);
         }
     }
 
@@ -10632,6 +10724,7 @@ osk_open(void)
 
     g_osk.open = 1;
     g_osk.hover_key = -1;
+    osk_key_release();
     g_osk.shift = 0;
     g_osk.bigtext = 0;
     g_osk.ctrl = 0;
@@ -10653,6 +10746,7 @@ osk_close(void)
 
     g_osk.open = 0;
     g_osk.hover_key = -1;
+    osk_key_release();
     g_osk.shift = 0;
     g_osk.bigtext = 0;
     g_osk.ctrl = 0;
@@ -12473,6 +12567,7 @@ static void
 osk_surface_free(struct bar *b)
 {
     transition_cancel(&g_osk_trans);
+    osk_key_release();
     if (b->osk_frame_cb) { wl_callback_destroy(b->osk_frame_cb); b->osk_frame_cb = NULL; }
     b->osk_frame_pending = 0;
     if (b->osk_cairo) { cairo_surface_destroy(b->osk_cairo); b->osk_cairo = NULL; }
@@ -13740,6 +13835,7 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
 
     if (state != WL_POINTER_BUTTON_STATE_PRESSED) {
         if (button == BTN_LEFT) {
+            osk_key_release();
             g_volpop.dragging = 0;
             if (g_wspop.blue_dragging) {
                 /* The filter already tracked every motion event, so the
@@ -15045,6 +15141,7 @@ cleanup(void)
     transition_cancel(&g_fly_trans);
     transition_cancel(&g_menu_trans);
     transition_cancel(&g_osk_trans);
+    osk_key_release();
     if (g_bar.frame_cb) { wl_callback_destroy(g_bar.frame_cb); g_bar.frame_cb = NULL; }
     if (g_bar.cairo) { cairo_surface_destroy(g_bar.cairo); g_bar.cairo = NULL; }
     if (g_bar.cr) { cairo_destroy(g_bar.cr); g_bar.cr = NULL; }
