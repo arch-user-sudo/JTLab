@@ -185,7 +185,7 @@ jtlab's resident memory is dominated by the wallpaper, and a large footprint her
 - **One full-resolution buffer per output.** Each output's background layer surface owns an shm buffer sized to that output in device pixels, also 4 bytes per pixel, living in `/dev/shm`. That is roughly 8 MB at 1080p and 33 MB at 4K (or at 2x scale on a 1080p output), per monitor.
 - **Browser thumbnails.** While the wallpaper browser is open, one small 130x80 thumbnail is kept per entry; these are freed when it closes.
 
-Only the current wallpaper is decoded at any time (single-slot cache): selecting a new one destroys the previous decoded image. Because the wallpaper is rendered in its pure, uncompressed form, memory scales with resolution rather than with the source file size.
+Only the current wallpaper is decoded at any time (single-slot cache): selecting a new one destroys the previous decoded image and hands its heap pages back to the OS immediately, so RSS follows the active wallpaper instead of the largest one ever loaded. Album-art images and browser thumbnails are released the same way when they are replaced or the browser closes. Because the wallpaper is rendered in its pure, uncompressed form, memory scales with resolution rather than with the source file size.
 
 ## Known Issues
 

@@ -20,6 +20,9 @@
 #include <unistd.h>
 #include <execinfo.h>
 #include <linux/input-event-codes.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #include <cairo/cairo.h>
 #include <pango/pangocairo.h>
@@ -452,6 +455,18 @@ now_ms(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* glibc keeps freed heap pages in its free lists instead of handing them back
+ * to the kernel.  A wallpaper or album-art image is large enough that those
+ * pages dominate RSS long after the image is gone, so ask the allocator to
+ * return them as soon as an image is destroyed. */
+static void
+heap_return_pages(void)
+{
+#ifdef __GLIBC__
+    malloc_trim(0);
+#endif
 }
 
 static int
@@ -6179,6 +6194,9 @@ wlp_free_thumbs(void)
     }
     g_wlp.n_entries = 0;
     atomic_store(&g_wlp.loaded_count, 0);
+    /* Thumbnail staging pixbufs can be large while they are decoded; release
+     * whatever the loader left behind as soon as the browser closes. */
+    heap_return_pages();
 }
 
 static int
@@ -6282,6 +6300,9 @@ wlp_loader_thread(gpointer data)
         }
         atomic_fetch_add(&g_wlp.loaded_count, 1);
     }
+    /* The loaders scale during decode, but the full-size source pixbufs they
+     * release on the way are exactly the kind of pages worth returning now. */
+    heap_return_pages();
     return NULL;
 }
 
@@ -6523,6 +6544,9 @@ bg_image_load(const char *path)
     if (!pb) return NULL;
     sf = surface_from_pixbuf(pb);
     g_object_unref(pb);
+    /* The decoded pixbuf was a full-resolution temporary; hand its pages back
+     * now rather than leaving them in the allocator's free lists. */
+    heap_return_pages();
     return sf;
 }
 
@@ -7286,12 +7310,16 @@ wlp_set_wallpaper_bg(const char *path)
     long mtime = (stat(path, &st) == 0) ? (long)st.st_mtime : 0;
     if (!g_wlp.wall_image || strcmp(g_wlp.wall_image_path, path) != 0 ||
         g_wlp.wall_image_mtime != mtime) {
-        cairo_surface_t *wall = bg_image_load(path);
+        /* Drop the previous wallpaper before decoding the new one.  The
+         * output buffer still holds the old picture, so there is no visual
+         * gap, and the allocator can reuse the released pages instead of
+         * having both wallpapers resident at once. */
         if (g_wlp.wall_image) {
             cairo_surface_destroy(g_wlp.wall_image);
             g_wlp.wall_image = NULL;
+            heap_return_pages();
         }
-        g_wlp.wall_image = wall;
+        g_wlp.wall_image = bg_image_load(path);
         g_wlp.wall_image_mtime = mtime;
         snprintf(g_wlp.wall_image_path, sizeof(g_wlp.wall_image_path),
                  "%s", path);
@@ -8622,7 +8650,13 @@ surface_from_pixbuf(GdkPixbuf *pb)
 static void
 art_clear(void)
 {
-    if (g_sys.art) { cairo_surface_destroy(g_sys.art); g_sys.art = NULL; }
+    if (g_sys.art) {
+        cairo_surface_destroy(g_sys.art);
+        g_sys.art = NULL;
+        /* Album art arrives at full resolution and is scaled down for the
+         * bar; return the pages the source image used as soon as it is gone. */
+        heap_return_pages();
+    }
 }
 
 static void
@@ -8652,16 +8686,26 @@ art_reload(void)
     GdkPixbuf *pb = gdk_pixbuf_new_from_file(g_sys.art_path, NULL);
     if (!pb) return;
     int w = gdk_pixbuf_get_width(pb), h = gdk_pixbuf_get_height(pb);
-    if (w <= 0 || h <= 0) { g_object_unref(pb); return; }
+    if (w <= 0 || h <= 0) {
+        g_object_unref(pb);
+        heap_return_pages();
+        return;
+    }
     double sc = (double)SYS_THUMB / (w > h ? w : h);
     int nw = (int)(w * sc + 0.5), nh = (int)(h * sc + 0.5);
     if (nw < 1) nw = 1;
     if (nh < 1) nh = 1;
     GdkPixbuf *spb = gdk_pixbuf_scale_simple(pb, nw, nh, GDK_INTERP_BILINEAR);
     g_object_unref(pb);
-    if (!spb) return;
+    if (!spb) {
+        heap_return_pages();
+        return;
+    }
     g_sys.art = surface_from_pixbuf(spb);
     g_object_unref(spb);
+    /* The full-size source and the scaled pixbuf are both gone now; return
+     * their heap pages immediately instead of waiting for reuse. */
+    heap_return_pages();
 }
 
 static void
