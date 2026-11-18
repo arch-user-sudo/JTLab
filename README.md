@@ -146,7 +146,7 @@ All configuration is done at compile time via `config.h`. Edit it to match your 
 Key configuration options include:
 - **Appearance**: `BAR_HEIGHT`, `FONT_FAMILY`, `FONT_SIZE`, colors, corner radius, padding
 - **Accent**: derived automatically from the current wallpaper and shared by every accent surface; `ACCENT_HEX` is the fallback used when no wallpaper color is available
-- **Wallpaper**: `WALLPAPER_DIR` (default: `~/Wallpapers/`) - PNG is decoded natively, other formats (JPEG, WebP, ...) via GdkPixbuf. The live wallpaper accent is passed to `SPEEDTEST_CMD`, `NETWORKS_CMD`, `UPDATER_CMD`, and `POLKIT_CMD` as a quoted `#RRGGBB` argument. Set `POLKIT_AUTOSTART` to 0 to manage the authentication agent yourself.
+- **Wallpaper**: `WALLPAPER_DIR` (default: `~/Wallpapers/`) - PNG is decoded natively, other formats (JPEG, WebP, ...) via GdkPixbuf. The live wallpaper accent is passed to `SPEEDTEST_CMD`, `NETWORKS_CMD`, and `UPDATER_CMD` as a quoted `#RRGGBB` argument.
 - **Weather**: `WEATHER_ENABLED`, `WEATHER_CITY`, refresh intervals
 - **Terminal**: `TERMINAL_CMD` (default: `footclient`)
 - **Night light**: Temperature range controlled via `BLUE_TEMP_OFF`/`BLUE_TEMP_MIN`, applied natively through the `wlr-gamma-control` protocol

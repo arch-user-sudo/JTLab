@@ -3847,23 +3847,6 @@ theme_update_open_apps(void)
     theme_send_accent("jtlabwc");
 }
 
-/* Start the polkit agent once, with the current wallpaper accent. jtpolkit
- * owns its control socket only while it is alive, so a present socket means
- * an agent is already registered for this session. */
-static void
-theme_ensure_agent(void)
-{
-#if POLKIT_AUTOSTART
-    char path[256];
-    const char *rt = getenv("XDG_RUNTIME_DIR");
-    if (!rt || !rt[0]) rt = "/tmp";
-    snprintf(path, sizeof(path), "%s/jtpolkit-ctl.sock", rt);
-    if (access(path, F_OK) == 0)
-        return;
-    theme_run_app(POLKIT_CMD);
-#endif
-}
-
 /* The scrollable app list region for a given menu body height. Single source of
  * truth for where rows are drawn and hit-tested: double vertical padding on
  * top/bottom plus the search bar below the list. */
@@ -15717,7 +15700,6 @@ main(int argc, char *argv[])
 
     bar_init();
     wlp_load_wallpaper();
-    theme_ensure_agent();
     blue_load();
     poll_init();
     ctl_init();
