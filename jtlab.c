@@ -3752,27 +3752,16 @@ run_cmd_child_cleanup(void)
     }
 }
 
-/* hold: after the command finishes, exec an interactive shell in the same
- * terminal so the window stays open and usable. Meant for commands that print
- * and exit immediately (fastfetch), where the terminal would otherwise close
- * before the output can be read. Note the terminal's own hold flag is not
- * enough: foot's -H/--hold only keeps the pane on screen with no process
- * behind it to read input, so the window looks alive but cannot be typed into.
- * Leave hold at 0 for commands that run long enough to read as they go. */
+/* Run a command, optionally in a terminal. */
 static void
-run_cmd_ex(const char *cmd, int terminal, int hold)
+run_cmd(const char *cmd, int terminal)
 {
     if (!cmd || !cmd[0]) return;
     char clean[512];
     exec_clean(cmd, clean, sizeof(clean));
     if (!clean[0]) return;
     char buf[1024];
-    if (terminal && hold)
-        /* single quotes keep the outer sh from expanding the shell reference,
-         * so it resolves inside the terminal where $SHELL is meaningful */
-        snprintf(buf, sizeof(buf), "%s sh -c '%s; exec %s'",
-                 TERMINAL_CMD, clean, TERMINAL_HOLD_SHELL);
-    else if (terminal)
+    if (terminal)
         snprintf(buf, sizeof(buf), "%s %s", TERMINAL_CMD, clean);
     else
         snprintf(buf, sizeof(buf), "%s", clean);
@@ -3783,12 +3772,6 @@ run_cmd_ex(const char *cmd, int terminal, int hold)
         execl("/bin/sh", "sh", "-c", buf, NULL);
         _exit(127);
     }
-}
-
-static void
-run_cmd(const char *cmd, int terminal)
-{
-    run_cmd_ex(cmd, terminal, 0);
 }
 
 /* Launch one of the companion GUIs with the current wallpaper accent. The
@@ -4771,8 +4754,6 @@ static const struct ext_workspace_manager_v1_listener ws_mgr_listener = {
  * alone in its row spans the full width. */
 enum {
     WS_ACT_ROW_MAIN = 0,   /* Speedtest + Screenshot */
-    WS_ACT_ROW_FASTFETCH,  /* Fastfetch, on its own row */
-    WS_ACT_ROW_UPDATER,    /* Updater, on its own row */
     WS_ACT_ROWS,
 };
 
@@ -4798,23 +4779,19 @@ static struct ws_popup g_wspop = { 0 };
 enum {
     WS_ACT_SPEEDTEST = 0,
     WS_ACT_SCREENSHOT,
-    WS_ACT_FASTFETCH,
-    WS_ACT_UPDATER,
     WS_ACT_COUNT,
 };
 
 #define WS_ACT_HIT_BASE (-5)
 
 static const char *const ws_act_label[WS_ACT_COUNT] = {
-    "Speedtest", "Screenshot", "Fastfetch", "Updater",
+    "Speedtest", "Screenshot",
 };
 
 /* Which row each action sits in, top to bottom. */
 static const unsigned char ws_act_row[WS_ACT_COUNT] = {
     [WS_ACT_SPEEDTEST]  = WS_ACT_ROW_MAIN,
     [WS_ACT_SCREENSHOT] = WS_ACT_ROW_MAIN,
-    [WS_ACT_FASTFETCH]  = WS_ACT_ROW_FASTFETCH,
-    [WS_ACT_UPDATER]    = WS_ACT_ROW_UPDATER,
 };
 
 /* Actions in the given row. */
@@ -4898,8 +4875,7 @@ wspop_wall_y(void)
     return g_wspop.y + MENU_PADDING;
 }
 
-/* Top of quick-action row r (0 = Speedtest/Screenshot, 1 = Fastfetch,
- * 2 = Updater). */
+/* Top of the quick-action row (Speedtest/Screenshot). */
 static double
 wspop_act_row_y(int r)
 {
@@ -5003,7 +4979,7 @@ wspop_hit_test(double px, double py)
     if (in_rect(px, py, g_wspop.x, wp_y, g_wspop.w, WS_WP_BTN_H))
         return -2;
 
-    /* Quick-action buttons (returned as -5, -6, -7) */
+    /* Quick-action buttons (returned as -5, -6) */
     for (int i = 0; i < WS_ACT_COUNT; i++) {
         if (in_rect(px, py, wspop_act_x(i), wspop_act_y(i),
                     wspop_act_w(i), WS_WP_BTN_H))
@@ -10021,66 +9997,6 @@ wspop_camera_icon(cairo_t *cr, double ix, double iy, double isz)
     cairo_stroke(cr);
 }
 
-/* Fastfetch icon: a terminal prompt (chevron plus cursor bar) filling the unit
- * square -- chevron touches the left, top and bottom edges, the bar reaches the
- * right edge. Both are stroked, so the path is inset by WS_ICON_INSET to keep
- * the ink on the same square as the other icons. */
-static void
-wspop_terminal_icon(cairo_t *cr, double ix, double iy, double isz)
-{
-    const double x0  = WS_ICON_INSET;              /* left edge of ink */
-    const double x1  = isz - WS_ICON_INSET;        /* right edge of ink */
-    const double y0  = WS_ICON_INSET;              /* top edge of ink */
-    const double y1  = isz - WS_ICON_INSET;        /* bottom edge of ink */
-    const double xm  = isz * 0.40;                 /* chevron point */
-    const double ym  = isz / 2.0;
-    const double bx  = isz * 0.56;                 /* cursor bar start */
-
-    /* chevron */
-    cairo_new_path(cr);
-    cairo_move_to(cr, ix + x0, iy + y0);
-    cairo_line_to(cr, ix + xm, iy + ym);
-    cairo_line_to(cr, ix + x0, iy + y1);
-    cairo_stroke(cr);
-
-    /* cursor bar */
-    cairo_new_path(cr);
-    cairo_move_to(cr, ix + bx, iy + y1);
-    cairo_line_to(cr, ix + x1, iy + y1);
-    cairo_stroke(cr);
-}
-
-/* Updater icon: a download arrow over a baseline, filling the unit square.
- * The shaft reaches the top edge, the baseline spans the full width, and both
- * are stroked so the path is inset by WS_ICON_INSET. */
-static void
-wspop_updater_icon(cairo_t *cr, double ix, double iy, double isz)
-{
-    const double x0 = WS_ICON_INSET;
-    const double x1 = isz - WS_ICON_INSET;
-    const double y0 = WS_ICON_INSET;
-    const double y1 = isz - WS_ICON_INSET;
-    const double cx = isz * 0.5;
-    const double head = 0.66;      /* arrow tip, fraction of the icon box */
-
-    /* shaft */
-    cairo_new_path(cr);
-    cairo_move_to(cr, ix + cx, iy + y0);
-    cairo_line_to(cr, ix + cx, iy + head * isz);
-
-    /* arrow head */
-    cairo_move_to(cr, ix + isz * 0.26, iy + isz * 0.40);
-    cairo_line_to(cr, ix + cx, iy + head * isz);
-    cairo_line_to(cr, ix + isz * 0.74, iy + isz * 0.40);
-    cairo_stroke(cr);
-
-    /* baseline */
-    cairo_new_path(cr);
-    cairo_move_to(cr, ix + x0, iy + y1);
-    cairo_line_to(cr, ix + x1, iy + y1);
-    cairo_stroke(cr);
-}
-
 /* One quick-action button of the workspace popup. */
 static void
 wspop_action_draw(cairo_t *cr, int i)
@@ -10101,12 +10017,6 @@ wspop_action_draw(cairo_t *cr, int i)
     switch (i) {
     case WS_ACT_SCREENSHOT:
         wspop_camera_icon(cr, ix, iy, isz);
-        break;
-    case WS_ACT_FASTFETCH:
-        wspop_terminal_icon(cr, ix, iy, isz);
-        break;
-    case WS_ACT_UPDATER:
-        wspop_updater_icon(cr, ix, iy, isz);
         break;
     default:
         wspop_speedtest_icon(cr, ix, iy, isz);
@@ -10154,11 +10064,6 @@ wspop_action_activate(int i)
     case WS_ACT_SCREENSHOT:
         wspop_action_screenshot();
         break;
-    case WS_ACT_FASTFETCH:
-        /* Held: fastfetch prints its report and exits immediately, so the
-         * terminal would vanish before the output could be read. */
-        run_cmd_ex("fastfetch", 1, 1);
-        break;
     case WS_ACT_SPEEDTEST: {
         /* jtspeedtest opens its own native Wayland window, so no terminal
          * wrapper is needed.  A click focuses the window if it is already
@@ -10167,18 +10072,6 @@ wspop_action_activate(int i)
         if (!focus_app_window("jtspeedtest")
                 && now_ms() - launched_at_ms > 1500) {
             theme_run_app(SPEEDTEST_CMD);
-            launched_at_ms = now_ms();
-        }
-        break;
-    }
-    case WS_ACT_UPDATER: {
-        /* Same launch/focus behavior as Speedtest; launching through
-         * theme_run_app() hands jtupdate the live wallpaper accent, and the
-         * control socket keeps it in sync while it runs. */
-        static int64_t launched_at_ms;
-        if (!focus_app_window("jtupdate")
-                && now_ms() - launched_at_ms > 1500) {
-            theme_run_app(UPDATER_CMD);
             launched_at_ms = now_ms();
         }
         break;
@@ -11191,7 +11084,7 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
                           PANGO_ELLIPSIZE_NONE, PANGO_ALIGN_LEFT);
         }
 
-        /* Quick-action row: Speedtest / Screenshot / Fastfetch / Updater */
+        /* Quick-action row: Speedtest / Screenshot */
         for (int i = 0; i < WS_ACT_COUNT; i++)
             wspop_action_draw(cr, i);
 

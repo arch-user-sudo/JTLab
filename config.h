@@ -127,8 +127,6 @@
 #define SPEEDTEST_CMD   "/usr/local/bin/jtspeedtest"
 /* Network control GUI. The bar's network icon toggles this window. */
 #define NETWORKS_CMD    "/usr/local/bin/jtnetworks"
-/* Repository updater GUI. The workspace popup's Updater button toggles it. */
-#define UPDATER_CMD     "/usr/local/bin/jtupdate"
 /* Settings GUI. The gear below the profile photo in the app menu's power
  * column toggles it. */
 #define SETTINGS_CMD    "/usr/local/bin/jtsettings"
@@ -136,11 +134,6 @@
  * as a quoted #RRGGBB argument (for example: "... \'#36B4EB\'"). When one is
  * already running, JTLab sends the new accent to its control socket so the
  * color changes live instead of restarting the window. */
-/* Shell exec'd after a "held" command finishes, so the terminal window stays
- * open and interactive. $SHELL is the user's login shell; the :- fallback keeps
- * it working in sessions where $SHELL is unset. */
-#define TERMINAL_HOLD_SHELL "\"${SHELL:-/bin/sh}\""
-
 /* Running app taskbar */
 #define TASKBAR_ICON    18
 #define TASKBAR_GAP     (PINNED_SPACING * 2)
@@ -256,8 +249,7 @@
  * in its row spans the full width. The popup is sized by the row holding the
  * most buttons, so WS_ACT_LABEL_W only has to fit the widest label within a
  * half-width button -- "Screenshot" measures ~72px at FONT_SIZE ("Speedtest"
- * and "Fastfetch" are both ~63px), with headroom so text never wraps inside
- * the fixed-height row. */
+ * is ~63px), with headroom so text never wraps inside the fixed-height row. */
 #define WS_ACT_BTN_GAP  8
 #define WS_ACT_PAD      10
 #define WS_ACT_LABEL_W  80
