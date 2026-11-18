@@ -3732,6 +3732,12 @@ exec_clean(const char *src, char *dst, size_t dst_sz)
 static void
 run_cmd_child_cleanup(void)
 {
+    /*
+     * JTLab ignores SIGCHLD to auto-reap its own children. Reset it for
+     * launched applications so system()/popen()/waitpid() work normally.
+     */
+    signal(SIGCHLD, SIG_DFL);
+
     int devnull = open("/dev/null", O_RDWR);
     if (devnull < 0) _exit(127);
     if (devnull != 0) dup2(devnull, 0);
