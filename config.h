@@ -125,6 +125,10 @@
 #define TERMINAL_CMD    "footclient"
 /* Speedtest GUI. Native Wayland client, launched directly (no terminal). */
 #define SPEEDTEST_CMD   "/usr/local/bin/jtspeedtest"
+/* Polkit authentication agent. Launched once by the bar with the wallpaper
+ * accent; set POLKIT_AUTOSTART to 0 to manage it yourself. */
+#define POLKIT_CMD      "/usr/local/bin/jtpolkit"
+#define POLKIT_AUTOSTART 1
 /* Network control GUI. The bar's network icon toggles this window. */
 #define NETWORKS_CMD    "/usr/local/bin/jtnetworks"
 /* Repository updater GUI. The workspace popup's Updater button toggles it. */

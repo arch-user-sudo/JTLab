@@ -3837,6 +3837,7 @@ static void
 theme_update_open_apps(void)
 {
     theme_send_accent("jtnetworks");
+    theme_send_accent("jtpolkit");
     theme_send_accent("jtspeedtest");
     theme_send_accent("jtupdate");
     theme_send_accent("jtwpi");
@@ -3844,6 +3845,23 @@ theme_update_open_apps(void)
     /* The compositor uses the same line protocol for the SSD close button and
      * the snap overlay, so a missing socket just means jtlabwc is not up yet. */
     theme_send_accent("jtlabwc");
+}
+
+/* Start the polkit agent once, with the current wallpaper accent. jtpolkit
+ * owns its control socket only while it is alive, so a present socket means
+ * an agent is already registered for this session. */
+static void
+theme_ensure_agent(void)
+{
+#if POLKIT_AUTOSTART
+    char path[256];
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (!rt || !rt[0]) rt = "/tmp";
+    snprintf(path, sizeof(path), "%s/jtpolkit-ctl.sock", rt);
+    if (access(path, F_OK) == 0)
+        return;
+    theme_run_app(POLKIT_CMD);
+#endif
 }
 
 /* The scrollable app list region for a given menu body height. Single source of
@@ -15699,6 +15717,7 @@ main(int argc, char *argv[])
 
     bar_init();
     wlp_load_wallpaper();
+    theme_ensure_agent();
     blue_load();
     poll_init();
     ctl_init();
