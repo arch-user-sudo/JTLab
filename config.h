@@ -130,6 +130,9 @@
 /* Settings GUI. The gear below the profile photo in the app menu's power
  * column toggles it. */
 #define SETTINGS_CMD    "/usr/local/bin/jtsettings"
+/* Screen locker. Launched with the current wallpaper accent like the other
+ * companion GUIs. */
+#define LOCK_CMD        "/usr/local/bin/jtgreeter --lock"
 /* The companion GUIs are launched with the current wallpaper accent appended
  * as a quoted #RRGGBB argument (for example: "... \'#36B4EB\'"). When one is
  * already running, JTLab sends the new accent to its control socket so the
