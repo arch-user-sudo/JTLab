@@ -12,6 +12,15 @@ LIBS    = -lwayland-client -lm -lpangocairo-1.0 -lpango-1.0 -lgobject-2.0 -lcair
 PREFIX  ?= /usr/local
 BINDIR  := $(PREFIX)/bin
 
+# First-run wallpaper bootstrap. jtlab scans $HOME/Wallpapers for the picker
+# and restores the active wallpaper from $HOME/.cache/wallpaper-browser/current.txt
+# (two lines: 0|1, then the absolute image path) whenever it starts.
+WALLPAPER_SRC  ?= yellow.jpg
+WALLPAPER_DIR  ?= $(HOME)/Wallpapers
+WALLPAPER_DEST := $(WALLPAPER_DIR)/$(notdir $(WALLPAPER_SRC))
+WP_STATE_DIR   := $(HOME)/.cache/wallpaper-browser
+WP_STATE_FILE  := $(WP_STATE_DIR)/current.txt
+
 PKGS    = wayland-client wayland-cursor pangocairo glib-2.0 gio-2.0 cairo librsvg-2.0 libpipewire-0.3 gdk-pixbuf-2.0 libsoup-3.0 xkbcommon
 
 CFLAGS  += $(shell pkg-config --cflags $(PKGS) 2>/dev/null | sed 's/-I/-isystem /g')
@@ -70,9 +79,21 @@ GAMMA_XML = $(PROTOCOL_DIR)/wlr-gamma-control-unstable-v1.xml
 SCREENCOPY_XML = $(PROTOCOL_DIR)/wlr-screencopy-unstable-v1.xml
 VKEYBOARD_XML = $(PROTOCOL_DIR)/virtual-keyboard-unstable-v1.xml
 
-all: jtlab jtlabctl
+all: jtlab jtlabctl wallpaper
 
 debug: jtlab-debug
+
+# Seed the wallpaper directory and the persisted state so the first launch has
+# a wallpaper. If setup already exists (the image is installed or a state file
+# is present), do nothing at all: no directories, no copy, no state write.
+wallpaper: $(WALLPAPER_SRC)
+	@if [ -e '$(WALLPAPER_DEST)' ] || [ -s '$(WP_STATE_FILE)' ]; then \
+	    echo 'wallpaper already set up; skipping'; \
+	else \
+	    mkdir -p '$(WALLPAPER_DIR)' '$(WP_STATE_DIR)'; \
+	    cp '$<' '$(WALLPAPER_DEST)'; \
+	    printf '1\n%s\n' '$(WALLPAPER_DEST)' > '$(WP_STATE_FILE)'; \
+	fi
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -171,11 +192,11 @@ jtlabctl: jtlabctl.c
 clean:
 	rm -rf $(BUILD_DIR) jtlab.o jtlab jtlabctl jtlab-debug
 
-install: jtlab jtlabctl
+install: jtlab jtlabctl wallpaper
 	install -Dm755 jtlab $(DESTDIR)$(BINDIR)/jtlab
 	install -Dm755 jtlabctl $(DESTDIR)$(BINDIR)/jtlabctl
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/jtlab $(DESTDIR)$(BINDIR)/jtlabctl
 
-.PHONY: all clean install uninstall debug strict tidy cppcheck
+.PHONY: all clean install uninstall debug strict tidy cppcheck wallpaper
