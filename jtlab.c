@@ -573,6 +573,99 @@ time_text_width(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Shared profile configuration
+ *
+ * Both jtsettings and JTLab use ~/.config/jt/profile.config. jtsettings owns
+ * the file (the Profile tab writes it); JTLab reads it at startup and whenever
+ * jtsettings sends "reload" to the control socket. The values in config.h are
+ * only fallbacks for a missing/unreadable file.
+ * ------------------------------------------------------------------------- */
+
+static struct {
+    char city[96];
+    char photo[512];
+    double zoom;
+    int fahrenheit;
+    int has_coords;
+    double lat, lon;
+} g_profile = {
+    .city = WEATHER_CITY,
+    .photo = PROFILE_PHOTO,
+    .zoom = 1.0,
+    .fahrenheit = 0,
+    .has_coords = 0,
+    .lat = 0.0,
+    .lon = 0.0,
+};
+
+static char *
+profile_trim(char *s)
+{
+    while (*s && isspace((unsigned char)*s)) s++;
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) end--;
+    *end = '\0';
+    return s;
+}
+
+static void
+profile_config_path(char *out, size_t n)
+{
+    const char *home = getenv("HOME");
+    snprintf(out, n, "%s/.config/jt/profile.config",
+             (home && home[0]) ? home : "/tmp");
+}
+
+static void
+profile_config_load(void)
+{
+    char path[512];
+    profile_config_path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        char *s = profile_trim(line);
+        if (!*s || *s == '#') continue;
+        char *eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = profile_trim(s);
+        char *val = profile_trim(eq + 1);
+
+        if (!strcmp(key, "weather_location")) {
+            if (*val)
+                snprintf(g_profile.city, sizeof(g_profile.city), "%s", val);
+        } else if (!strcmp(key, "weather_units")) {
+            g_profile.fahrenheit = !strcmp(val, "fahrenheit") ||
+                                   !strcmp(val, "f") ||
+                                   !strcmp(val, "degrees") ||
+                                   !strcmp(val, "°f");
+        } else if (!strcmp(key, "weather_latitude")) {
+            g_profile.lat = strtod(val, NULL);
+            g_profile.has_coords = 1;
+        } else if (!strcmp(key, "weather_longitude")) {
+            g_profile.lon = strtod(val, NULL);
+            g_profile.has_coords = 1;
+        } else if (!strcmp(key, "profile_photo")) {
+            snprintf(g_profile.photo, sizeof(g_profile.photo), "%s", val);
+        } else if (!strcmp(key, "profile_zoom")) {
+            double z = strtod(val, NULL);
+            if (z >= 1.0 && z <= 4.0)
+                g_profile.zoom = z;
+        }
+    }
+    fclose(f);
+
+    /* A coordinate pair only makes sense when both halves are present. */
+    if (g_profile.has_coords &&
+        (g_profile.lat < -90.0 || g_profile.lat > 90.0 ||
+         g_profile.lon < -180.0 || g_profile.lon > 180.0))
+        g_profile.has_coords = 0;
+}
+
+/* ---------------------------------------------------------------------------
  * Weather
  *
  * Current conditions live in the bar just outside the left edge of the
@@ -607,6 +700,7 @@ static struct {
     int pending;                 /* a request is in flight */
     double lat, lon;
     int have_loc;
+    unsigned generation;         /* bumps on reload; stale replies are dropped */
     SoupSession *session;
 } g_wx;
 
@@ -644,10 +738,31 @@ wx_cond_label(int cond)
     }
 }
 
-static void
-wx_deg_str(double t, char *out, size_t n)
+/* Open-Meteo always answers in Celsius; the unit choice is applied when we
+ * draw so toggling it in jtsettings never needs a new fetch. */
+static double
+wx_display_temp(double celsius)
 {
+    if (g_profile.fahrenheit)
+        return celsius * 9.0 / 5.0 + 32.0;
+    return celsius;
+}
+
+static void
+wx_deg_str(double celsius, char *out, size_t n)
+{
+    double t = wx_display_temp(celsius);
     snprintf(out, n, "%d°", (int)(t < 0 ? t - 0.5 : t + 0.5));
+}
+
+/* Slightly longer form for the forecast header, where there is room to spell
+ * out which scale the bare degree signs in the bar refer to. */
+static void
+wx_temp_str(double celsius, char *out, size_t n)
+{
+    double t = wx_display_temp(celsius);
+    snprintf(out, n, "%d°%s", (int)(t < 0 ? t - 0.5 : t + 0.5),
+             g_profile.fahrenheit ? "F" : "C");
 }
 
 /* The bar item reads as a bare temperature; the unit suffix only has room in
@@ -8550,8 +8665,9 @@ draw_lock_icon(cairo_t *cr, double cx, double cy)
 }
 
 /* Profile photo: a circle at the top of the power column, above the power
- * icons. Falls back to a drawn avatar when PROFILE_PHOTO is unset or the file
- * cannot be read, so the column always has something to show. */
+ * icons. The path and zoom come from ~/.config/jt/profile.config; falls back to
+ * a drawn avatar when no photo is set or the file cannot be read, so the column
+ * always has something to show. */
 static cairo_surface_t *g_avatar;
 static int g_avatar_tried;
 
@@ -8560,9 +8676,18 @@ avatar_load(void)
 {
     if (g_avatar_tried) return;
     g_avatar_tried = 1;
-    if (!PROFILE_PHOTO[0]) return;
-    cairo_surface_t *sf = png_load(PROFILE_PHOTO);
-    if (!sf) sf = icon_load_svg(PROFILE_PHOTO, PROFILE_PHOTO_SIZE);
+    if (!g_profile.photo[0]) return;
+
+    /* The portal can hand us any format GdkPixbuf understands (PNG, JPEG,
+     * WebP...), so try that first. PNG/SVG remain as fallbacks. */
+    GdkPixbuf *pb = gdk_pixbuf_new_from_file(g_profile.photo, NULL);
+    if (pb) {
+        g_avatar = surface_from_pixbuf(pb);
+        g_object_unref(pb);
+        return;
+    }
+    cairo_surface_t *sf = png_load(g_profile.photo);
+    if (!sf) sf = icon_load_svg(g_profile.photo, PROFILE_PHOTO_SIZE);
     g_avatar = sf;
 }
 
@@ -8608,17 +8733,22 @@ avatar_draw(cairo_t *cr)
         int iw = cairo_image_surface_get_width(g_avatar);
         int ih = cairo_image_surface_get_height(g_avatar);
         if (iw > 0 && ih > 0) {
-            /* scale by the SHORTER side so the image covers the whole circle
-             * and the overflow is cropped by the clip, rather than scaling by
-             * the longer side which would leave the circle part-filled */
+            /* Scale by the SHORTER side so the image covers the whole circle
+             * and the overflow is cropped by the clip. The zoom chosen in
+             * jtsettings after picking the file narrows the visible square
+             * around the image centre (1.0 = plain centre crop). */
             double mn = iw < ih ? iw : ih;
+            double zoom = g_profile.zoom;
+            if (zoom < 1.0) zoom = 1.0;
+            if (zoom > 4.0) zoom = 4.0;
+            double centre = mn / (2.0 * zoom);
             cairo_save(cr);
             cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
             cairo_clip(cr);
             cairo_translate(cr, cx - r, cy - r);
-            cairo_scale(cr, 2 * r / mn, 2 * r / mn);
+            cairo_scale(cr, 2 * r * zoom / mn, 2 * r * zoom / mn);
             cairo_set_source_surface(cr, g_avatar,
-                                     (mn - iw) / 2.0, (mn - ih) / 2.0);
+                                     centre - iw / 2.0, centre - ih / 2.0);
             cairo_paint(cr);
             cairo_restore(cr);
             avatar_ring(cr, cx, cy, r);
@@ -8909,8 +9039,9 @@ wx_cache_path(char *out, size_t n)
     snprintf(out, n, "%s/weather-loc", dir);
 }
 
-/* The cache records the city it was resolved for, so editing WEATHER_CITY
- * invalidates it without anyone having to remember to delete a file. */
+/* The cache records the city it was resolved for, so changing the location in
+ * jtsettings invalidates it without anyone having to remember to delete a file.
+ * A location with explicit coordinates does not need geocoding at all. */
 static void
 wx_loc_load(void)
 {
@@ -8950,7 +9081,7 @@ wx_loc_load(void)
     char *city = line;
     while (*city == ' ' || *city == '\t') city++;
 
-    if (strcmp(city, WEATHER_CITY) == 0) {
+    if (strcmp(city, g_profile.city) == 0) {
         g_wx.lat = la;
         g_wx.lon = lo;
         g_wx.have_loc = 1;
@@ -8964,7 +9095,7 @@ wx_loc_save(void)
     wx_cache_path(path, sizeof(path));
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "%s %.6f %.6f\n", WEATHER_CITY, g_wx.lat, g_wx.lon);
+    fprintf(f, "%s %.6f %.6f\n", g_profile.city, g_wx.lat, g_wx.lon);
     fclose(f);
 }
 
@@ -8987,8 +9118,10 @@ wx_get(const char *url, GAsyncReadyCallback cb)
     if (!g_wx.session) return;
     SoupMessage *msg = soup_message_new("GET", url);
     if (!msg) return;
+    /* Carry the generation so a reply from before a settings reload can be
+     * ignored instead of overwriting the new location's data. */
     soup_session_send_and_read_async(g_wx.session, msg, G_PRIORITY_DEFAULT,
-                                     NULL, cb, NULL);
+                                     NULL, cb, GUINT_TO_POINTER(g_wx.generation));
 }
 
 static void wx_fetch_forecast(void);
@@ -9024,7 +9157,7 @@ wx_parse_forecast(const char *js)
     g_wx.have = 1;
     g_wx.fetched = time(NULL);
     g_wx.retry_at = 0;
-    snprintf(g_wx.place, sizeof(g_wx.place), "%s", WEATHER_CITY);
+    snprintf(g_wx.place, sizeof(g_wx.place), "%s", g_profile.city);
 
     g_wx.n_days = 0;
     const char *daily = json_key(js, "daily");
@@ -9054,7 +9187,8 @@ wx_parse_forecast(const char *js)
 static void
 wx_forecast_finish(GObject *src, GAsyncResult *res, gpointer data)
 {
-    (void)data;
+    if (GPOINTER_TO_UINT(data) != g_wx.generation)
+        return;  /* a settings reload superseded this request */
     GError *err = NULL;
     GBytes *body = soup_session_send_and_read_finish(SOUP_SESSION(src), res, &err);
     g_wx.pending = 0;
@@ -9094,7 +9228,8 @@ wx_fetch_forecast(void)
 static void
 wx_geocode_finish(GObject *src, GAsyncResult *res, gpointer data)
 {
-    (void)data;
+    if (GPOINTER_TO_UINT(data) != g_wx.generation)
+        return;  /* a settings reload superseded this request */
     GError *err = NULL;
     GBytes *body = soup_session_send_and_read_finish(SOUP_SESSION(src), res, &err);
     g_wx.pending = 0;
@@ -9134,7 +9269,7 @@ wx_fetch_geocode(void)
 {
     char enc[192];
     char url[512];
-    wx_url_encode(WEATHER_CITY, enc, sizeof(enc));
+    wx_url_encode(g_profile.city, enc, sizeof(enc));
     snprintf(url, sizeof(url),
              "https://geocoding-api.open-meteo.com/v1/search?name=%s"
              "&count=1&language=en&format=json", enc);
@@ -9152,6 +9287,14 @@ wx_maybe_refresh(void)
 
     time_t now = time(NULL);
     if (now < g_wx.retry_at) return;
+
+    /* A location picked from search results carries exact coordinates, so it
+     * skips the geocoding round-trip (and its on-disk cache) entirely. */
+    if (g_profile.has_coords) {
+        g_wx.lat = g_profile.lat;
+        g_wx.lon = g_profile.lon;
+        g_wx.have_loc = 1;
+    }
 
     if (!g_wx.have_loc) {
         wx_loc_load();
@@ -11397,7 +11540,7 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
             double cur_y = head_y + 14;
             pango_layout_set_font_description(pl, wx_head_font());
             char tbuf[16];
-            wx_deg_str(g_wx.temp, tbuf, sizeof(tbuf));
+            wx_temp_str(g_wx.temp, tbuf, sizeof(tbuf));
             int ttw, tth;
             pango_layout_set_text(pl, tbuf, -1);
             pango_layout_get_pixel_size(pl, &ttw, &tth);
@@ -15580,6 +15723,55 @@ menu_toggle_ctl(void)
     render_request();
 }
 
+/* Re-read ~/.config/jt/profile.config after jtsettings writes it. Weather
+ * data is dropped only when the location actually changed; a unit switch is
+ * applied at draw time, and a new photo/zoom invalidates the cached avatar. */
+static void
+profile_config_reload(void)
+{
+    char old_city[sizeof(g_profile.city)];
+    char old_photo[sizeof(g_profile.photo)];
+    int old_coords = g_profile.has_coords;
+    double old_lat = g_profile.lat, old_lon = g_profile.lon;
+    double old_zoom = g_profile.zoom;
+    int old_fahrenheit = g_profile.fahrenheit;
+    snprintf(old_city, sizeof(old_city), "%s", g_profile.city);
+    snprintf(old_photo, sizeof(old_photo), "%s", g_profile.photo);
+
+    profile_config_load();
+
+    int place_changed = strcmp(old_city, g_profile.city) != 0 ||
+                        old_coords != g_profile.has_coords ||
+                        (g_profile.has_coords &&
+                         (fabs(old_lat - g_profile.lat) > 0.000001 ||
+                          fabs(old_lon - g_profile.lon) > 0.000001));
+    int photo_changed = strcmp(old_photo, g_profile.photo) != 0;
+    int zoom_changed = fabs(old_zoom - g_profile.zoom) > 0.0001;
+
+    if (place_changed) {
+        /* In-flight replies carry the old generation and are ignored. */
+        g_wx.generation++;
+        g_wx.pending = 0;
+        g_wx.have = 0;
+        g_wx.n_days = 0;
+        g_wx.fetched = 0;
+        g_wx.retry_at = 0;
+        g_wx.have_loc = g_profile.has_coords ? 1 : 0;
+        g_wx.lat = g_profile.lat;
+        g_wx.lon = g_profile.lon;
+        snprintf(g_wx.place, sizeof(g_wx.place), "%s", g_profile.city);
+    }
+    if (photo_changed) {
+        if (g_avatar)
+            cairo_surface_destroy(g_avatar);
+        g_avatar = NULL;
+        g_avatar_tried = 0;
+    }
+    if (place_changed || photo_changed || zoom_changed ||
+        old_fahrenheit != g_profile.fahrenheit)
+        render_request();
+}
+
 static gboolean
 ctl_incoming(GSocketService *service, GSocketConnection *conn,
              GObject *source_object, gpointer user_data)
@@ -15594,6 +15786,8 @@ ctl_incoming(GSocketService *service, GSocketConnection *conn,
             menu_toggle_ctl();
         else if (g_str_has_prefix(buf, "screenshot"))
             shot_begin();
+        else if (g_str_has_prefix(buf, "reload"))
+            profile_config_reload();
         else if (g_str_has_prefix(buf, "quit"))
             g_app.running = 0;
     }
@@ -15647,6 +15841,7 @@ main(int argc, char *argv[])
 
     init_signals();
     state_init();
+    profile_config_load();
     services_init();
 
     if (!wayland_init())

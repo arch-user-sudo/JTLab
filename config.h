@@ -76,9 +76,11 @@
 #define POWER_ROW_H     32
 
 /* Profile photo, drawn as a circle above the power icons in that column.
- * Point this at an image file (PNG works, SVG is scaled to PROFILE_PHOTO_SIZE),
- * e.g. "/home/lynch/Pictures/me.png". Leave it empty -- or point it at a file
- * that does not exist -- to get the built-in default avatar. */
+ * This is the built-in default; at runtime JTLab reads the photo (and its
+ * zoom) from ~/.config/jt/profile.config, written by the Profile tab in
+ * jtsettings. Any format GdkPixbuf understands works (PNG, JPEG, WebP...);
+ * SVG falls back to librsvg. Leave the config value empty -- or point it at
+ * a missing file -- to get the drawn default avatar. */
 #define PROFILE_PHOTO       ""
 #define PROFILE_PHOTO_SIZE  26
 #define MENU_SHADOW_W   0
@@ -162,8 +164,11 @@
 
 /* Weather: current conditions, drawn *outside* the status pill on its left
  * (a glyph plus the temperature). Clicking it opens the forecast popup.
- * Sourced from Open-Meteo, which needs no API key. WEATHER_CITY is resolved to
- * coordinates once by the geocoding endpoint and the result is cached under
+ * Sourced from Open-Meteo, which needs no API key. WEATHER_CITY is the startup
+ * fallback: the active location and temperature unit come from
+ * ~/.config/jt/profile.config (written by jtsettings), which is re-read on a
+ * "reload" command to the control socket. A location without saved coordinates
+ * is resolved by the geocoding endpoint once and cached under
  * $XDG_CACHE_HOME/jtlab, so each refresh afterwards costs a single forecast
  * request. Set WEATHER_ENABLED to 0 to drop the item and close its gap again. */
 #define WEATHER_ENABLED     1
