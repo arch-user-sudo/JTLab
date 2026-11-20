@@ -375,6 +375,7 @@ struct sys_stats {
     char status[16];
     guint props_sig;
     guint owner_sig;
+    uint32_t mpris_gen;           /* bumped on player change; stale replies ignored */
     int64_t last_refresh_ms;
     int ctrl_hover;
 };
@@ -491,13 +492,18 @@ time_now(char *buf, size_t n)
     ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
 
 static PangoContext *g_pango_ctx;
+static PangoLayout *g_clock_layout;
+static cairo_t *g_clock_bound_cr;
+static char g_clock_prev[24] = "";
 
 static PangoLayout *
 pango_ctx_layout(cairo_t *cr)
 {
     if (!g_pango_ctx)
         g_pango_ctx = pango_cairo_create_context(cr);
+    if (!g_pango_ctx) return NULL;
     PangoLayout *pl = pango_layout_new(g_pango_ctx);
+    if (!pl) return NULL;
     pango_cairo_update_layout(cr, pl);
     return pl;
 }
@@ -505,27 +511,35 @@ pango_ctx_layout(cairo_t *cr)
 static PangoLayout *
 clock_layout(cairo_t *cr)
 {
-    static PangoLayout *pl = NULL;
-    static cairo_t *bound_cr = NULL;
-    static char prev[24] = "";
     if (!g_pango_ctx)
         g_pango_ctx = pango_cairo_create_context(cr);
-    if (!pl) {
-        pl = pango_layout_new(g_pango_ctx);
+    if (!g_pango_ctx) return NULL;
+    if (!g_clock_layout) {
+        g_clock_layout = pango_layout_new(g_pango_ctx);
+        if (!g_clock_layout) return NULL;
         PangoFontDescription *pfd = pango_font_description_from_string(FONT_FAMILY);
         pango_font_description_set_absolute_size(pfd, FONT_SIZE * PANGO_SCALE);
-        pango_layout_set_font_description(pl, pfd);
+        pango_layout_set_font_description(g_clock_layout, pfd);
         pango_font_description_free(pfd);
     }
-    if (bound_cr != cr) {
-        pango_cairo_update_layout(cr, pl);
-        bound_cr = cr;
+    if (g_clock_bound_cr != cr) {
+        pango_cairo_update_layout(cr, g_clock_layout);
+        g_clock_bound_cr = cr;
     }
-    if (strcmp(prev, g_box.time_str) != 0) {
-        pango_layout_set_text(pl, g_box.time_str, -1);
-        snprintf(prev, sizeof(prev), "%s", g_box.time_str);
+    if (strcmp(g_clock_prev, g_box.time_str) != 0) {
+        pango_layout_set_text(g_clock_layout, g_box.time_str, -1);
+        snprintf(g_clock_prev, sizeof(g_clock_prev), "%s", g_box.time_str);
     }
-    return pl;
+    return g_clock_layout;
+}
+
+static void
+pango_cache_shutdown(void)
+{
+    g_clear_object(&g_clock_layout);
+    g_clock_bound_cr = NULL;
+    g_clock_prev[0] = '\0';
+    g_clear_object(&g_pango_ctx);
 }
 
 /* Text drawn from a fractional origin gets re-hinted by cairo and its stems
@@ -545,6 +559,7 @@ text_width_px(const char *text)
     PangoFontDescription *pfd = pango_font_description_from_string(FONT_FAMILY);
     pango_font_description_set_absolute_size(pfd, FONT_SIZE * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(g_bar.cr);
+    if (!pl) { pango_font_description_free(pfd); return 0; }
     pango_layout_set_font_description(pl, pfd);
     pango_layout_set_text(pl, text, -1);
     int tw, th;
@@ -925,6 +940,7 @@ static struct {
     struct pw_registry *registry;
     struct spa_hook registry_listener;
     struct pw_metadata *metadata;
+    uint32_t metadata_id;
     struct spa_hook metadata_listener;
     struct audio_dev devices[PW_MAX_DEVICES];
     _Atomic int n_devices;
@@ -1057,6 +1073,7 @@ registry_event_global(void *data, uint32_t id, uint32_t permissions,
             g_pw.registry, id, type,
             version < PW_VERSION_METADATA ? version : PW_VERSION_METADATA, 0);
         if (g_pw.metadata) {
+            g_pw.metadata_id = id;
             spa_zero(g_pw.metadata_listener);
             pw_metadata_add_listener(g_pw.metadata, &g_pw.metadata_listener,
                                      &metadata_events, NULL);
@@ -1069,6 +1086,19 @@ static void
 registry_event_global_remove(void *data, uint32_t id)
 {
     (void)data;
+    /* A metadata object can be replaced (e.g. when WirePlumber restarts).
+     * Drop the old proxy here instead of leaving a stale pointer that a later
+     * pw_disconnect() would destroy a second time. */
+    if (g_pw.metadata && g_pw.metadata_id == id) {
+        spa_hook_remove(&g_pw.metadata_listener);
+        pw_proxy_destroy((struct pw_proxy *)g_pw.metadata);
+        g_pw.metadata = NULL;
+        g_pw.metadata_id = 0;
+        g_pw.default_sink_valid = 0;
+        g_pw.default_source_valid = 0;
+        render_request();
+        return;
+    }
     for (int i = 0; i < g_pw.n_devices; i++) {
         if (g_pw.devices[i].id != id) continue;
         struct audio_dev *d = &g_pw.devices[i];
@@ -1149,24 +1179,32 @@ node_event_param(void *data, int seq, uint32_t id, uint32_t index,
          * -Wcast-align from treating this known-aligned cast as a bug. */
         const void *raw = body + off;
         const struct spa_pod_prop *prop = raw;
-        uint32_t padded = (uint32_t)SPA_ROUND_UP_N(SPA_POD_PROP_SIZE(prop), 8);
-        if (padded == 0 || off + padded > body_size) break;
+        uint32_t prop_size = SPA_POD_PROP_SIZE(prop);
+        if (prop_size == 0 || prop_size > body_size - off) break;
+        uint32_t padded = (uint32_t)SPA_ROUND_UP_N(prop_size, 8);
+        if (padded > body_size - off) break;
+        uint32_t value_size = SPA_POD_BODY_SIZE(&prop->value);
+        if (value_size > prop_size) { off += padded; continue; }
 
         if (prop->key == SPA_PROP_channelVolumes && prop->value.type == SPA_TYPE_Array) {
-            const struct spa_pod_array_body *arr =
-                (const struct spa_pod_array_body *)SPA_POD_BODY(&prop->value);
-            uint32_t child_size = arr->child.size;
-            if (child_size == sizeof(float)) {
-                const void *data_ptr = (const uint8_t *)arr + sizeof(*arr);
-                uint32_t data_size = (uint32_t)(SPA_POD_BODY_SIZE(&prop->value) - sizeof(*arr));
-                n_ch = (int)(data_size / child_size);
-                if (n_ch > 64) n_ch = 64;
-                const float *vol_data = data_ptr;
-                for (int i = 0; i < n_ch; i++)
-                    volumes[i] = vol_data[i];
+            /* A truncated array pod must not make the subtraction below wrap. */
+            if (value_size >= sizeof(struct spa_pod_array_body)) {
+                const struct spa_pod_array_body *arr =
+                    (const struct spa_pod_array_body *)SPA_POD_BODY(&prop->value);
+                uint32_t child_size = arr->child.size;
+                if (child_size == sizeof(float)) {
+                    const void *data_ptr = (const uint8_t *)arr + sizeof(*arr);
+                    uint32_t data_size = value_size - (uint32_t)sizeof(*arr);
+                    int avail = (int)(data_size / child_size);
+                    n_ch = avail > 64 ? 64 : avail;
+                    const float *vol_data = data_ptr;
+                    for (int i = 0; i < n_ch; i++)
+                        volumes[i] = vol_data[i];
+                }
             }
         } else if (prop->key == SPA_PROP_mute && prop->value.type == SPA_TYPE_Bool) {
-            muted = *(const uint32_t *)SPA_POD_BODY(&prop->value) ? 1 : 0;
+            if (value_size >= sizeof(uint32_t))
+                muted = *(const uint32_t *)SPA_POD_BODY(&prop->value) ? 1 : 0;
         }
         off += padded;
     }
@@ -1356,6 +1394,7 @@ pw_disconnect(void)
         spa_hook_remove(&g_pw.metadata_listener);
         pw_proxy_destroy((struct pw_proxy *)g_pw.metadata);
         g_pw.metadata = NULL;
+        g_pw.metadata_id = 0;
     }
     pw_drop_core();
 
@@ -1643,13 +1682,32 @@ app_add(const char *name, const char *exec, const char *icon, const char *deskto
         g_app.apps = new_apps;
         g_app.apps_cap = new_cap;
     }
-    g_app.apps[g_app.n_apps].name = strdup(name);
-    g_app.apps[g_app.n_apps].exec = strdup(exec);
-    g_app.apps[g_app.n_apps].icon_name = (icon && icon[0]) ? strdup(icon) : NULL;
-    g_app.apps[g_app.n_apps].desktop_id = (desktop_id && desktop_id[0]) ? strdup(desktop_id) : NULL;
-    g_app.apps[g_app.n_apps].wm_class = (wm_class && wm_class[0]) ? strdup(wm_class) : NULL;
-    g_app.apps[g_app.n_apps].icon = NULL;
-    g_app.apps[g_app.n_apps].terminal = terminal;
+    /* Build the entry off to the side so an OOM cannot publish a partially
+     * initialized record — qsort()/app_compare() would then hit a NULL name. */
+    char *s_name = strdup(name);
+    char *s_exec = strdup(exec);
+    char *s_icon = (icon && icon[0]) ? strdup(icon) : NULL;
+    char *s_desktop = (desktop_id && desktop_id[0]) ? strdup(desktop_id) : NULL;
+    char *s_wm = (wm_class && wm_class[0]) ? strdup(wm_class) : NULL;
+    if (!s_name || !s_exec || ((icon && icon[0]) && !s_icon) ||
+        ((desktop_id && desktop_id[0]) && !s_desktop) ||
+        ((wm_class && wm_class[0]) && !s_wm)) {
+        free(s_name);
+        free(s_exec);
+        free(s_icon);
+        free(s_desktop);
+        free(s_wm);
+        return;
+    }
+
+    struct app_entry *a = &g_app.apps[g_app.n_apps];
+    a->name = s_name;
+    a->exec = s_exec;
+    a->icon_name = s_icon;
+    a->desktop_id = s_desktop;
+    a->wm_class = s_wm;
+    a->icon = NULL;
+    a->terminal = terminal;
     g_app.n_apps++;
 }
 
@@ -1742,18 +1800,19 @@ icon_theme_name(void)
     return name[0] ? name : NULL;
 }
 
+static cairo_surface_t *g_icon_fallback;
+
 static cairo_surface_t *
 icon_fallback(void)
 {
-    static cairo_surface_t *s;
-    if (s) return s;
-    s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 64, 64);
-    cairo_t *cr = cairo_create(s);
+    if (g_icon_fallback) return g_icon_fallback;
+    g_icon_fallback = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 64, 64);
+    cairo_t *cr = cairo_create(g_icon_fallback);
     cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
     cairo_arc(cr, 32, 32, 22, 0, 2 * M_PI);
     cairo_fill(cr);
     cairo_destroy(cr);
-    return s;
+    return g_icon_fallback;
 }
 
 struct icon_theme_dir {
@@ -2953,6 +3012,7 @@ struct tray_menu {
     int height;
     int hover_row;
     guint signal_id;
+    uint32_t gen;                 /* bumped on every request; stale replies ignored */
     char bus[256];
     char path[256];
 };
@@ -3100,11 +3160,18 @@ tray_menu_parse_items(GVariant *items, gint32 parent_id, int depth)
 static void
 tray_menu_fetch_done(GObject *source, GAsyncResult *res, gpointer user_data)
 {
-    (void)source; (void)user_data;
+    uint32_t gen = GPOINTER_TO_UINT(user_data);
     GError *err = NULL;
-    GVariant *reply = g_dbus_connection_call_finish(g_sni.dbus_conn, res, &err);
+    GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &err);
     if (err) {
         g_clear_error(&err);
+        return;
+    }
+
+    /* A newer fetch may have been issued (menu closed/reopened, or another
+     * LayoutUpdated). Its reply is the only one that should populate the menu. */
+    if (!g_tm.open || gen != g_tm.gen) {
+        g_variant_unref(reply);
         return;
     }
 
@@ -3158,9 +3225,11 @@ tray_menu_fetch(void)
     };
     GVariant *props = g_variant_new_strv(names, -1);
     GVariant *params = g_variant_new("(ii@as)", 0, -1, props);
+    g_tm.gen++;
     g_dbus_connection_call(g_sni.dbus_conn, g_tm.bus, g_tm.path,
         "com.canonical.dbusmenu", "GetLayout", params,
-        NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, tray_menu_fetch_done, NULL);
+        NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL,
+        tray_menu_fetch_done, GUINT_TO_POINTER(g_tm.gen));
     g_dbus_connection_flush_sync(g_sni.dbus_conn, NULL, NULL);
 }
 
@@ -3228,9 +3297,9 @@ tray_menu_hit_test(double px, double py)
 static void
 tray_menu_event_done(GObject *source, GAsyncResult *res, gpointer user_data)
 {
-    (void)source; (void)user_data;
+    (void)user_data;
     GError *err = NULL;
-    GVariant *v = g_dbus_connection_call_finish(g_sni.dbus_conn, res, &err);
+    GVariant *v = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &err);
     if (err) {
         g_clear_error(&err);
     }
@@ -3597,13 +3666,27 @@ tray_init(void)
 static void
 tray_shutdown(void)
 {
+    /* Drop an open DBusMenu's subscription and entries before the connection
+     * goes away. Done inline rather than via tray_menu_close() because the
+     * latter pokes the (already torn down) bar surfaces through
+     * popup_size_changed(). */
+    if (g_tm.signal_id) {
+        g_dbus_connection_signal_unsubscribe(g_sni.dbus_conn, g_tm.signal_id);
+        g_tm.signal_id = 0;
+    }
+    tray_menu_free_entries();
+    g_tm.open = 0;
+    g_tm.bus[0] = 0;
+    g_tm.path[0] = 0;
+
     for (int i = 0; i < g_sni.n_tray; i++)
         tray_item_destroy(&g_tray[i]);
     g_sni.n_tray = 0;
     if (g_sni.owner) g_bus_unown_name(g_sni.owner);
     g_sni.owner = 0;
     if (g_sni.dbus_conn) {
-        g_dbus_connection_unregister_object(g_sni.dbus_conn, g_sni.obj_reg);
+        if (g_sni.obj_reg)
+            g_dbus_connection_unregister_object(g_sni.dbus_conn, g_sni.obj_reg);
         g_object_unref(g_sni.dbus_conn);
         g_sni.dbus_conn = NULL;
     }
@@ -4054,7 +4137,13 @@ menu_filter_update(void)
     if (g_app.apps_cap > g_app.menu_idx_cap) {
         int cap = g_app.apps_cap > 0 ? g_app.apps_cap : 64;
         int *ni = realloc(g_app.menu_idx, (size_t)cap * sizeof(*g_app.menu_idx));
-        if (!ni) return;
+        if (!ni) {
+            /* Keep the cached index list consistent with the app array even
+             * when the grow fails: stale indices could outlive a dropped app. */
+            g_app.menu_n = 0;
+            g_app.menu_sel = 0;
+            return;
+        }
         g_app.menu_idx = ni;
         g_app.menu_idx_cap = cap;
     }
@@ -4733,9 +4822,12 @@ workspaces_compact_proxies(void)
         if (p->removed) continue;
         if (n != i) {
             g_ws_proxies[n] = *p;
-            ext_workspace_handle_v1_add_listener(g_ws_proxies[n].handle,
-                                                 &ws_handle_listener,
-                                                 &g_ws_proxies[n]);
+            /* The proxy already has a listener installed from ws_mgr_workspace().
+             * add_listener() would refuse a second one and leave user_data
+             * pointing at the old (now overwritten) array slot. Update only
+             * the user_data so events reach the struct at its new position. */
+            wl_proxy_set_user_data((struct wl_proxy *)g_ws_proxies[n].handle,
+                                   &g_ws_proxies[n]);
         }
         n++;
     }
@@ -4758,6 +4850,18 @@ workspaces_sync_from_proxies(void)
     }
     g_ws.ws_count = n;
     render_request();
+}
+
+/* g_workspaces[] mirrors the proxy handles, but the mirror is only refreshed
+ * on manager.done(). A workspace can be removed before that event arrives, so
+ * clear the cached pointer the moment its handle is destroyed. */
+static void
+workspaces_clear_cached_handle(struct ext_workspace_handle_v1 *handle)
+{
+    if (!handle) return;
+    for (int i = 0; i < WS_MAX; i++)
+        if (g_workspaces[i].handle == handle)
+            g_workspaces[i].handle = NULL;
 }
 
 static void
@@ -4823,7 +4927,14 @@ static void
 ws_handle_removed(void *data, struct ext_workspace_handle_v1 *h)
 {
     struct ws_proxy *p = data;
-    (void)h;
+    if (p->handle) {
+        workspaces_clear_cached_handle(p->handle);
+        ext_workspace_handle_v1_destroy(p->handle);
+        p->handle = NULL;
+    } else if (h) {
+        workspaces_clear_cached_handle(h);
+        ext_workspace_handle_v1_destroy(h);
+    }
     p->removed = 1;
 }
 
@@ -4839,16 +4950,25 @@ static const struct ext_workspace_handle_v1_listener ws_handle_listener = {
 static void
 ws_mgr_workspace_group(void *data, struct ext_workspace_manager_v1 *m,
     struct ext_workspace_group_handle_v1 *group)
-{ (void)data; (void)m; (void)group; }
+{
+    (void)data; (void)m;
+    if (group)
+        ext_workspace_group_handle_v1_destroy(group);
+}
 
 static void
 ws_mgr_workspace(void *data, struct ext_workspace_manager_v1 *m,
     struct ext_workspace_handle_v1 *handle)
 {
     (void)data; (void)m;
-    if (g_ws.ws_proxies_n >= WS_MAX) return;
+    if (g_ws.ws_proxies_n >= WS_MAX) {
+        if (handle)
+            ext_workspace_handle_v1_destroy(handle);
+        return;
+    }
     struct ws_proxy *p = &g_ws_proxies[g_ws.ws_proxies_n++];
     p->handle = handle;
+    p->name[0] = '\0';
     p->state = 0;
     p->removed = 0;
     ext_workspace_handle_v1_add_listener(handle, &ws_handle_listener, p);
@@ -4865,6 +4985,12 @@ static void
 ws_mgr_finished(void *data, struct ext_workspace_manager_v1 *m)
 {
     (void)data;
+    for (int i = 0; i < g_ws.ws_proxies_n; i++) {
+        if (g_ws_proxies[i].handle) {
+            ext_workspace_handle_v1_destroy(g_ws_proxies[i].handle);
+            g_ws_proxies[i].handle = NULL;
+        }
+    }
     if (g_wl.ext_ws_mgr == m) g_wl.ext_ws_mgr = NULL;
     ext_workspace_manager_v1_destroy(m);
     g_ws.ws_proxies_n = 0;
@@ -5828,7 +5954,9 @@ struct wall_entry {
 };
 
 struct wall_entry_staging {
-    GdkPixbuf *pb;
+    /* Written by the loader thread, consumed by the render thread. Atomic so
+     * publication has a happens-before relationship with consumption. */
+    _Atomic(GdkPixbuf *) pb;
 };
 
 struct wall_popup {
@@ -6292,10 +6420,10 @@ wlp_free_thumbs(void)
     for (int i = 0; i < g_wlp.n_entries; i++) {
         if (g_wlp.entries[i].thumb)
             cairo_surface_destroy(g_wlp.entries[i].thumb);
-        if (g_wlp.staging[i].pb)
-            g_object_unref(g_wlp.staging[i].pb);
+        GdkPixbuf *pb = atomic_exchange(&g_wlp.staging[i].pb, NULL);
+        if (pb)
+            g_object_unref(pb);
         g_wlp.entries[i].thumb = NULL;
-        g_wlp.staging[i].pb = NULL;
     }
     g_wlp.n_entries = 0;
     atomic_store(&g_wlp.loaded_count, 0);
@@ -6355,7 +6483,9 @@ wlp_scan(void)
         snprintf(we->name, sizeof(we->name), "%.*s", (int)(l > 20 ? 17 : l), n);
         if (l > 20) strcat(we->name, "...");
         we->thumb = NULL;
-        g_wlp.staging[g_wlp.n_entries].pb = NULL;
+        /* staging atomics are already initialized (statically or by a prior
+         * scan); atomic_init() on an initialized object is undefined behavior. */
+        atomic_store(&g_wlp.staging[g_wlp.n_entries].pb, NULL);
         g_wlp.n_entries++;
     }
     closedir(dir);
@@ -6401,7 +6531,7 @@ wlp_loader_thread(gpointer data)
         if (pb) {
             if (!cache_ok && src_ok)
                 gdk_pixbuf_save(pb, cpath, "png", NULL, NULL);
-            g_wlp.staging[i].pb = pb;
+            atomic_store(&g_wlp.staging[i].pb, pb);
         }
         atomic_fetch_add(&g_wlp.loaded_count, 1);
     }
@@ -6742,8 +6872,10 @@ output_bg_surface_create(struct output_entry *o)
     /* Empty input region: the wallpaper sits behind everything and must never
      * swallow pointer events meant for the desktop. */
     struct wl_region *region = wl_compositor_create_region(g_wl.compositor);
-    wl_surface_set_input_region(surf, region);
-    wl_region_destroy(region);
+    if (region) {
+        wl_surface_set_input_region(surf, region);
+        wl_region_destroy(region);
+    }
     wl_surface_commit(surf);
 }
 
@@ -7730,10 +7862,11 @@ wlp_draw(cairo_t *cr, PangoLayout *pl)
     int loaded = atomic_load(&g_wlp.loaded_count);
     int need_render = 0;
     for (int i = 0; i < g_wlp.n_entries; i++) {
-        if (!g_wlp.entries[i].thumb && g_wlp.staging[i].pb) {
-            g_wlp.entries[i].thumb = surface_from_pixbuf(g_wlp.staging[i].pb);
-            g_object_unref(g_wlp.staging[i].pb);
-            g_wlp.staging[i].pb = NULL;
+        if (g_wlp.entries[i].thumb) continue;
+        GdkPixbuf *pb = atomic_exchange(&g_wlp.staging[i].pb, NULL);
+        if (pb) {
+            g_wlp.entries[i].thumb = surface_from_pixbuf(pb);
+            g_object_unref(pb);
             need_render = 1;
         }
     }
@@ -8925,6 +9058,7 @@ art_download_start(const char *url, const char *cache)
     if (!msg) return;
     soup_session_send_and_read_async(g_sni.art_session, msg, G_PRIORITY_DEFAULT,
                                      NULL, art_download_finish, g_strdup(cache));
+    g_object_unref(msg);
 }
 
 /* ---- weather fetching ----
@@ -9099,7 +9233,7 @@ wx_loc_save(void)
     fclose(f);
 }
 
-static void
+static int
 wx_get(const char *url, GAsyncReadyCallback cb)
 {
     /* A SoupSession binds to the thread-default context when it is created, and
@@ -9115,13 +9249,15 @@ wx_get(const char *url, GAsyncReadyCallback cb)
         if (g_wx.session)
             soup_session_set_user_agent(g_wx.session, WEATHER_UA);
     }
-    if (!g_wx.session) return;
+    if (!g_wx.session) return 0;
     SoupMessage *msg = soup_message_new("GET", url);
-    if (!msg) return;
+    if (!msg) return 0;
     /* Carry the generation so a reply from before a settings reload can be
      * ignored instead of overwriting the new location's data. */
     soup_session_send_and_read_async(g_wx.session, msg, G_PRIORITY_DEFAULT,
                                      NULL, cb, GUINT_TO_POINTER(g_wx.generation));
+    g_object_unref(msg);
+    return 1;
 }
 
 static void wx_fetch_forecast(void);
@@ -9222,7 +9358,10 @@ wx_fetch_forecast(void)
              "&timezone=auto&forecast_days=%d",
              g_wx.lat, g_wx.lon, WEATHER_DAYS);
     g_wx.pending = 1;
-    wx_get(url, wx_forecast_finish);
+    if (!wx_get(url, wx_forecast_finish)) {
+        g_wx.pending = 0;
+        g_wx.retry_at = time(NULL) + WEATHER_RETRY_SEC;
+    }
 }
 
 static void
@@ -9274,7 +9413,10 @@ wx_fetch_geocode(void)
              "https://geocoding-api.open-meteo.com/v1/search?name=%s"
              "&count=1&language=en&format=json", enc);
     g_wx.pending = 1;
-    wx_get(url, wx_geocode_finish);
+    if (!wx_get(url, wx_geocode_finish)) {
+        g_wx.pending = 0;
+        g_wx.retry_at = time(NULL) + WEATHER_RETRY_SEC;
+    }
 }
 
 /* Called from the periodic tick. Resolves the city on the first run and after
@@ -9370,10 +9512,17 @@ static void mpris_props_cb(GDBusConnection *conn, const gchar *sender,
 static void
 mpris_fetch_meta(GObject *src, GAsyncResult *res, gpointer data)
 {
-    (void)src; (void)data;
+    uint32_t gen = GPOINTER_TO_UINT(data);
     GError *err = NULL;
-    GVariant *reply = g_dbus_connection_call_finish(g_sni.dbus_conn, res, &err);
+    GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(src), res, &err);
     if (err) { g_error_free(err); return; }
+
+    /* A reply from a previous player must not overwrite the current one's
+     * metadata or kick off an art download for the old track. */
+    if (gen != g_sys.mpris_gen) {
+        g_variant_unref(reply);
+        return;
+    }
 
     GVariant *props = g_variant_get_child_value(reply, 0);
 #ifdef JTLAB_DEBUG
@@ -9488,16 +9637,20 @@ static void
 mpris_fetch(void)
 {
     if (!g_sni.dbus_conn || !g_sys.player_bus[0]) return;
+    g_sys.mpris_gen++;
     g_dbus_connection_call(g_sni.dbus_conn, g_sys.player_bus,
         "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties",
         "GetAll", g_variant_new("(s)", "org.mpris.MediaPlayer2.Player"),
         G_VARIANT_TYPE("(a{sv})"), G_DBUS_CALL_FLAGS_NONE, -1, NULL,
-        mpris_fetch_meta, NULL);
+        mpris_fetch_meta, GUINT_TO_POINTER(g_sys.mpris_gen));
 }
 
 static void
 mpris_clear_player(void)
 {
+    /* Invalidate any in-flight metadata fetch so a late reply cannot repopulate
+     * the fields we are about to clear. */
+    g_sys.mpris_gen++;
     g_sys.track[0] = g_sys.artist[0] = g_sys.album[0] = g_sys.status[0] = 0;
     g_sys.track_id[0] = 0;
     g_sys.art_path[0] = 0;
@@ -9525,9 +9678,9 @@ mpris_set_player(const char *bus)
 static void
 mpris_list_names_cb(GObject *src, GAsyncResult *res, gpointer data)
 {
-    (void)src; (void)data;
+    (void)data;
     GError *err = NULL;
-    GVariant *reply = g_dbus_connection_call_finish(g_sni.dbus_conn, res, &err);
+    GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(src), res, &err);
     if (err) { g_error_free(err); return; }
 
     char pick[sizeof(g_sys.player_bus)];
@@ -9650,6 +9803,7 @@ sys_draw_text(cairo_t *cr, double x, double y, double w, double h,
     PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
     pango_font_description_set_absolute_size(fd, size * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(cr);
+    if (!pl) { pango_font_description_free(fd); return; }
     pango_layout_set_font_description(pl, fd);
     pango_layout_set_text(pl, text, -1);
     pango_layout_set_width(pl, (int)(w * PANGO_SCALE));
@@ -11702,6 +11856,7 @@ bar_draw(struct bar *b)
     PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
     pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(cr);
+    if (!pl) { pango_font_description_free(fd); return; }
     pango_layout_set_font_description(pl, fd);
 
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
@@ -11958,18 +12113,20 @@ bar_draw(struct bar *b)
         double cx = bell_x + bell_sz / 2.0;
 
         PangoLayout *clk = clock_layout(cr);
-        int clk_tw, clk_th;
-        pango_layout_get_pixel_size(clk, &clk_tw, &clk_th);
-        double clk_x = bell_x - TRAY_GAP - clk_tw;
+        if (clk) {
+            int clk_tw, clk_th;
+            pango_layout_get_pixel_size(clk, &clk_tw, &clk_th);
+            double clk_x = bell_x - TRAY_GAP - clk_tw;
 
-        if (g_pointer.hover_clock) {
-            draw_hover_row(cr, clk_x - 7, bar_y + 4, clk_tw + 14,
-                           BAR_HEIGHT - 8, PRADIUS, MENU_HOVER_A);
+            if (g_pointer.hover_clock) {
+                draw_hover_row(cr, clk_x - 7, bar_y + 4, clk_tw + 14,
+                               BAR_HEIGHT - 8, PRADIUS, MENU_HOVER_A);
+            }
+
+            cairo_set_source_rgba(cr, COLOR(FG_HEX), FG_A);
+            cairo_move_to(cr, clk_x, bar_y + (bar_h - clk_th) / 2.0);
+            pango_cairo_show_layout(cr, clk);
         }
-
-        cairo_set_source_rgba(cr, COLOR(FG_HEX), FG_A);
-        cairo_move_to(cr, clk_x, bar_y + (bar_h - clk_th) / 2.0);
-        pango_cairo_show_layout(cr, clk);
 
         if (g_pointer.hover_bell) draw_hover_circle(cr, cx, bell_y + bell_sz / 2.0, bell_sz, 6);
 
@@ -12133,9 +12290,14 @@ menu_surface_size_alloc(struct bar *b, int width, int height)
         return;
     b->menu_surf_width = width;
     b->menu_surf_height = height;
+    if (b->menu_cr) { cairo_destroy(b->menu_cr); b->menu_cr = NULL; }
+    if (b->menu_cairo) { cairo_surface_destroy(b->menu_cairo); b->menu_cairo = NULL; }
     size_t buf_size = (size_t)stride * (size_t)phys_h;
-    shm_pool_init(&b->menu_pool, buf_size);
-    if (b->menu_pool.fd < 0) return;
+    if (shm_pool_init(&b->menu_pool, buf_size) < 0) {
+        b->menu_surf_configured = 0;
+        b->menu_needs_render = 0;
+        return;
+    }
     pool_cairo_init(&b->menu_pool, &b->menu_cairo, &b->menu_cr,
                     phys_w, phys_h, stride, scale);
 }
@@ -12149,6 +12311,7 @@ bar_popup_positioner(struct bar *b, int width, int height)
 {
     struct xdg_positioner *pos =
         xdg_wm_base_create_positioner(g_wl.xdg_wm_base);
+    if (!pos) return NULL;
     xdg_positioner_set_size(pos, width, height);
     xdg_positioner_set_anchor_rect(pos, 0, 0, b->width, b->height);
     xdg_positioner_set_anchor(pos, XDG_POSITIONER_ANCHOR_TOP_LEFT);
@@ -12265,6 +12428,12 @@ menu_surface_render(struct bar *b)
     PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
     pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(cr);
+    if (!pl) {
+        pango_font_description_free(fd);
+        cairo_surface_flush(b->menu_cairo);
+        menu_commit(b);
+        return;
+    }
     pango_layout_set_font_description(pl, fd);
 
     int grouped = transition_begin_frame(cr, &g_menu_trans);
@@ -12286,17 +12455,21 @@ menu_surface_create(struct bar *b)
     if (b->width <= 0 || b->menu_height <= 0) return;
 
     struct wl_surface *surf = wl_compositor_create_surface(g_wl.compositor);
+    if (!surf) return;
     b->menu_surface = surf;
 
     b->menu_xdg_surface =
         xdg_wm_base_get_xdg_surface(g_wl.xdg_wm_base, surf);
+    if (!b->menu_xdg_surface) { menu_surface_destroy(b); return; }
     xdg_surface_add_listener(b->menu_xdg_surface,
                              &menu_xdg_surface_listener, NULL);
 
     struct xdg_positioner *pos =
         bar_popup_positioner(b, b->width, b->menu_height);
+    if (!pos) { menu_surface_destroy(b); return; }
     b->menu_popup = xdg_surface_get_popup(b->menu_xdg_surface, NULL, pos);
     xdg_positioner_destroy(pos);
+    if (!b->menu_popup) { menu_surface_destroy(b); return; }
     xdg_popup_add_listener(b->menu_popup, &menu_popup_listener, NULL);
 
     /* The popup has to be adopted by the bar before its initial commit. The
@@ -12309,11 +12482,13 @@ menu_surface_create(struct bar *b)
     /* Keep the transparent full-width remainder click-through so a press there
      * dismisses the grab instead of being swallowed by the popup. */
     struct wl_region *region = wl_compositor_create_region(g_wl.compositor);
-    wl_region_add(region, 0, 0,
-                  MENU_MARGIN_L + MENU_WIDTH + POWER_COL_W + SYS_COL_W,
-                  b->menu_height);
-    wl_surface_set_input_region(surf, region);
-    wl_region_destroy(region);
+    if (region) {
+        wl_region_add(region, 0, 0,
+                      MENU_MARGIN_L + MENU_WIDTH + POWER_COL_W + SYS_COL_W,
+                      b->menu_height);
+        wl_surface_set_input_region(surf, region);
+        wl_region_destroy(region);
+    }
 
     b->menu_req_width = b->width;
     b->menu_req_height = b->menu_height;
@@ -12360,10 +12535,12 @@ menu_update_size(struct bar *b)
         if (xdg_popup_get_version(b->menu_popup) >=
             XDG_POPUP_REPOSITION_SINCE_VERSION) {
             struct xdg_positioner *pos = bar_popup_positioner(b, w, h);
-            xdg_popup_reposition(b->menu_popup, pos, ++b->menu_reposition_token);
-            xdg_positioner_destroy(pos);
-            b->menu_req_width = w;
-            b->menu_req_height = h;
+            if (pos) {
+                xdg_popup_reposition(b->menu_popup, pos, ++b->menu_reposition_token);
+                xdg_positioner_destroy(pos);
+                b->menu_req_width = w;
+                b->menu_req_height = h;
+            }
         }
     } else {
         b->menu_needs_render = 1;
@@ -12429,9 +12606,14 @@ flyout_surface_size_alloc(struct bar *b, int width, int height)
         return;
     b->fly_surf_width = width;
     b->fly_surf_height = height;
+    if (b->fly_cr) { cairo_destroy(b->fly_cr); b->fly_cr = NULL; }
+    if (b->fly_cairo) { cairo_surface_destroy(b->fly_cairo); b->fly_cairo = NULL; }
     size_t buf_size = (size_t)stride * (size_t)phys_h;
-    shm_pool_init(&b->fly_pool, buf_size);
-    if (b->fly_pool.fd < 0) return;
+    if (shm_pool_init(&b->fly_pool, buf_size) < 0) {
+        b->fly_surf_configured = 0;
+        b->fly_needs_render = 0;
+        return;
+    }
     pool_cairo_init(&b->fly_pool, &b->fly_cairo, &b->fly_cr,
                     phys_w, phys_h, stride, scale);
 }
@@ -12541,6 +12723,12 @@ flyout_surface_render(struct bar *b)
     PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
     pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(cr);
+    if (!pl) {
+        pango_font_description_free(fd);
+        cairo_surface_flush(b->fly_cairo);
+        fly_commit(b);
+        return;
+    }
     pango_layout_set_font_description(pl, fd);
 
     int grouped = transition_begin_frame(cr, &g_fly_trans);
@@ -12562,10 +12750,12 @@ flyout_surface_create(struct bar *b, int width, int height)
     if (width <= 0 || height <= 0) return;
 
     struct wl_surface *surf = wl_compositor_create_surface(g_wl.compositor);
+    if (!surf) return;
     b->fly_surface = surf;
 
     b->fly_xdg_surface =
         xdg_wm_base_get_xdg_surface(g_wl.xdg_wm_base, surf);
+    if (!b->fly_xdg_surface) { flyout_surface_destroy(b); return; }
     xdg_surface_add_listener(b->fly_xdg_surface,
                              &flyout_xdg_surface_listener, NULL);
 
@@ -12573,8 +12763,10 @@ flyout_surface_create(struct bar *b, int width, int height)
      * open: the keyboard is its own popup, not part of the bar's height. */
     struct xdg_positioner *pos =
         bar_popup_positioner(b, width, height);
+    if (!pos) { flyout_surface_destroy(b); return; }
     b->fly_popup = xdg_surface_get_popup(b->fly_xdg_surface, NULL, pos);
     xdg_positioner_destroy(pos);
+    if (!b->fly_popup) { flyout_surface_destroy(b); return; }
     xdg_popup_add_listener(b->fly_popup, &flyout_popup_listener, NULL);
 
     /* The popup has to be adopted by the bar before its initial commit, and
@@ -12683,9 +12875,14 @@ osk_surface_size_alloc(struct bar *b, int width, int height)
         return;
     b->osk_surf_width = width;
     b->osk_surf_height = height;
+    if (b->osk_cr) { cairo_destroy(b->osk_cr); b->osk_cr = NULL; }
+    if (b->osk_cairo) { cairo_surface_destroy(b->osk_cairo); b->osk_cairo = NULL; }
     size_t buf_size = (size_t)stride * (size_t)phys_h;
-    shm_pool_init(&b->osk_pool, buf_size);
-    if (b->osk_pool.fd < 0) return;
+    if (shm_pool_init(&b->osk_pool, buf_size) < 0) {
+        b->osk_surf_configured = 0;
+        b->osk_needs_render = 0;
+        return;
+    }
     pool_cairo_init(&b->osk_pool, &b->osk_cairo, &b->osk_cr,
                     phys_w, phys_h, stride, scale);
 }
@@ -12788,6 +12985,12 @@ osk_surface_render(struct bar *b)
     PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
     pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(cr);
+    if (!pl) {
+        pango_font_description_free(fd);
+        cairo_surface_flush(b->osk_cairo);
+        osk_commit(b);
+        return;
+    }
     pango_layout_set_font_description(pl, fd);
 
     int grouped = transition_begin_frame(cr, &g_osk_trans);
@@ -12887,16 +13090,20 @@ osk_surface_create(struct bar *b)
     if (w <= 0 || h <= 0) return;
 
     struct wl_surface *surf = wl_compositor_create_surface(g_wl.compositor);
+    if (!surf) return;
     b->osk_surface = surf;
 
     b->osk_xdg_surface =
         xdg_wm_base_get_xdg_surface(g_wl.xdg_wm_base, surf);
+    if (!b->osk_xdg_surface) { osk_surface_destroy(b); return; }
     xdg_surface_add_listener(b->osk_xdg_surface,
                              &osk_xdg_surface_listener, NULL);
 
     struct xdg_positioner *pos = bar_popup_positioner(b, w, h);
+    if (!pos) { osk_surface_destroy(b); return; }
     b->osk_popup = xdg_surface_get_popup(b->osk_xdg_surface, NULL, pos);
     xdg_positioner_destroy(pos);
+    if (!b->osk_popup) { osk_surface_destroy(b); return; }
     xdg_popup_add_listener(b->osk_popup, &osk_popup_listener, NULL);
 
     /* Adopt the popup without grabbing, so the focused application keeps
@@ -12984,10 +13191,12 @@ osk_update_size(struct bar *b)
         if (xdg_popup_get_version(b->osk_popup) >=
             XDG_POPUP_REPOSITION_SINCE_VERSION) {
             struct xdg_positioner *pos = bar_popup_positioner(b, w, h);
-            xdg_popup_reposition(b->osk_popup, pos, ++b->osk_reposition_token);
-            xdg_positioner_destroy(pos);
-            b->osk_req_width = w;
-            b->osk_req_height = h;
+            if (pos) {
+                xdg_popup_reposition(b->osk_popup, pos, ++b->osk_reposition_token);
+                xdg_positioner_destroy(pos);
+                b->osk_req_width = w;
+                b->osk_req_height = h;
+            }
         }
     } else {
         b->osk_needs_render = 1;
@@ -13092,10 +13301,12 @@ flyout_update_size(struct bar *b)
             XDG_POPUP_REPOSITION_SINCE_VERSION) {
             struct xdg_positioner *pos =
                 bar_popup_positioner(b, b->width, h);
-            xdg_popup_reposition(b->fly_popup, pos, ++b->fly_reposition_token);
-            xdg_positioner_destroy(pos);
-            b->fly_req_width = b->width;
-            b->fly_req_height = h;
+            if (pos) {
+                xdg_popup_reposition(b->fly_popup, pos, ++b->fly_reposition_token);
+                xdg_positioner_destroy(pos);
+                b->fly_req_width = b->width;
+                b->fly_req_height = h;
+            }
         }
     } else {
         b->fly_needs_render = 1;
@@ -13247,8 +13458,12 @@ bar_reinit_shm(struct bar *b, int w, int h, int scale)
     int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, phys_w);
     size_t buf_size = (size_t)stride * (size_t)phys_h;
 
-    shm_pool_init(&b->pool, buf_size);
-    if (b->pool.fd < 0) return 0;
+    if (b->cr) { cairo_destroy(b->cr); b->cr = NULL; }
+    if (b->cairo) { cairo_surface_destroy(b->cairo); b->cairo = NULL; }
+    if (shm_pool_init(&b->pool, buf_size) < 0) {
+        b->needs_render = 0;
+        return 0;
+    }
     pool_cairo_init(&b->pool, &b->cairo, &b->cr, phys_w, phys_h, stride, scale);
     b->resize_pending = 1;
     g_box.resize_at_ms = now_ms();
@@ -14785,8 +15000,11 @@ dnd_init(void)
         wl_data_device_add_listener(g_wl.data_device, &dnd_device_listener, NULL);
 }
 
+/* Per-seat DnD state. Called when the seat global disappears; the data-device
+ * manager is a separate global and must survive so a replacement seat can get
+ * its own wl_data_device. */
 static void
-dnd_cleanup(void)
+dnd_cleanup_seat(void)
 {
     dnd_reset();
     if (g_dnd.pending_offer) {
@@ -14801,10 +15019,23 @@ dnd_cleanup(void)
             wl_data_device_destroy(g_wl.data_device);
         g_wl.data_device = NULL;
     }
+}
+
+static void
+dnd_cleanup_mgr(void)
+{
     if (g_wl.data_device_mgr) {
         wl_data_device_manager_destroy(g_wl.data_device_mgr);
         g_wl.data_device_mgr = NULL;
+        g_wl.data_device_mgr_name = 0;
     }
+}
+
+static void
+dnd_cleanup(void)
+{
+    dnd_cleanup_seat();
+    dnd_cleanup_mgr();
 }
 
 static void
@@ -14936,7 +15167,7 @@ keyboard_handle_keymap(void *data, struct wl_keyboard *kb, uint32_t format,
     (void)data; (void)kb;
     if (!g_wl.xkb_ctx)
         g_wl.xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || size == 0) {
+    if (!g_wl.xkb_ctx || format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || size == 0) {
         close(fd);
         return;
     }
@@ -15056,14 +15287,16 @@ seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t caps)
     (void)data;
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !g_pointer.pointer) {
         g_pointer.pointer = wl_seat_get_pointer(seat);
-        wl_pointer_add_listener(g_pointer.pointer, &pointer_listener, NULL);
+        if (g_pointer.pointer)
+            wl_pointer_add_listener(g_pointer.pointer, &pointer_listener, NULL);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && g_pointer.pointer) {
         wl_pointer_destroy(g_pointer.pointer);
         g_pointer.pointer = NULL;
     }
     if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !g_wl.keyboard) {
         g_wl.keyboard = wl_seat_get_keyboard(seat);
-        wl_keyboard_add_listener(g_wl.keyboard, &keyboard_listener, NULL);
+        if (g_wl.keyboard)
+            wl_keyboard_add_listener(g_wl.keyboard, &keyboard_listener, NULL);
     } else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && g_wl.keyboard) {
         wl_keyboard_destroy(g_wl.keyboard);
         g_wl.keyboard = NULL;
@@ -15261,7 +15494,13 @@ static void
 toplevel_manager_toplevel(void *data, struct zwlr_foreign_toplevel_manager_v1 *mgr, struct zwlr_foreign_toplevel_handle_v1 *h)
 {
     (void)data; (void)mgr;
-    if (g_n_toplevels >= MAX_TOPLEVELS) return;
+    if (g_n_toplevels >= MAX_TOPLEVELS) {
+        /* The compositor handed us a new handle we cannot track — destroy it
+         * rather than leaking both the client proxy and the server object. */
+        if (h)
+            zwlr_foreign_toplevel_handle_v1_destroy(h);
+        return;
+    }
     int idx = g_n_toplevels++;
     memset(&g_toplevels[idx], 0, sizeof(*g_toplevels));
     g_toplevels[idx].handle = h;
@@ -15281,6 +15520,7 @@ static void
 cleanup(void)
 {
     shot_end();
+    wlp_close();            /* join loader thread and release thumbnails */
     transition_cancel(&g_fly_trans);
     transition_cancel(&g_menu_trans);
     transition_cancel(&g_osk_trans);
@@ -15296,17 +15536,18 @@ cleanup(void)
     if (g_bar.fly_popup) xdg_popup_destroy(g_bar.fly_popup);
     if (g_bar.fly_xdg_surface) xdg_surface_destroy(g_bar.fly_xdg_surface);
     if (g_bar.fly_surface) wl_surface_destroy(g_bar.fly_surface);
-    shm_pool_cleanup(&g_bar.menu_pool);
     if (g_bar.menu_frame_cb) { wl_callback_destroy(g_bar.menu_frame_cb); g_bar.menu_frame_cb = NULL; }
     if (g_bar.menu_cairo) { cairo_surface_destroy(g_bar.menu_cairo); g_bar.menu_cairo = NULL; }
     if (g_bar.menu_cr) { cairo_destroy(g_bar.menu_cr); g_bar.menu_cr = NULL; }
+    /* The cairo surfaces point into the pool's mmap — drop them first. */
+    shm_pool_cleanup(&g_bar.menu_pool);
     if (g_bar.menu_popup) xdg_popup_destroy(g_bar.menu_popup);
     if (g_bar.menu_xdg_surface) xdg_surface_destroy(g_bar.menu_xdg_surface);
     if (g_bar.menu_surface) wl_surface_destroy(g_bar.menu_surface);
-    shm_pool_cleanup(&g_bar.osk_pool);
     if (g_bar.osk_frame_cb) { wl_callback_destroy(g_bar.osk_frame_cb); g_bar.osk_frame_cb = NULL; }
     if (g_bar.osk_cairo) { cairo_surface_destroy(g_bar.osk_cairo); g_bar.osk_cairo = NULL; }
     if (g_bar.osk_cr) { cairo_destroy(g_bar.osk_cr); g_bar.osk_cr = NULL; }
+    shm_pool_cleanup(&g_bar.osk_pool);
     if (g_bar.osk_popup) xdg_popup_destroy(g_bar.osk_popup);
     if (g_bar.osk_xdg_surface) xdg_surface_destroy(g_bar.osk_xdg_surface);
     if (g_bar.osk_surface) wl_surface_destroy(g_bar.osk_surface);
@@ -15324,6 +15565,7 @@ cleanup(void)
     toplevels_clear();
     if (g_wl.toplevel_mgr) zwlr_foreign_toplevel_manager_v1_destroy(g_wl.toplevel_mgr);
     if (g_pointer.pointer) wl_pointer_destroy(g_pointer.pointer);
+    if (g_wl.keyboard) wl_keyboard_destroy(g_wl.keyboard);
     dnd_cleanup();
     if (g_wl.seat) wl_seat_destroy(g_wl.seat);
     if (g_wl.shm) wl_shm_destroy(g_wl.shm);
@@ -15364,57 +15606,91 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name,
                 const char *interface, uint32_t version)
 {
     (void)data;
+    /* Each singleton global is bound at most once. A compositor that (malformed
+     * or otherwise) re-advertises an already-bound global must not cause us to
+     * overwrite the proxy: that leaks the old one and, for listener-bearing
+     * globals, leaves its listener firing into state we no longer associate
+     * with it. global_remove() sets these fields to NULL before any re-advertisement. */
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
-        g_wl.compositor = wl_registry_bind(reg, name, &wl_compositor_interface, 4);
+        if (g_wl.compositor) return;
+        uint32_t v = version < 4 ? version : 4;
+        g_wl.compositor = wl_registry_bind(reg, name, &wl_compositor_interface, v);
         g_wl.compositor_name = name;
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
-        g_wl.shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
+        if (g_wl.shm) return;
+        uint32_t v = version < 1 ? version : 1;
+        g_wl.shm = wl_registry_bind(reg, name, &wl_shm_interface, v);
         g_wl.shm_name = name;
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
-        g_wl.seat = wl_registry_bind(reg, name, &wl_seat_interface, 5);
+        if (g_wl.seat) return;
+        uint32_t v = version < 5 ? version : 5;
+        g_wl.seat = wl_registry_bind(reg, name, &wl_seat_interface, v);
         g_wl.seat_name = name;
         /* The listener must be in place before the seat's capabilities event
          * is dispatched -- it is what creates the wl_pointer, and the event
          * can arrive as early as the roundtrip that flushes this bind. */
-        wl_seat_add_listener(g_wl.seat, &seat_listener, NULL);
+        if (g_wl.seat) {
+            wl_seat_add_listener(g_wl.seat, &seat_listener, NULL);
+            /* A replacement seat needs a fresh wl_data_device; the manager
+             * global survives seat removal now (see dnd_cleanup_seat()). */
+            dnd_init();
+        }
     } else if (strcmp(interface, wl_data_device_manager_interface.name) == 0) {
+        if (g_wl.data_device_mgr) return;
         uint32_t v = version < 3 ? version : 3;
         g_wl.data_device_mgr =
             wl_registry_bind(reg, name, &wl_data_device_manager_interface, v);
         g_wl.data_device_mgr_name = name;
+        /* The seat may have been advertised first; complete DnD setup now. */
+        dnd_init();
     } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
-        g_wl.layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, 3);
+        if (g_wl.layer_shell) return;
+        uint32_t v = version < 3 ? version : 3;
+        g_wl.layer_shell = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface, v);
         g_wl.layer_shell_name = name;
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+        if (g_wl.xdg_wm_base) return;
         uint32_t v = version < XDG_POPUP_REPOSITION_SINCE_VERSION
                          ? version : XDG_POPUP_REPOSITION_SINCE_VERSION;
         g_wl.xdg_wm_base = wl_registry_bind(reg, name, &xdg_wm_base_interface, v);
         g_wl.xdg_wm_base_name = name;
-        xdg_wm_base_add_listener(g_wl.xdg_wm_base, &xdg_wm_base_listener, NULL);
+        if (g_wl.xdg_wm_base)
+            xdg_wm_base_add_listener(g_wl.xdg_wm_base, &xdg_wm_base_listener, NULL);
     } else if (strcmp(interface, zwlr_foreign_toplevel_manager_v1_interface.name) == 0) {
-        g_wl.toplevel_mgr = wl_registry_bind(reg, name, &zwlr_foreign_toplevel_manager_v1_interface, 3);
+        if (g_wl.toplevel_mgr) return;
+        uint32_t v = version < 3 ? version : 3;
+        g_wl.toplevel_mgr = wl_registry_bind(reg, name, &zwlr_foreign_toplevel_manager_v1_interface, v);
         g_wl.toplevel_mgr_name = name;
-        zwlr_foreign_toplevel_manager_v1_add_listener(g_wl.toplevel_mgr, &toplevel_manager_listener, NULL);
+        if (g_wl.toplevel_mgr)
+            zwlr_foreign_toplevel_manager_v1_add_listener(g_wl.toplevel_mgr, &toplevel_manager_listener, NULL);
     }
     else if (strcmp(interface, ext_workspace_manager_v1_interface.name) == 0) {
-        g_wl.ext_ws_mgr = wl_registry_bind(reg, name, &ext_workspace_manager_v1_interface, 1);
+        if (g_wl.ext_ws_mgr) return;
+        uint32_t v = version < 1 ? version : 1;
+        g_wl.ext_ws_mgr = wl_registry_bind(reg, name, &ext_workspace_manager_v1_interface, v);
         g_wl.ext_ws_mgr_name = name;
-        ext_workspace_manager_v1_add_listener(g_wl.ext_ws_mgr, &ws_mgr_listener, NULL);
+        if (g_wl.ext_ws_mgr)
+            ext_workspace_manager_v1_add_listener(g_wl.ext_ws_mgr, &ws_mgr_listener, NULL);
     } else if (strcmp(interface, wl_output_interface.name) == 0) {
         output_add(reg, name, version);
     } else if (strcmp(interface, zwlr_gamma_control_manager_v1_interface.name) == 0) {
-        g_wl.gamma_mgr = wl_registry_bind(reg, name, &zwlr_gamma_control_manager_v1_interface, 1);
+        if (g_wl.gamma_mgr) return;
+        uint32_t v = version < 1 ? version : 1;
+        g_wl.gamma_mgr = wl_registry_bind(reg, name, &zwlr_gamma_control_manager_v1_interface, v);
         g_wl.gamma_mgr_name = name;
         output_gamma_create_all();
     } else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) {
+        if (g_wl.screencopy_mgr) return;
         /* Version 1 keeps the shm buffer event unconditional; newer versions
          * may advertise dmabuf formats first, which this client cannot use. */
         g_wl.screencopy_mgr = wl_registry_bind(reg, name,
             &zwlr_screencopy_manager_v1_interface, 1);
         g_wl.screencopy_mgr_name = name;
     } else if (strcmp(interface, zwp_virtual_keyboard_manager_v1_interface.name) == 0) {
+        if (g_wl.vk_mgr) return;
+        uint32_t v = version < 1 ? version : 1;
         g_wl.vk_mgr = wl_registry_bind(reg, name,
-            &zwp_virtual_keyboard_manager_v1_interface, 1);
+            &zwp_virtual_keyboard_manager_v1_interface, v);
         g_wl.vk_mgr_name = name;
     }
 }
@@ -15430,24 +15706,35 @@ registry_global_remove(void *data, struct wl_registry *reg, uint32_t name)
         wl_shm_destroy(g_wl.shm);
         g_wl.shm = NULL;
     } else if (g_wl.seat && g_wl.seat_name == name) {
-        dnd_cleanup();
+        dnd_cleanup_seat();     /* keep the manager for a replacement seat */
         if (g_wl.vk) {
             zwp_virtual_keyboard_v1_destroy(g_wl.vk);
             g_wl.vk = NULL;
         }
-        wl_seat_destroy(g_wl.seat);
-        g_wl.seat = NULL;
+        /* Children must go before their seat, and g_wl.keyboard must be NULL
+         * or a replacement seat will never get a keyboard of its own. */
         if (g_pointer.pointer) {
             wl_pointer_destroy(g_pointer.pointer);
             g_pointer.pointer = NULL;
         }
+        if (g_wl.keyboard) {
+            wl_keyboard_destroy(g_wl.keyboard);
+            g_wl.keyboard = NULL;
+        }
+        wl_seat_destroy(g_wl.seat);
+        g_wl.seat = NULL;
     } else if (g_wl.data_device_mgr && g_wl.data_device_mgr_name == name) {
-        dnd_cleanup();
+        dnd_cleanup_mgr();
     } else if (g_wl.layer_shell && g_wl.layer_shell_name == name) {
         zwlr_layer_shell_v1_destroy(g_wl.layer_shell);
         g_wl.layer_shell = NULL;
     } else if (g_wl.xdg_wm_base && g_wl.xdg_wm_base_name == name) {
         close_all_popups_full();
+        /* The close helpers above may only start an ease-out transition; the
+         * xdg_surfaces have to be gone before the factory that created them. */
+        menu_surface_destroy(&g_bar);
+        flyout_surface_destroy(&g_bar);
+        osk_surface_destroy(&g_bar);
         xdg_wm_base_destroy(g_wl.xdg_wm_base);
         g_wl.xdg_wm_base = NULL;
     } else if (g_wl.toplevel_mgr && g_wl.toplevel_mgr_name == name) {
@@ -15455,6 +15742,13 @@ registry_global_remove(void *data, struct wl_registry *reg, uint32_t name)
         g_wl.toplevel_mgr = NULL;
         toplevels_clear();
     } else if (g_wl.ext_ws_mgr && g_wl.ext_ws_mgr_name == name) {
+        for (int i = 0; i < g_ws.ws_proxies_n; i++) {
+            if (g_ws_proxies[i].handle) {
+                workspaces_clear_cached_handle(g_ws_proxies[i].handle);
+                ext_workspace_handle_v1_destroy(g_ws_proxies[i].handle);
+                g_ws_proxies[i].handle = NULL;
+            }
+        }
         ext_workspace_manager_v1_destroy(g_wl.ext_ws_mgr);
         g_wl.ext_ws_mgr = NULL;
         g_ws.ws_proxies_n = 0;
@@ -15514,6 +15808,7 @@ state_init(void)
     g_bar.pool.fd = -1;
     g_bar.fly_pool.fd = -1;
     g_bar.menu_pool.fd = -1;
+    g_bar.osk_pool.fd = -1;
     g_bar.scale = 1;
     g_pw.retry_delay_ms = 250;
     g_pointer.hover_menu_idx = -1;
@@ -15582,12 +15877,14 @@ static void
 bar_init(void)
 {
     struct wl_surface *surf = wl_compositor_create_surface(g_wl.compositor);
+    if (!surf) return;
     g_bar.surface = surf;
 
     struct zwlr_layer_surface_v1 *ls =
         zwlr_layer_shell_v1_get_layer_surface(g_wl.layer_shell, surf, NULL,
             ZWLR_LAYER_SHELL_V1_LAYER_TOP, "jtlab");
     g_bar.layer_surface = ls;
+    if (!ls) return;
     zwlr_layer_surface_v1_add_listener(ls, &bar_layer_listener, NULL);
 
     uint32_t anchor = ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
@@ -15688,16 +15985,31 @@ static void
 teardown(void)
 {
     ctl_teardown();
-    cleanup();    close(g_sni.clock_fd);
+    cleanup();
+    close(g_sni.clock_fd);
     close(g_box.sys_fd);
     if (g_app.apps_fd >= 0) close(g_app.apps_fd);
     close(g_sni.main_epoll_fd);
-    wl_display_disconnect(g_wl.display);
+    if (g_wl.display) {
+        wl_display_disconnect(g_wl.display);
+        g_wl.display = NULL;
+    }
 
     apps_free();
     pinned_free();
     pw_shutdown();
     art_clear();
+    if (g_avatar) {
+        cairo_surface_destroy(g_avatar);
+        g_avatar = NULL;
+    }
+    if (g_icon_fallback) {
+        cairo_surface_destroy(g_icon_fallback);
+        g_icon_fallback = NULL;
+    }
+    pango_cache_shutdown();
+    g_clear_object(&g_sni.art_session);
+    g_clear_object(&g_wx.session);
     if (g_sys.props_sig)
         g_dbus_connection_signal_unsubscribe(g_sni.dbus_conn, g_sys.props_sig);
     if (g_sys.owner_sig)
@@ -15772,26 +16084,64 @@ profile_config_reload(void)
         render_request();
 }
 
+/* Each pending control-socket read owns its connection ref, buffer and a
+ * cancellable in one heap context. Tracking them lets ctl_teardown() cancel
+ * and drain outstanding reads instead of leaving GIO callbacks to fire after
+ * the bar state has been torn down (or leaking the conn ref and buffer when
+ * the process exits with a read still in flight). */
+struct ctl_read_ctx {
+    GSocketConnection *conn;
+    char *buf;
+    GCancellable *cancel;
+};
+static GList *g_ctl_pending;
+static int g_ctl_stopping;
+
+static void
+ctl_read_ctx_free(struct ctl_read_ctx *ctx)
+{
+    g_ctl_pending = g_list_remove(g_ctl_pending, ctx);
+    g_object_unref(ctx->conn);
+    g_object_unref(ctx->cancel);
+    g_free(ctx->buf);
+    g_free(ctx);
+}
+
+static void
+ctl_read_buf_done(GObject *src, GAsyncResult *res, gpointer data)
+{
+    struct ctl_read_ctx *ctx = data;
+    GError *err = NULL;
+    gssize n = g_input_stream_read_finish(G_INPUT_STREAM(src), res, &err);
+    if (n > 0 && !g_ctl_stopping) {
+        ctx->buf[n] = '\0';
+        if (g_str_has_prefix(ctx->buf, "menu"))
+            menu_toggle_ctl();
+        else if (g_str_has_prefix(ctx->buf, "screenshot"))
+            shot_begin();
+        else if (g_str_has_prefix(ctx->buf, "reload"))
+            profile_config_reload();
+        else if (g_str_has_prefix(ctx->buf, "quit"))
+            g_app.running = 0;
+    }
+    g_clear_error(&err);
+    ctl_read_ctx_free(ctx);
+}
+
 static gboolean
 ctl_incoming(GSocketService *service, GSocketConnection *conn,
              GObject *source_object, gpointer user_data)
 {
     (void)service; (void)source_object; (void)user_data;
     GInputStream *in = g_io_stream_get_input_stream(G_IO_STREAM(conn));
-    char buf[64];
-    gssize n = g_input_stream_read(in, buf, sizeof(buf) - 1, NULL, NULL);
-    if (n > 0) {
-        buf[n] = '\0';
-        if (g_str_has_prefix(buf, "menu"))
-            menu_toggle_ctl();
-        else if (g_str_has_prefix(buf, "screenshot"))
-            shot_begin();
-        else if (g_str_has_prefix(buf, "reload"))
-            profile_config_reload();
-        else if (g_str_has_prefix(buf, "quit"))
-            g_app.running = 0;
-    }
-    return FALSE;
+    struct ctl_read_ctx *ctx = g_new0(struct ctl_read_ctx, 1);
+    ctx->conn = g_object_ref(conn);
+    ctx->buf = g_malloc(64);
+    ctx->cancel = g_cancellable_new();
+    g_ctl_pending = g_list_prepend(g_ctl_pending, ctx);
+    g_input_stream_read_async(in, ctx->buf, 63, G_PRIORITY_DEFAULT,
+                              ctx->cancel, ctl_read_buf_done, ctx);
+    return TRUE;
 }
 
 static void
@@ -15799,7 +16149,11 @@ ctl_init(void)
 {
     char path[256];
     ctl_path(path, sizeof(path));
-    unlink(path);
+    {
+        struct stat st;
+        if (lstat(path, &st) == 0 && S_ISSOCK(st.st_mode))
+            unlink(path);
+    }
 
     GError *err = NULL;
     GSocketAddress *effective = NULL;
@@ -15811,12 +16165,15 @@ ctl_init(void)
                                        NULL, &effective, &err)) {
         fprintf(stderr, "jtlab: control socket %s: %s\n", path,
                 err ? err->message : "unknown error");
-        if (err) g_error_free(err);
+        g_clear_error(&err);
         g_object_unref(addr);
         g_object_unref(g_sni.ctl_service);
         g_sni.ctl_service = NULL;
         return;
     }
+    if (effective)
+        g_object_unref(effective);
+    chmod(path, 0600);
     g_object_unref(addr);
     g_signal_connect(g_sni.ctl_service, "incoming",
                      G_CALLBACK(ctl_incoming), NULL);
@@ -15825,13 +16182,38 @@ ctl_init(void)
 static void
 ctl_teardown(void)
 {
+    g_ctl_stopping = 1;
+    /* Cancel every in-flight read. Each callback completes with
+     * G_IO_ERROR_CANCELLED and frees its own context, so there is no double
+     * free and no callback left to poke the bar after cleanup() has run. */
+    for (GList *l = g_ctl_pending; l; l = l->next)
+        g_cancellable_cancel(((struct ctl_read_ctx *)l->data)->cancel);
+
     if (g_sni.ctl_service) {
+        g_socket_service_stop(g_sni.ctl_service);
+        g_socket_listener_close(G_SOCKET_LISTENER(g_sni.ctl_service));
         g_object_unref(g_sni.ctl_service);
         g_sni.ctl_service = NULL;
     }
     char path[256];
     ctl_path(path, sizeof(path));
-    unlink(path);
+    {
+        struct stat st;
+        if (lstat(path, &st) == 0 && S_ISSOCK(st.st_mode))
+            unlink(path);
+    }
+
+    /* Drain the cancelled callbacks on the GLib context the socket service
+     * uses, so their connections and buffers are actually released here.
+     * g_main_context_pending() can momentarily report false before GLib has
+     * queued the cancellation completions, so iterate unconditionally until
+     * there is nothing left to dispatch (bounded in case a source misbehaves). */
+    if (g_sni.glib_ctx) {
+        for (int i = 0; i < 32 && g_ctl_pending; i++) {
+            if (!g_main_context_iteration(g_sni.glib_ctx, FALSE))
+                break;
+        }
+    }
 }
 
 int
@@ -15844,8 +16226,12 @@ main(int argc, char *argv[])
     profile_config_load();
     services_init();
 
-    if (!wayland_init())
+    if (!wayland_init()) {
+        /* services_init() has already started PipeWire, D-Bus, the app watcher
+         * and the Soup sessions — unwind them instead of leaking on this path. */
+        teardown();
         return 1;
+    }
 
     bar_init();
     wlp_load_wallpaper();
