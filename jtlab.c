@@ -492,6 +492,30 @@ time_now(char *buf, size_t n)
 #define clampd(v, lo, hi) \
     ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
 
+#define SURFACE_CLEAR(p) do { \
+    if (p) { cairo_surface_destroy(p); (p) = NULL; } \
+} while (0)
+
+#define GOBJ_CLEAR(p) do { \
+    if (p) { g_object_unref(p); (p) = NULL; } \
+} while (0)
+
+static PangoFontDescription *
+font_desc_new(double pt)
+{
+    PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
+    pango_font_description_set_absolute_size(fd, pt * PANGO_SCALE);
+    return fd;
+}
+
+static void
+layout_set_font_size(PangoLayout *pl, double pt)
+{
+    PangoFontDescription *fd = font_desc_new(pt);
+    pango_layout_set_font_description(pl, fd);
+    pango_font_description_free(fd);
+}
+
 static PangoContext *g_pango_ctx;
 static PangoLayout *g_clock_layout;
 static cairo_t *g_clock_bound_cr;
@@ -518,10 +542,7 @@ clock_layout(cairo_t *cr)
     if (!g_clock_layout) {
         g_clock_layout = pango_layout_new(g_pango_ctx);
         if (!g_clock_layout) return NULL;
-        PangoFontDescription *pfd = pango_font_description_from_string(FONT_FAMILY);
-        pango_font_description_set_absolute_size(pfd, FONT_SIZE * PANGO_SCALE);
-        pango_layout_set_font_description(g_clock_layout, pfd);
-        pango_font_description_free(pfd);
+        layout_set_font_size(g_clock_layout, FONT_SIZE);
     }
     if (g_clock_bound_cr != cr) {
         pango_cairo_update_layout(cr, g_clock_layout);
@@ -557,17 +578,14 @@ static double
 text_width_px(const char *text)
 {
     if (!g_bar.cr) return 0;
-    PangoFontDescription *pfd = pango_font_description_from_string(FONT_FAMILY);
-    pango_font_description_set_absolute_size(pfd, FONT_SIZE * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(g_bar.cr);
-    if (!pl) { pango_font_description_free(pfd); return 0; }
-    pango_layout_set_font_description(pl, pfd);
+    if (!pl) return 0;
+    layout_set_font_size(pl, FONT_SIZE);
     pango_layout_set_text(pl, text, -1);
     int tw, th;
     pango_layout_get_pixel_size(pl, &tw, &th);
     (void)th;
     g_object_unref(pl);
-    pango_font_description_free(pfd);
     return tw;
 }
 
@@ -2911,7 +2929,7 @@ static void tray_item_destroy(struct tray_item *it);
 static void
 tray_item_reload_icon(struct tray_item *it)
 {
-    if (it->icon) { cairo_surface_destroy(it->icon); it->icon = NULL; }
+    SURFACE_CLEAR(it->icon);
     if (it->pixmap) {
         it->icon = tray_surface_from_pixmap(it->pixmap);
         if (it->icon) { render_request(); return; }
@@ -5714,8 +5732,7 @@ cal_day_font(void)
 {
     static PangoFontDescription *fd = NULL;
     if (!fd) {
-        fd = pango_font_description_from_string(FONT_FAMILY);
-        pango_font_description_set_absolute_size(fd, SYS_FONT_SIZE * PANGO_SCALE);
+        fd = font_desc_new(SYS_FONT_SIZE);
     }
     return fd;
 }
@@ -5725,8 +5742,7 @@ cal_small_font(void)
 {
     static PangoFontDescription *fd = NULL;
     if (!fd) {
-        fd = pango_font_description_from_string(FONT_FAMILY);
-        pango_font_description_set_absolute_size(fd, SYS_FONT_SMALL * PANGO_SCALE);
+        fd = font_desc_new(SYS_FONT_SMALL);
     }
     return fd;
 }
@@ -5853,8 +5869,7 @@ wx_font(void)
 {
     static PangoFontDescription *fd = NULL;
     if (!fd) {
-        fd = pango_font_description_from_string(FONT_FAMILY);
-        pango_font_description_set_absolute_size(fd, WX_FONT_SIZE * PANGO_SCALE);
+        fd = font_desc_new(WX_FONT_SIZE);
     }
     return fd;
 }
@@ -5864,8 +5879,7 @@ wx_head_font(void)
 {
     static PangoFontDescription *fd = NULL;
     if (!fd) {
-        fd = pango_font_description_from_string(FONT_FAMILY);
-        pango_font_description_set_absolute_size(fd, WX_FONT_HEAD * PANGO_SCALE);
+        fd = font_desc_new(WX_FONT_HEAD);
     }
     return fd;
 }
@@ -5875,8 +5889,7 @@ wx_small_font(void)
 {
     static PangoFontDescription *fd = NULL;
     if (!fd) {
-        fd = pango_font_description_from_string(FONT_FAMILY);
-        pango_font_description_set_absolute_size(fd, WX_FONT_SMALL * PANGO_SCALE);
+        fd = font_desc_new(WX_FONT_SMALL);
     }
     return fd;
 }
@@ -6113,8 +6126,7 @@ clock_font(void)
 {
     static PangoFontDescription *fd = NULL;
     if (!fd) {
-        fd = pango_font_description_from_string(FONT_FAMILY);
-        pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
+        fd = font_desc_new(FONT_SIZE);
     }
     return fd;
 }
@@ -6845,7 +6857,7 @@ static void
 bg_alloc(struct output_entry *o, int width, int height, int scale)
 {
     if (o->bg_cr) { cairo_destroy(o->bg_cr); o->bg_cr = NULL; }
-    if (o->bg_cairo) { cairo_surface_destroy(o->bg_cairo); o->bg_cairo = NULL; }
+    SURFACE_CLEAR(o->bg_cairo);
     o->bg_width = width;
     o->bg_height = height;
     o->bg_scale = scale;
@@ -6947,7 +6959,7 @@ output_bg_surface_destroy(struct output_entry *o)
     if (o->bg_layer) { zwlr_layer_surface_v1_destroy(o->bg_layer); o->bg_layer = NULL; }
     if (o->bg_surface) { wl_surface_destroy(o->bg_surface); o->bg_surface = NULL; }
     if (o->bg_cr) { cairo_destroy(o->bg_cr); o->bg_cr = NULL; }
-    if (o->bg_cairo) { cairo_surface_destroy(o->bg_cairo); o->bg_cairo = NULL; }
+    SURFACE_CLEAR(o->bg_cairo);
     shm_pool_cleanup(&o->bg_pool);
     o->bg_configured = 0;
     o->bg_width = o->bg_height = o->bg_scale = 0;
@@ -7031,7 +7043,7 @@ shot_overlay_destroy(struct shot_overlay *ov)
     if (ov->layer) { zwlr_layer_surface_v1_destroy(ov->layer); ov->layer = NULL; }
     if (ov->surface) { wl_surface_destroy(ov->surface); ov->surface = NULL; }
     if (ov->cr) { cairo_destroy(ov->cr); ov->cr = NULL; }
-    if (ov->cairo) { cairo_surface_destroy(ov->cairo); ov->cairo = NULL; }
+    SURFACE_CLEAR(ov->cairo);
     shm_pool_cleanup(&ov->pool);
     free(ov);
 }
@@ -7270,7 +7282,7 @@ static int
 shot_overlay_alloc(struct shot_overlay *ov, int width, int height, int scale)
 {
     if (ov->cr) { cairo_destroy(ov->cr); ov->cr = NULL; }
-    if (ov->cairo) { cairo_surface_destroy(ov->cairo); ov->cairo = NULL; }
+    SURFACE_CLEAR(ov->cairo);
     ov->width = width;
     ov->height = height;
     ov->scale = scale;
@@ -7943,11 +7955,8 @@ wlp_draw(cairo_t *cr, PangoLayout *pl)
 
     /* Header */
     {
-        PangoFontDescription *hfd = pango_font_description_from_string(FONT_FAMILY);
-        pango_font_description_set_absolute_size(hfd, FONT_SIZE * PANGO_SCALE);
-        pango_layout_set_font_description(pl, hfd);
+        layout_set_font_size(pl, FONT_SIZE);
         pango_layout_set_text(pl, "Wallpapers", -1);
-        pango_font_description_free(hfd);
         int tw, th;
         pango_layout_get_pixel_size(pl, &tw, &th);
         cairo_set_source_rgba(cr, COLOR(FG_HEX), 1.0);
@@ -8027,9 +8036,7 @@ wlp_draw(cairo_t *cr, PangoLayout *pl)
 
         /* Filename label */
         {
-            PangoFontDescription *lfd = pango_font_description_from_string(FONT_FAMILY);
-            pango_font_description_set_absolute_size(lfd, 11.0 * PANGO_SCALE);
-            pango_layout_set_font_description(pl, lfd);
+            layout_set_font_size(pl, 11.0);
             pango_layout_set_text(pl, g_wlp.entries[i].name, -1);
             pango_layout_set_ellipsize(pl, PANGO_ELLIPSIZE_END);
             pango_layout_set_width(pl, WALL_THUMB_W * PANGO_SCALE);
@@ -8038,7 +8045,6 @@ wlp_draw(cairo_t *cr, PangoLayout *pl)
             cairo_set_source_rgba(cr, COLOR(FG_HEX), hover ? 1.0 : 0.7);
             cairo_move_to(cr, cx, cy + WALL_THUMB_H + 2);
             pango_cairo_show_layout(cr, pl);
-            pango_font_description_free(lfd);
         }
     }
 
@@ -9861,11 +9867,9 @@ sys_draw_text(cairo_t *cr, double x, double y, double w, double h,
               const char *text, double size, double r, double g, double b,
               double a, PangoEllipsizeMode el, PangoAlignment align)
 {
-    PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
-    pango_font_description_set_absolute_size(fd, size * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(cr);
-    if (!pl) { pango_font_description_free(fd); return; }
-    pango_layout_set_font_description(pl, fd);
+    if (!pl) return;
+    layout_set_font_size(pl, size);
     pango_layout_set_text(pl, text, -1);
     pango_layout_set_width(pl, (int)(w * PANGO_SCALE));
     pango_layout_set_alignment(pl, align);
@@ -9877,7 +9881,6 @@ sys_draw_text(cairo_t *cr, double x, double y, double w, double h,
     cairo_move_to(cr, x, snap_px(y + (h - th) / 2.0));
     pango_cairo_show_layout(cr, pl);
     g_object_unref(pl);
-    pango_font_description_free(fd);
 }
 
 static void
@@ -10965,9 +10968,7 @@ osk_label_font(int big)
     static PangoFontDescription *normal, *large;
     PangoFontDescription **fd = big ? &large : &normal;
     if (!*fd) {
-        *fd = pango_font_description_from_string(FONT_FAMILY);
-        pango_font_description_set_absolute_size(*fd,
-            (big ? FONT_SIZE * 2.0 : FONT_SIZE) * PANGO_SCALE);
+        *fd = font_desc_new(big ? FONT_SIZE * 2.0 : FONT_SIZE);
     }
     return *fd;
 }
@@ -11921,11 +11922,9 @@ bar_draw(struct bar *b)
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_new_path(cr);
 
-    PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
-    pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(cr);
-    if (!pl) { pango_font_description_free(fd); return; }
-    pango_layout_set_font_description(pl, fd);
+    if (!pl) return;
+    layout_set_font_size(pl, FONT_SIZE);
 
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_set_source_rgba(cr, COLOR(BG_HEX), BG_A);
@@ -12230,7 +12229,6 @@ bar_draw(struct bar *b)
 
 
     g_object_unref(pl);
-    pango_font_description_free(fd);
 
     cairo_surface_flush(b->cairo);
 }
@@ -12359,7 +12357,7 @@ menu_surface_size_alloc(struct bar *b, int width, int height)
     b->menu_surf_width = width;
     b->menu_surf_height = height;
     if (b->menu_cr) { cairo_destroy(b->menu_cr); b->menu_cr = NULL; }
-    if (b->menu_cairo) { cairo_surface_destroy(b->menu_cairo); b->menu_cairo = NULL; }
+    SURFACE_CLEAR(b->menu_cairo);
     size_t buf_size = (size_t)stride * (size_t)phys_h;
     if (shm_pool_init(&b->menu_pool, buf_size) < 0) {
         b->menu_surf_configured = 0;
@@ -12468,7 +12466,7 @@ menu_surface_free(struct bar *b)
     transition_cancel(&g_menu_trans);
     if (b->menu_frame_cb) { wl_callback_destroy(b->menu_frame_cb); b->menu_frame_cb = NULL; }
     b->menu_frame_pending = 0;
-    if (b->menu_cairo) { cairo_surface_destroy(b->menu_cairo); b->menu_cairo = NULL; }
+    SURFACE_CLEAR(b->menu_cairo);
     if (b->menu_cr) { cairo_destroy(b->menu_cr); b->menu_cr = NULL; }
     shm_pool_cleanup(&b->menu_pool);
     b->menu_surf_configured = 0;
@@ -12493,23 +12491,19 @@ menu_surface_render(struct bar *b)
         return;
     }
 
-    PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
-    pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(cr);
     if (!pl) {
-        pango_font_description_free(fd);
         cairo_surface_flush(b->menu_cairo);
         menu_commit(b);
         return;
     }
-    pango_layout_set_font_description(pl, fd);
+    layout_set_font_size(pl, FONT_SIZE);
 
     int grouped = transition_begin_frame(cr, &g_menu_trans);
     menu_draw(cr, pl, g_bar.menu_height);
     transition_end_frame(cr, &g_menu_trans, grouped);
 
     g_object_unref(pl);
-    pango_font_description_free(fd);
 
     cairo_surface_flush(b->menu_cairo);
     menu_commit(b);
@@ -12675,7 +12669,7 @@ flyout_surface_size_alloc(struct bar *b, int width, int height)
     b->fly_surf_width = width;
     b->fly_surf_height = height;
     if (b->fly_cr) { cairo_destroy(b->fly_cr); b->fly_cr = NULL; }
-    if (b->fly_cairo) { cairo_surface_destroy(b->fly_cairo); b->fly_cairo = NULL; }
+    SURFACE_CLEAR(b->fly_cairo);
     size_t buf_size = (size_t)stride * (size_t)phys_h;
     if (shm_pool_init(&b->fly_pool, buf_size) < 0) {
         b->fly_surf_configured = 0;
@@ -12692,7 +12686,7 @@ flyout_surface_free(struct bar *b)
     transition_cancel(&g_fly_trans);
     if (b->fly_frame_cb) { wl_callback_destroy(b->fly_frame_cb); b->fly_frame_cb = NULL; }
     b->fly_frame_pending = 0;
-    if (b->fly_cairo) { cairo_surface_destroy(b->fly_cairo); b->fly_cairo = NULL; }
+    SURFACE_CLEAR(b->fly_cairo);
     if (b->fly_cr) { cairo_destroy(b->fly_cr); b->fly_cr = NULL; }
     shm_pool_cleanup(&b->fly_pool);
     b->fly_surf_configured = 0;
@@ -12788,23 +12782,19 @@ flyout_surface_render(struct bar *b)
         return;
     }
 
-    PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
-    pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(cr);
     if (!pl) {
-        pango_font_description_free(fd);
         cairo_surface_flush(b->fly_cairo);
         fly_commit(b);
         return;
     }
-    pango_layout_set_font_description(pl, fd);
+    layout_set_font_size(pl, FONT_SIZE);
 
     int grouped = transition_begin_frame(cr, &g_fly_trans);
     flyout_draw(cr, pl);
     transition_end_frame(cr, &g_fly_trans, grouped);
 
     g_object_unref(pl);
-    pango_font_description_free(fd);
 
     cairo_surface_flush(b->fly_cairo);
     fly_commit(b);
@@ -12944,7 +12934,7 @@ osk_surface_size_alloc(struct bar *b, int width, int height)
     b->osk_surf_width = width;
     b->osk_surf_height = height;
     if (b->osk_cr) { cairo_destroy(b->osk_cr); b->osk_cr = NULL; }
-    if (b->osk_cairo) { cairo_surface_destroy(b->osk_cairo); b->osk_cairo = NULL; }
+    SURFACE_CLEAR(b->osk_cairo);
     size_t buf_size = (size_t)stride * (size_t)phys_h;
     if (shm_pool_init(&b->osk_pool, buf_size) < 0) {
         b->osk_surf_configured = 0;
@@ -12962,7 +12952,7 @@ osk_surface_free(struct bar *b)
     osk_key_release();
     if (b->osk_frame_cb) { wl_callback_destroy(b->osk_frame_cb); b->osk_frame_cb = NULL; }
     b->osk_frame_pending = 0;
-    if (b->osk_cairo) { cairo_surface_destroy(b->osk_cairo); b->osk_cairo = NULL; }
+    SURFACE_CLEAR(b->osk_cairo);
     if (b->osk_cr) { cairo_destroy(b->osk_cr); b->osk_cr = NULL; }
     shm_pool_cleanup(&b->osk_pool);
     b->osk_surf_configured = 0;
@@ -13050,23 +13040,19 @@ osk_surface_render(struct bar *b)
         return;
     }
 
-    PangoFontDescription *fd = pango_font_description_from_string(FONT_FAMILY);
-    pango_font_description_set_absolute_size(fd, FONT_SIZE * PANGO_SCALE);
     PangoLayout *pl = pango_ctx_layout(cr);
     if (!pl) {
-        pango_font_description_free(fd);
         cairo_surface_flush(b->osk_cairo);
         osk_commit(b);
         return;
     }
-    pango_layout_set_font_description(pl, fd);
+    layout_set_font_size(pl, FONT_SIZE);
 
     int grouped = transition_begin_frame(cr, &g_osk_trans);
     osk_draw(cr, pl);
     transition_end_frame(cr, &g_osk_trans, grouped);
 
     g_object_unref(pl);
-    pango_font_description_free(fd);
 
     cairo_surface_flush(b->osk_cairo);
     osk_commit(b);
@@ -13527,7 +13513,7 @@ bar_reinit_shm(struct bar *b, int w, int h, int scale)
     size_t buf_size = (size_t)stride * (size_t)phys_h;
 
     if (b->cr) { cairo_destroy(b->cr); b->cr = NULL; }
-    if (b->cairo) { cairo_surface_destroy(b->cairo); b->cairo = NULL; }
+    SURFACE_CLEAR(b->cairo);
     if (shm_pool_init(&b->pool, buf_size) < 0) {
         b->needs_render = 0;
         return 0;
@@ -15598,18 +15584,18 @@ cleanup(void)
     transition_cancel(&g_osk_trans);
     osk_key_release();
     if (g_bar.frame_cb) { wl_callback_destroy(g_bar.frame_cb); g_bar.frame_cb = NULL; }
-    if (g_bar.cairo) { cairo_surface_destroy(g_bar.cairo); g_bar.cairo = NULL; }
+    SURFACE_CLEAR(g_bar.cairo);
     if (g_bar.cr) { cairo_destroy(g_bar.cr); g_bar.cr = NULL; }
     shm_pool_cleanup(&g_bar.pool);
     if (g_bar.fly_frame_cb) { wl_callback_destroy(g_bar.fly_frame_cb); g_bar.fly_frame_cb = NULL; }
-    if (g_bar.fly_cairo) { cairo_surface_destroy(g_bar.fly_cairo); g_bar.fly_cairo = NULL; }
+    SURFACE_CLEAR(g_bar.fly_cairo);
     if (g_bar.fly_cr) { cairo_destroy(g_bar.fly_cr); g_bar.fly_cr = NULL; }
     shm_pool_cleanup(&g_bar.fly_pool);
     if (g_bar.fly_popup) xdg_popup_destroy(g_bar.fly_popup);
     if (g_bar.fly_xdg_surface) xdg_surface_destroy(g_bar.fly_xdg_surface);
     if (g_bar.fly_surface) wl_surface_destroy(g_bar.fly_surface);
     if (g_bar.menu_frame_cb) { wl_callback_destroy(g_bar.menu_frame_cb); g_bar.menu_frame_cb = NULL; }
-    if (g_bar.menu_cairo) { cairo_surface_destroy(g_bar.menu_cairo); g_bar.menu_cairo = NULL; }
+    SURFACE_CLEAR(g_bar.menu_cairo);
     if (g_bar.menu_cr) { cairo_destroy(g_bar.menu_cr); g_bar.menu_cr = NULL; }
     /* The cairo surfaces point into the pool's mmap — drop them first. */
     shm_pool_cleanup(&g_bar.menu_pool);
@@ -15617,7 +15603,7 @@ cleanup(void)
     if (g_bar.menu_xdg_surface) xdg_surface_destroy(g_bar.menu_xdg_surface);
     if (g_bar.menu_surface) wl_surface_destroy(g_bar.menu_surface);
     if (g_bar.osk_frame_cb) { wl_callback_destroy(g_bar.osk_frame_cb); g_bar.osk_frame_cb = NULL; }
-    if (g_bar.osk_cairo) { cairo_surface_destroy(g_bar.osk_cairo); g_bar.osk_cairo = NULL; }
+    SURFACE_CLEAR(g_bar.osk_cairo);
     if (g_bar.osk_cr) { cairo_destroy(g_bar.osk_cr); g_bar.osk_cr = NULL; }
     shm_pool_cleanup(&g_bar.osk_pool);
     if (g_bar.osk_popup) xdg_popup_destroy(g_bar.osk_popup);
@@ -15626,7 +15612,7 @@ cleanup(void)
     if (g_bar.layer_surface) zwlr_layer_surface_v1_destroy(g_bar.layer_surface);
     if (g_bar.surface) wl_surface_destroy(g_bar.surface);
     output_bg_surface_destroy_all();
-    if (g_wlp.wall_image) { cairo_surface_destroy(g_wlp.wall_image); g_wlp.wall_image = NULL; }
+    SURFACE_CLEAR(g_wlp.wall_image);
     if (g_wl.xdg_wm_base) xdg_wm_base_destroy(g_wl.xdg_wm_base);
     if (g_wl.layer_shell) zwlr_layer_shell_v1_destroy(g_wl.layer_shell);
     if (g_wl.vk) zwp_virtual_keyboard_v1_destroy(g_wl.vk);
