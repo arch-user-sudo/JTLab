@@ -352,11 +352,19 @@ render_request(void)
         g_bar.osk_needs_render = 1;
 }
 
-struct power_menu {
-    int hover;
+struct hover_delay {
+    int target;
+    int shown;
+    guint timer;
 };
 
-static struct power_menu g_pmenu = { 0 };
+struct power_menu {
+    int hover;
+    struct hover_delay tip;
+};
+
+static struct power_menu g_pmenu = { .hover = -1, .tip = { .target = -1 } };
+static struct hover_delay g_bar_app_tip = { .target = -1 };
 
 enum { SYS_STAT_RAM, SYS_STAT_CPU, SYS_STAT_GPU, SYS_STAT_COUNT };
 
@@ -2577,6 +2585,7 @@ static struct transition g_osk_trans;
 /* Exponential approach. 18/s is the continuous-time equivalent of the old
  * 25% per 16ms step: exp(-18 * 0.016) ~= 0.75. */
 #define TRANS_RATE 18.0
+#define HOVER_TIP_DELAY_MS 1000
 
 static void
 transition_free_snapshot(struct transition *t)
@@ -10244,7 +10253,7 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
         cairo_restore(cr);
     }
 
-    if (g_pmenu.hover >= 0) {
+    if (g_pmenu.hover >= 0 && g_pmenu.tip.shown && g_pmenu.tip.target == g_pmenu.hover) {
         const char *label = power_labels[g_pmenu.hover];
         pango_layout_set_text(pl, label, -1);
         int tw, th;
@@ -10608,6 +10617,39 @@ static const size_t osk_row_counts[OSK_ROWS] = {
     sizeof(osk_row4) / sizeof(osk_row4[0]),
 };
 
+static const char *
+bar_app_tip_label(double *cx)
+{
+    if (!g_bar_app_tip.shown || g_bar_app_tip.target < 0) return NULL;
+    if (g_bar_app_tip.target < 10000) {
+        int i = g_bar_app_tip.target;
+        if (i >= 0 && i < g_box.n_pl && g_app.pinned[i] < g_app.n_apps) {
+            if (cx) *cx = g_box.pl[i].x + g_box.pl[i].w / 2.0;
+            return g_app.apps[g_app.pinned[i]].name;
+        }
+    } else {
+        int gi = g_bar_app_tip.target - 10000;
+        if (gi >= 0 && gi < g_box.n_taskbar_groups) {
+            struct taskbar_group *tg = &g_box.taskbar_groups[gi];
+            if (cx) *cx = tg->x + tg->w / 2.0;
+            if (tg->n_windows > 0) {
+                const char *tip = g_toplevels[tg->windows[0]].title;
+                if (tip && *tip) return tip;
+                return g_toplevels[tg->windows[0]].app_id;
+            }
+        }
+    }
+    return NULL;
+}
+
+static int
+bar_app_tip_popup_h(void)
+{
+    double cx = 0;
+    return (bar_app_tip_label(&cx) && *bar_app_tip_label(&cx)) ?
+           (int)(FONT_SIZE + 16) : 0;
+}
+
 /* Height of the open flyouts on the shared strip. The keyboard lives on its own
  * surface and deliberately does not contribute to this. */
 static int
@@ -10622,7 +10664,12 @@ flyout_other_height(void)
     int ch = g_calpop.open ? calpop_height() : 0;
     int wlh = g_wlp.open ? wlp_height() : 0;
     int xxh = g_wxpop.open ? wxpop_height() : 0;
-    return ph + cph + vh + th + wh + nh + ch + wlh + xxh;
+    int base = ph + cph + vh + th + wh + nh + ch + wlh + xxh;
+    if (base == 0) {
+        int tip_h = bar_app_tip_popup_h();
+        if (tip_h > 0) base = tip_h + 5; /* 5px gap above bar */
+    }
+    return base;
 }
 
 static double
@@ -11892,6 +11939,45 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
 
     if (g_wlp.open)
         wlp_draw(cr, pl);
+
+    {
+        double cx = 0;
+        const char *tip = bar_app_tip_label(&cx);
+        int tip_h = bar_app_tip_popup_h();
+        int base = (g_gpopup.open ? g_gpopup.height : 0) +
+                   (g_cpop.open ? (int)g_cpop.h : 0) +
+                   (g_volpop.open ? volpop_height() : 0) +
+                   (g_tm.open ? g_tm.height : 0) +
+                   (g_wspop.open ? wspop_height() : 0) +
+                   (g_npop.open ? notif_height() : 0) +
+                   (g_calpop.open ? calpop_height() : 0) +
+                   (g_wlp.open ? wlp_height() : 0) +
+                   (g_wxpop.open ? wxpop_height() : 0);
+        if (tip && *tip && tip_h > 0 && base == 0) {
+            pango_layout_set_width(pl, -1);
+            pango_layout_set_alignment(pl, PANGO_ALIGN_LEFT);
+            pango_layout_set_ellipsize(pl, PANGO_ELLIPSIZE_END);
+            pango_layout_set_text(pl, tip, -1);
+            int tw, th;
+            pango_layout_get_pixel_size(pl, &tw, &th);
+            double pad_x = MENU_PADDING;
+            double pad_y = 4;
+            double bw = tw + pad_x * 2;
+            double bh = th + pad_y * 2;
+            double bx = cx - bw / 2.0;
+            double by = (double)(tip_h + 5) - 5 - bh; /* 5px above bar */
+            if (bx < PPADDING) bx = PPADDING;
+            if (bx + bw > g_bar.width - PPADDING) bx = g_bar.width - PPADDING - bw;
+            cairo_new_path(cr);
+            cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+            rounded_rect(cr, bx, by, bw, bh, 4);
+            cairo_set_source_rgba(cr, 0.13, 0.13, 0.13, 0.95);
+            cairo_fill(cr);
+            cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 1.0);
+            cairo_move_to(cr, bx + pad_x, by + pad_y);
+            pango_cairo_show_layout(cr, pl);
+        }
+    }
 }
 
 static void
@@ -12227,7 +12313,6 @@ bar_draw(struct bar *b)
         }
     }
 
-
     g_object_unref(pl);
 
     cairo_surface_flush(b->cairo);
@@ -12452,11 +12537,15 @@ static const struct xdg_surface_listener menu_xdg_surface_listener = {
     .configure = menu_xdg_surface_configure,
 };
 
+static void hover_delay_clear(struct hover_delay *d);
+static void hover_delay_set(struct hover_delay *d, int target, unsigned delay_ms);
+
 static void
 menu_hover_reset(void)
 {
     g_pointer.hover_menu_idx = -1;
     g_pmenu.hover = -1;
+    hover_delay_clear(&g_pmenu.tip);
     g_sys.ctrl_hover = -1;
 }
 
@@ -12719,6 +12808,16 @@ flyout_popup_done(void *data, struct xdg_popup *popup)
 {
     (void)data; (void)popup;
     struct bar *b = &g_bar;
+    /* A tooltip-only no-grab popup should never get a done event in normal
+     * flow, but if the compositor dismisses it, just tear it down. */
+    if (bar_app_tip_popup_h() > 0 &&
+        !g_gpopup.open && !g_cpop.open && !g_volpop.open &&
+        !g_tm.open && !g_wspop.open && !g_npop.open &&
+        !g_calpop.open && !g_wlp.open && !g_wxpop.open) {
+        if (b->fly_popup)
+            flyout_surface_destroy(b);
+        return;
+    }
     /* The compositor dismissed the grab: the surface is already unmapped, so
      * skip the close animation and drop every flyout's state at once. */
     int resume_osk = g_osk.suspended;
@@ -12831,8 +12930,14 @@ flyout_surface_create(struct bar *b, int width, int height)
      * the grab has to come after the parent is assigned: some compositors
      * reject a grab that arrives before get_popup(). */
     zwlr_layer_surface_v1_get_popup(b->layer_surface, b->fly_popup);
-    if (g_pointer.last_serial && g_wl.seat)
-        xdg_popup_grab(b->fly_popup, g_wl.seat, g_pointer.last_serial);
+    {
+        int tip_only = bar_app_tip_popup_h() > 0 &&
+                       !g_gpopup.open && !g_cpop.open && !g_volpop.open &&
+                       !g_tm.open && !g_wspop.open && !g_npop.open &&
+                       !g_calpop.open && !g_wlp.open && !g_wxpop.open;
+        if (!tip_only && g_pointer.last_serial && g_wl.seat)
+            xdg_popup_grab(b->fly_popup, g_wl.seat, g_pointer.last_serial);
+    }
 
     b->fly_req_width = width;
     b->fly_req_height = height;
@@ -14054,6 +14159,55 @@ ctx_hover_refresh(int on_menu)
     return old != g_pointer.hover_ctx_idx;
 }
 
+static void
+hover_delay_clear(struct hover_delay *d)
+{
+    if (d->timer) {
+        GSource *s = g_sni.glib_ctx ?
+            g_main_context_find_source_by_id(g_sni.glib_ctx, d->timer) : NULL;
+        if (s) g_source_destroy(s);
+        d->timer = 0;
+    }
+    d->target = -1;
+    d->shown = 0;
+}
+
+static gboolean
+hover_delay_fire(void *data)
+{
+    struct hover_delay *d = data;
+    d->timer = 0;
+    d->shown = 1;
+    popup_size_changed();
+    render_request();
+    return G_SOURCE_REMOVE;
+}
+
+static void
+hover_delay_set(struct hover_delay *d, int target, unsigned delay_ms)
+{
+    if (d->target == target)
+        return;
+    if (d->timer) {
+        GSource *s = g_sni.glib_ctx ?
+            g_main_context_find_source_by_id(g_sni.glib_ctx, d->timer) : NULL;
+        if (s) g_source_destroy(s);
+        d->timer = 0;
+    }
+    d->target = target;
+    d->shown = 0;
+    popup_size_changed();
+    if (target < 0) {
+        render_request();
+        return;
+    }
+    if (!g_sni.glib_ctx) return;
+    GSource *src = g_timeout_source_new(delay_ms);
+    g_source_set_callback(src, hover_delay_fire, d, NULL);
+    d->timer = g_source_attach(src, g_sni.glib_ctx);
+    g_source_unref(src);
+}
+
 static int
 menu_hover_refresh(int on_menu)
 {
@@ -14063,6 +14217,7 @@ menu_hover_refresh(int on_menu)
     if (g_bar.menu_open && !g_ctx.open) {
         g_pointer.hover_menu_idx = on_menu ? menu_hit_test(g_pointer.x, g_pointer.y) : -1;
         g_pmenu.hover = on_menu ? menu_power_hit_test(g_pointer.x, g_pointer.y) : -1;
+        hover_delay_set(&g_pmenu.tip, g_pmenu.hover, HOVER_TIP_DELAY_MS);
         g_sys.ctrl_hover = on_menu ? sys_ctrl_hit_test(g_pointer.x, g_pointer.y) : -1;
         int pos = menu_pos_of_app(g_pointer.hover_menu_idx);
         if (pos >= 0) g_app.menu_sel = pos;
@@ -14110,6 +14265,14 @@ bar_hover_refresh(int on_bar, int on_fly)
             *bar_tbl[i].field = v;
             changed = 1;
         }
+    }
+    {
+        int tip_target = -1;
+        if (g_pointer.hover_pinned_idx >= 0)
+            tip_target = g_pointer.hover_pinned_idx;
+        else if (g_pointer.hover_taskbar_idx >= 0)
+            tip_target = 10000 + g_pointer.hover_taskbar_idx;
+        hover_delay_set(&g_bar_app_tip, tip_target, HOVER_TIP_DELAY_MS);
     }
     return changed;
 }
