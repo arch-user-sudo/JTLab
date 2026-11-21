@@ -14703,11 +14703,7 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
          * a fresh launch is still waiting for its first window. */
         static int64_t launched_at_ms;
         close_all_popups();
-        if (!focus_app_window("jtnetworks")
-                && now_ms() - launched_at_ms > 1500) {
-            theme_run_app(NETWORKS_CMD);
-            launched_at_ms = now_ms();
-        }
+        launch_or_focus_app("jtnetworks", NETWORKS_CMD, &launched_at_ms);
         render_request();
         return;
     }
