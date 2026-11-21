@@ -5996,9 +5996,9 @@ struct wall_popup {
     int enabled;
     int hover_power;
     char cur_wallpaper[512];
-    /* Decoded current wallpaper, kept so that a configure event (compositors
-     * re-send one on every layer arrangement change, e.g. a popup opening or
-     * closing) or a power toggle does not re-read and re-decode the file. */
+    /* Transient decoded wallpaper, held only while deriving the accent after
+     * painting. The per-output shm buffers keep the painted result; rare
+     * reconfigures reload the image from disk. */
     cairo_surface_t *wall_image;
     char wall_image_path[512];
     long wall_image_mtime;
@@ -6782,15 +6782,29 @@ bg_paint_output(struct output_entry *o, cairo_surface_t *wall)
     bg_commit(o);
 }
 
-/* Repaint one output from the cached wallpaper state. This is the cheap path:
- * it never touches the disk, so it is safe to call on a reconfigure. */
+static cairo_surface_t *bg_image_load(const char *path);
+
+/* Repaint one output from the cached wallpaper state. The decoded image is
+ * normally dropped after painting to save RAM, so a reconfigure reloads it
+ * from disk - rare, and cheaper than keeping the full-resolution image
+ * resident at all times. */
 static void
 bg_repaint_output(struct output_entry *o)
 {
-    if (g_wlp.enabled && g_wlp.cur_wallpaper[0])
-        bg_paint_output(o, g_wlp.wall_image);
-    else
+    if (g_wlp.enabled && g_wlp.cur_wallpaper[0]) {
+        if (g_wlp.wall_image) {
+            bg_paint_output(o, g_wlp.wall_image);
+        } else {
+            cairo_surface_t *img = bg_image_load(g_wlp.cur_wallpaper);
+            bg_paint_output(o, img);
+            if (img) {
+                cairo_surface_destroy(img);
+                heap_return_pages();
+            }
+        }
+    } else {
         bg_paint_output(o, NULL);
+    }
 }
 
 static cairo_surface_t *
@@ -7565,29 +7579,20 @@ static void
 wlp_set_wallpaper_bg(const char *path)
 {
     if (!path || !path[0]) return;
-    /* Decode once and cache, keyed on the path and its mtime: a reconfigure or
-     * a power toggle then repaints the cached surface without re-reading the
-     * file, while an image replaced in place is still picked up. */
-    struct stat st;
-    long mtime = (stat(path, &st) == 0) ? (long)st.st_mtime : 0;
-    if (!g_wlp.wall_image || strcmp(g_wlp.wall_image_path, path) != 0 ||
-        g_wlp.wall_image_mtime != mtime) {
-        /* Drop the previous wallpaper before decoding the new one.  The
-         * output buffer still holds the old picture, so there is no visual
-         * gap, and the allocator can reuse the released pages instead of
-         * having both wallpapers resident at once. */
-        if (g_wlp.wall_image) {
-            cairo_surface_destroy(g_wlp.wall_image);
-            g_wlp.wall_image = NULL;
-            heap_return_pages();
-        }
-        g_wlp.wall_image = bg_image_load(path);
-        g_wlp.wall_image_mtime = mtime;
-        snprintf(g_wlp.wall_image_path, sizeof(g_wlp.wall_image_path),
-                 "%s", path);
-    }
+    /* Decode, paint every output, then keep the image only briefly for
+     * theme_update_from_wallpaper() to derive the accent from.  The per-output
+     * shm buffers already hold the painted result, so the decoded image is
+     * dropped afterwards; reconfigures reload from disk via bg_repaint_output(). */
+    cairo_surface_t *img = bg_image_load(path);
     for (int i = 0; i < g_n_outputs; i++)
-        bg_paint_output(g_outputs[i], g_wlp.wall_image);
+        bg_paint_output(g_outputs[i], img);
+    if (g_wlp.wall_image) {
+        cairo_surface_destroy(g_wlp.wall_image);
+        g_wlp.wall_image = NULL;
+    }
+    g_wlp.wall_image = img;
+    g_wlp.wall_image_path[0] = '\0';
+    g_wlp.wall_image_mtime = 0;
 }
 
 static void
@@ -7783,8 +7788,25 @@ static void
 theme_update_from_wallpaper(void)
 {
     unsigned accent = ACCENT_HEX;
-    if (g_wlp.enabled && g_wlp.wall_image)
-        theme_accent_from_surface(g_wlp.wall_image, &accent);
+    if (g_wlp.enabled) {
+        cairo_surface_t *img = g_wlp.wall_image;
+        cairo_surface_t *tmp = NULL;
+        if (!img && g_wlp.cur_wallpaper[0]) {
+            tmp = bg_image_load(g_wlp.cur_wallpaper);
+            img = tmp;
+        }
+        if (img)
+            theme_accent_from_surface(img, &accent);
+        if (tmp) {
+            cairo_surface_destroy(tmp);
+            heap_return_pages();
+        }
+    }
+    if (g_wlp.wall_image) {
+        cairo_surface_destroy(g_wlp.wall_image);
+        g_wlp.wall_image = NULL;
+        heap_return_pages();
+    }
 
     theme_set_accent(accent);
     theme_update_open_apps();

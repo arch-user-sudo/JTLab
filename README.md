@@ -179,13 +179,13 @@ jtlabctl quit  # Exit jtlab
 
 ## Memory Usage
 
-jtlab's resident memory is dominated by the wallpaper, and a large footprint here is expected rather than a leak. The image is decoded once into raw, uncompressed pixels and kept in that form while it is the active wallpaper -- it is *not* stored compressed between frames.
+jtlab's resident memory is dominated by the wallpaper, and a large footprint here is expected rather than a leak. The wallpaper is decoded to raw, uncompressed pixels for painting, then the decoded source image is released -- it is *not* kept resident between rare reconfigures.
 
-- **Uncompressed picture data.** The wallpaper is decoded to raw 32-bit ARGB (4 bytes per pixel) and held that way. The compressed size of the source file is irrelevant; only the pixel resolution matters. A 1080p image costs ~8 MB, 1440p ~14 MB and 4K ~33 MB, whether the source PNG/JPEG is 200 KB or 20 MB. A high-resolution source stays high-resolution in memory even when shown on a smaller output.
-- **One full-resolution buffer per output.** Each output's background layer surface owns an shm buffer sized to that output in device pixels, also 4 bytes per pixel, living in `/dev/shm`. That is roughly 8 MB at 1080p and 33 MB at 4K (or at 2x scale on a 1080p output), per monitor.
+- **Per-output wallpaper buffers.** Each output's background layer surface owns an shm buffer sized to that output in device pixels, 4 bytes per pixel (ARGB32), living in `/dev/shm`. That is roughly 8 MB at 1080p and 33 MB at 4K (or at 2x scale on a 1080p output), per monitor. These buffers hold the painted wallpaper and are the main steady-state cost.
+- **Transient decode.** When setting a wallpaper, jtlab decodes the source image, cover-fits it into each output buffer, derives the accent, and frees the decoded image. A rare output reconfigure reloads it from disk. The compressed size of the source file is irrelevant during decode; only source resolution matters for that temporary peak.
 - **Browser thumbnails.** While the wallpaper browser is open, one small 130x80 thumbnail is kept per entry; these are freed when it closes.
 
-Only the current wallpaper is decoded at any time (single-slot cache): selecting a new one destroys the previous decoded image and hands its heap pages back to the OS immediately, so RSS follows the active wallpaper instead of the largest one ever loaded. Album-art images and browser thumbnails are released the same way when they are replaced or the browser closes. Because the wallpaper is rendered in its pure, uncompressed form, memory scales with resolution rather than with the source file size.
+Album-art images and browser thumbnails are released when replaced or closed. Steady-state wallpaper memory scales with output device resolution and monitor count, not with the source file size.
 
 ## Known Issues
 
