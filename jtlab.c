@@ -6603,13 +6603,18 @@ wlp_height(void)
 static void
 wlp_open(void)
 {
+    if (g_wlp.open)
+        return;
+    if (g_wlp.loader) {
+        g_thread_join(g_wlp.loader);
+        g_wlp.loader = NULL;
+    }
     g_wlp.open = 1;
     g_wlp.hover_idx = -1;
     g_wlp.hover_power = 0;
     g_wlp.scroll = 0;
     g_wlp.anim_px = 0;
     g_wlp.target_px = 0;
-    g_wlp.loader = NULL;
     atomic_store(&g_wlp.loaded_count, 0);
     wlp_scan();
 
