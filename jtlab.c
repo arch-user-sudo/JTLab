@@ -15171,7 +15171,8 @@ pointer_handle_axis(void *d, struct wl_pointer *p, uint32_t t,
     }
 
     int over_wlp = on_fly && popup_coords_safe(t) && g_wlp.open &&
-                   wlp_hit_test(g_pointer.x, g_pointer.y) >= 0;
+                   in_rect(g_pointer.x, g_pointer.y, g_wlp.x, g_wlp.y,
+                           g_wlp.w, g_wlp.h - PPADDING);
     if (over_wlp) {
         wlp_scroll(delta < 0 ? -40.0 : 40.0);
         return;
