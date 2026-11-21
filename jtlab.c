@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -3927,35 +3928,6 @@ exec_clean(const char *src, char *dst, size_t dst_sz)
     dst[di] = '\0';
 }
 
-static void
-run_cmd_child_cleanup(void)
-{
-    /*
-     * JTLab ignores SIGCHLD to auto-reap its own children. Reset it for
-     * launched applications so system()/popen()/waitpid() work normally.
-     */
-    signal(SIGCHLD, SIG_DFL);
-
-    int devnull = open("/dev/null", O_RDWR);
-    if (devnull < 0) _exit(127);
-    if (devnull != 0) dup2(devnull, 0);
-    if (devnull != 1) dup2(devnull, 1);
-    if (devnull != 2) dup2(devnull, 2);
-    if (devnull > 2) close(devnull);
-    DIR *d = opendir("/proc/self/fd");
-    if (d) {
-        int dfd = dirfd(d);
-        struct dirent *e;
-        while ((e = readdir(d))) {
-            char *end = NULL;
-            long fd = strtol(e->d_name, &end, 10);
-            if (end == e->d_name || *end) continue;
-            if (fd > 2 && (int)fd != dfd) close((int)fd);
-        }
-        closedir(d);
-    }
-}
-
 /* Run a command, optionally in a terminal. */
 static void
 run_cmd(const char *cmd, int terminal)
@@ -3969,13 +3941,50 @@ run_cmd(const char *cmd, int terminal)
         snprintf(buf, sizeof(buf), "%s %s", TERMINAL_CMD, clean);
     else
         snprintf(buf, sizeof(buf), "%s", clean);
-    pid_t pid = fork();
-    if (pid == 0) {
-        setsid();
-        run_cmd_child_cleanup();
-        execl("/bin/sh", "sh", "-c", buf, NULL);
-        _exit(127);
+
+    posix_spawnattr_t attr;
+    posix_spawn_file_actions_t fa;
+    if (posix_spawnattr_init(&attr) != 0)
+        return;
+    if (posix_spawn_file_actions_init(&fa) != 0) {
+        posix_spawnattr_destroy(&attr);
+        return;
     }
+
+    short flags = POSIX_SPAWN_SETSID | POSIX_SPAWN_SETSIGDEF;
+    posix_spawnattr_setflags(&attr, flags);
+    sigset_t sigdefault;
+    sigemptyset(&sigdefault);
+    sigaddset(&sigdefault, SIGCHLD);
+    posix_spawnattr_setsigdefault(&attr, &sigdefault);
+
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDWR, 0);
+    posix_spawn_file_actions_adddup2(&fa, 0, 1);
+    posix_spawn_file_actions_adddup2(&fa, 0, 2);
+
+    DIR *d = opendir("/proc/self/fd");
+    if (d) {
+        int dfd = dirfd(d);
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            char *end = NULL;
+            long fd = strtol(e->d_name, &end, 10);
+            if (end == e->d_name || *end) continue;
+            if (fd > 2 && (int)fd != dfd)
+                posix_spawn_file_actions_addclose(&fa, (int)fd);
+        }
+        posix_spawn_file_actions_addclose(&fa, dfd);
+        closedir(d);
+    }
+
+    char sh[] = "sh";
+    char dash_c[] = "-c";
+    char *const argv[] = {sh, dash_c, buf, NULL};
+    pid_t pid;
+    (void)posix_spawn(&pid, "/bin/sh", &fa, &attr, argv, environ);
+
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&attr);
 }
 
 /* Launch one of the companion GUIs with the current wallpaper accent. The
@@ -10450,6 +10459,17 @@ focus_app_window(const char *app_id)
     return 0;
 }
 
+/* Focus an existing app window, otherwise launch it with the live accent.
+ * Debounces launches to avoid double-spawns on rapid clicks. */
+static void
+launch_or_focus_app(const char *app_id, const char *cmd, int64_t *launched_at_ms)
+{
+    if (!focus_app_window(app_id) && now_ms() - *launched_at_ms > 1500) {
+        theme_run_app(cmd);
+        *launched_at_ms = now_ms();
+    }
+}
+
 /* Runs the action behind quick-action button i. */
 static void
 wspop_action_activate(int i)
@@ -10463,11 +10483,7 @@ wspop_action_activate(int i)
          * wrapper is needed.  A click focuses the window if it is already
          * up, otherwise launches it. */
         static int64_t launched_at_ms;
-        if (!focus_app_window("jtspeedtest")
-                && now_ms() - launched_at_ms > 1500) {
-            theme_run_app(SPEEDTEST_CMD);
-            launched_at_ms = now_ms();
-        }
+        launch_or_focus_app("jtspeedtest", SPEEDTEST_CMD, &launched_at_ms);
         break;
     }
     default:
@@ -14485,11 +14501,7 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
                 /* Focus an existing settings window, otherwise start it with
                  * the live wallpaper accent. */
                 static int64_t launched_at_ms;
-                if (!focus_app_window("jtsettings")
-                        && now_ms() - launched_at_ms > 1500) {
-                    theme_run_app(SETTINGS_CMD);
-                    launched_at_ms = now_ms();
-                }
+                launch_or_focus_app("jtsettings", SETTINGS_CMD, &launched_at_ms);
                 menu_close(&g_bar);
                 return;
             }
