@@ -4230,6 +4230,31 @@ enum {
     POWER_LOCK_IDX,
 };
 
+/* True when systemd is PID 1.  On OpenRC systems elogind provides the same
+ * org.freedesktop.login1 D-Bus interface, but there is no systemctl to talk
+ * to: the equivalent verbs are available through `loginctl` instead. */
+static int
+power_systemd_init(void)
+{
+    static int cached = -1;
+    if (cached >= 0) return cached;
+
+    int systemd = 0;
+    FILE *f = fopen("/proc/1/comm", "r");
+    if (f) {
+        char comm[32] = { 0 };
+        size_t n = fread(comm, 1, sizeof(comm) - 1, f);
+        fclose(f);
+        if (n > 0) {
+            comm[n] = '\0';
+            comm[strcspn(comm, "\r\n")] = '\0';
+            systemd = strcmp(comm, "systemd") == 0;
+        }
+    }
+    cached = systemd;
+    return systemd;
+}
+
 static double
 menu_vert_pad(void)
 {
@@ -14457,12 +14482,23 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
                 return;
             }
             if (prow >= 0) {
-                static const char *power_cmds[POWER_ACTION_COUNT] = {
+                /* systemd: systemctl drives poweroff/reboot/suspend.
+                 * OpenRC + elogind: no systemctl, but loginctl exposes the
+                 * same login1 verbs (and already handles logout for both). */
+                static const char *power_cmds_systemd[POWER_ACTION_COUNT] = {
                     "systemctl poweroff",
                     "systemctl reboot",
                     "loginctl terminate-user $USER",
                     "systemctl suspend",
                 };
+                static const char *power_cmds_elogind[POWER_ACTION_COUNT] = {
+                    "loginctl poweroff",
+                    "loginctl reboot",
+                    "loginctl terminate-user $USER",
+                    "loginctl suspend",
+                };
+                const char *const *power_cmds = power_systemd_init()
+                    ? power_cmds_systemd : power_cmds_elogind;
                 run_cmd(power_cmds[prow], 0);
                 menu_close(&g_bar);
                 return;
