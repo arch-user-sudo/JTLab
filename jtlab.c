@@ -5206,6 +5206,15 @@ gpopup_open_jk_preview(void)
     int prev_wlr = -1, prev_ext = -1;
     int was_open_all = g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW &&
                        g_gpopup.focus_on_leave_idx >= 0;
+    int old_ext_wlr[MAX_TOPLEVELS];
+    for (int i = 0; i < MAX_TOPLEVELS; i++) old_ext_wlr[i] = -1;
+    if (was_open_all) {
+        for (int i = 0; i < g_gpopup.n_windows; i++) {
+            int ei = g_gpopup.previews[i] ? g_gpopup.previews[i]->ext_idx : -1;
+            if (ei >= 0 && ei < MAX_TOPLEVELS)
+                old_ext_wlr[ei] = g_gpopup.windows[i];
+        }
+    }
     if (was_open_all && g_gpopup.hover_idx >= 0 && g_gpopup.hover_idx < g_gpopup.n_windows) {
         prev_wlr = g_gpopup.windows[g_gpopup.hover_idx];
         prev_ext = g_gpopup.previews[g_gpopup.hover_idx] ?
@@ -5219,7 +5228,16 @@ gpopup_open_jk_preview(void)
         char used_wlr[MAX_TOPLEVELS];
         memset(used_wlr, 0, sizeof(used_wlr));
         for (int i = 0; i < g_n_ext_toplevels && count < MAX_WINDOWS_PER_GROUP; i++) {
-            int wlr = find_wlr_toplevel_for_ext(i, used_wlr);
+            int wlr = -1;
+            int old = (i < MAX_TOPLEVELS) ? old_ext_wlr[i] : -1;
+            if (old >= 0 && old < g_n_toplevels && !used_wlr[old]) {
+                const char *ea = g_ext_toplevels[i].app_id;
+                const char *wa = g_toplevels[old].app_id;
+                if (ea && wa && strcmp(ea, wa) == 0)
+                    wlr = old;
+            }
+            if (wlr < 0)
+                wlr = find_wlr_toplevel_for_ext(i, used_wlr);
             if (wlr >= 0 && wlr < MAX_TOPLEVELS) used_wlr[wlr] = 1;
             ext_windows[count] = i;
             windows[count] = wlr;
@@ -16893,10 +16911,24 @@ ext_toplevel_handle_closed(void *data, struct ext_foreign_toplevel_handle_v1 *h)
 static void
 ext_toplevel_handle_done(void *data, struct ext_foreign_toplevel_handle_v1 *h)
 {
-    (void)data; (void)h;
+    (void)data;
     if (g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW &&
-        g_gpopup.focus_on_leave_idx >= 0)
-        gpopup_open_jk_preview();
+        g_gpopup.focus_on_leave_idx >= 0) {
+        int idx = find_ext_toplevel(h);
+        int found = 0;
+        if (idx >= 0) {
+            for (int i = 0; i < g_gpopup.n_windows; i++) {
+                if (g_gpopup.previews[i] && g_gpopup.previews[i]->ext_idx == idx) {
+                    found = 1;
+                    break;
+                }
+            }
+        }
+        if (idx >= 0 && !found)
+            gpopup_open_jk_preview();
+        else
+            render_request();
+    }
 }
 
 static void
@@ -17059,7 +17091,10 @@ toplevel_handle_done(void *data, struct zwlr_foreign_toplevel_handle_v1 *h)
     toplevel_recalc_layout();
     if (g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW) {
         if (g_gpopup.focus_on_leave_idx >= 0) {
-            gpopup_open_jk_preview();
+            if (g_n_ext_toplevels == 0)
+                gpopup_open_jk_preview();
+            else
+                render_request();
         } else if (g_gpopup.n_windows > 0) {
             int ref = g_gpopup.windows[0];
             const char *ref_app = (ref >= 0 && ref < g_n_toplevels) ? g_toplevels[ref].app_id : NULL;
