@@ -3,6 +3,9 @@
  * Usage: jtlabctl <command>
  *   menu        toggle the app menu open/closed
  *   screenshot  start the interactive screenshot region selector
+ *   next        select next window in preview
+ *   previous    select previous window in preview
+ *   focus       focus selected preview window
  *   quit        exit the bar
  */
 #include <stdio.h>
@@ -24,7 +27,7 @@ int
 main(int argc, char *argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <command> (menu|screenshot|quit)\n", argv[0]);
+        fprintf(stderr, "usage: %s <command> (menu|screenshot|next|previous|focus|quit)\n", argv[0]);
         return 1;
     }
 

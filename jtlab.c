@@ -47,6 +47,9 @@
 #include "ext-workspace-v1-client-protocol.h"
 #include "wlr-gamma-control-unstable-v1-client-protocol.h"
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
+#include "ext-foreign-toplevel-list-v1-client-protocol.h"
+#include "ext-image-capture-source-v1-client-protocol.h"
+#include "ext-image-copy-capture-v1-client-protocol.h"
 #include "virtual-keyboard-unstable-v1-client-protocol.h"
 
 static struct {
@@ -67,6 +70,9 @@ static struct {
     struct ext_workspace_manager_v1 *ext_ws_mgr;
     struct zwlr_gamma_control_manager_v1 *gamma_mgr;
     struct zwlr_screencopy_manager_v1 *screencopy_mgr;
+    struct ext_image_copy_capture_manager_v1 *ext_capture_mgr;
+    struct ext_foreign_toplevel_image_capture_source_manager_v1 *ext_toplevel_capture_mgr;
+    struct ext_foreign_toplevel_list_v1 *ext_toplevel_list;
     struct zwp_virtual_keyboard_manager_v1 *vk_mgr;
     struct zwp_virtual_keyboard_v1 *vk;
     uint32_t vk_mod_shift, vk_mod_ctrl, vk_mod_alt, vk_mod_super;
@@ -77,6 +83,9 @@ static struct {
     uint32_t xdg_wm_base_name;
     uint32_t toplevel_mgr_name, ext_ws_mgr_name, gamma_mgr_name;
     uint32_t screencopy_mgr_name;
+    uint32_t ext_capture_mgr_name;
+    uint32_t ext_toplevel_capture_mgr_name;
+    uint32_t ext_toplevel_list_name;
     uint32_t vk_mgr_name;
     uint32_t data_device_mgr_name;
 } g_wl = { 0 };
@@ -176,6 +185,14 @@ struct toplevel_entry {
 static struct toplevel_entry g_toplevels[MAX_TOPLEVELS];
 static int g_n_toplevels = 0;
 
+struct ext_toplevel_entry {
+    struct ext_foreign_toplevel_handle_v1 *handle;
+    char *app_id;
+    char *title;
+};
+static struct ext_toplevel_entry g_ext_toplevels[MAX_TOPLEVELS];
+static int g_n_ext_toplevels = 0;
+
 struct shm_pool {
     int fd;
     size_t size;
@@ -269,6 +286,7 @@ struct bar {
     int fly_cfg_width, fly_cfg_height;
     uint32_t fly_reposition_token;
     int fly_dismissed;
+    int fly_grabbed;
     struct shm_pool fly_pool;
     cairo_surface_t *fly_cairo;
     cairo_t *fly_cr;
@@ -356,6 +374,8 @@ struct hover_delay {
     int target;
     int shown;
     guint timer;
+    guint anim_src_id;
+    int64_t show_us;
 };
 
 struct power_menu {
@@ -396,7 +416,7 @@ struct bar_item {
 };
 
 #define MAX_TASKBAR_GROUPS 256
-#define MAX_WINDOWS_PER_GROUP 32
+#define MAX_WINDOWS_PER_GROUP 64
 
 struct taskbar_group {
     double x, w;
@@ -435,15 +455,50 @@ static struct {
     struct audio_snapshot vol_snap;
 } g_box = { 0 };
 
+enum { GPOPUP_LIST = 0, GPOPUP_PREVIEW = 1 };
+
+struct gpopup_preview {
+    struct ext_image_copy_capture_session_v1 *session;
+    struct ext_image_copy_capture_frame_v1 *frame;
+    struct shm_pool pool;
+    uint32_t width, height;
+    uint32_t shm_format;
+    cairo_surface_t *surface;
+    int pending;
+    int failed;
+    guint recapture_id;
+    int ext_idx;
+    double anim_dx;
+    double anim_dx_start;
+};
+
 struct group_popup {
     int open;
+    int mode;
     int windows[MAX_WINDOWS_PER_GROUP];
     int n_windows;
     double x, y;
-    int height;
+    int w, h;
+    double scroll;      /* horizontal scroll offset in px, preview mode */
+    double scroll_max;
     int hover_idx;
     int hover_close;
+    int focus_on_leave_idx;
+    struct gpopup_preview *previews[MAX_WINDOWS_PER_GROUP];
+    double anim_x, anim_w, anim_h, anim_scroll;
+    double anim_target_x, anim_target_w, anim_target_h, anim_target_scroll;
+    double anim_start_x, anim_start_w, anim_start_h, anim_start_scroll;
+    gint64 anim_start_us;
+    int animating;
+    guint anim_src_id;
+    int scroll_drag;
+    double scroll_drag_off;
 };
+
+#define GPOPUP_PREVIEW_CARD_W 180
+#define GPOPUP_PREVIEW_CARD_H 120
+#define GPOPUP_PREVIEW_ICON 48
+#define GPOPUP_PREVIEW_GAP 8
 
 static struct group_popup g_gpopup = { 0 };
 
@@ -1481,6 +1536,7 @@ pw_shutdown(void)
         g_pw.pw_inited = 0;
     }
 }
+#ifdef JTLAB_DEBUG
 static int
 trace_on(void)
 {
@@ -1488,6 +1544,7 @@ trace_on(void)
     if (v < 0) v = getenv("JTLAB_TRACE") ? 1 : 0;
     return v;
 }
+#endif
 
 static void
 pinned_recalc_layout(void)
@@ -1511,6 +1568,7 @@ pinned_recalc_layout(void)
 }
 
 static void gpopup_close(void);
+static void gpopup_close_window(int idx);
 static void cpop_clear_hover(void);
 static void cpop_open(int app_idx, int window_idx, double x);
 static void cpop_close(void);
@@ -1585,6 +1643,7 @@ toplevel_recalc_layout(void)
 
     center_taskbar_items();
 
+#ifdef JTLAB_DEBUG
     if (trace_on()) {
         fprintf(stderr, "[trace] recalc w=%d n_pl=%d n_grp=%d |", g_bar.width,
                 g_box.n_pl, g_box.n_taskbar_groups);
@@ -1595,6 +1654,7 @@ toplevel_recalc_layout(void)
                     g_box.taskbar_groups[i].w);
         fputc('\n', stderr);
     }
+#endif
 
     if (g_gpopup.open) {
         for (int i = 0; i < g_gpopup.n_windows; i++) {
@@ -1646,10 +1706,12 @@ center_taskbar_items(void)
     for (int i = 0; i < g_box.n_taskbar_groups; i++)
         g_box.taskbar_groups[i].x += shift;
 
+#ifdef JTLAB_DEBUG
     if (trace_on())
         fprintf(stderr,
                 "[trace] center shift=%.1f lmost=%.1f rmost=%.1f max_r=%.1f\n",
                 shift, lmost, rmost, right_cluster_limit());
+#endif
 }
 
 static void bar_draw(struct bar *b);
@@ -1765,13 +1827,35 @@ icon_load_svg(const char *path, int target_size)
 }
 
 static cairo_surface_t *
-png_load(const char *path)
+png_load(const char *path, int target)
 {
     cairo_surface_t *sf = cairo_image_surface_create_from_png(path);
-    if (cairo_surface_status(sf) == CAIRO_STATUS_SUCCESS)
+    if (cairo_surface_status(sf) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(sf);
+        return NULL;
+    }
+    if (target <= 0) return sf;
+    int w = cairo_image_surface_get_width(sf);
+    int h = cairo_image_surface_get_height(sf);
+    if (w <= 0 || h <= 0 || (w <= target && h <= target)) return sf;
+    double sc = (double)target / (double)(w > h ? w : h);
+    int nw = (int)(w * sc + 0.5);
+    int nh = (int)(h * sc + 0.5);
+    if (nw < 1) nw = 1;
+    if (nh < 1) nh = 1;
+    cairo_surface_t *out = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, nw, nh);
+    if (cairo_surface_status(out) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(out);
         return sf;
+    }
+    cairo_t *cr = cairo_create(out);
+    cairo_scale(cr, (double)nw / (double)w, (double)nh / (double)h);
+    cairo_set_source_surface(cr, sf, 0, 0);
+    cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+    cairo_paint(cr);
+    cairo_destroy(cr);
     cairo_surface_destroy(sf);
-    return NULL;
+    return out;
 }
 
 static char *
@@ -2004,7 +2088,7 @@ icon_theme_search(const char *theme_dir, const struct icon_theme_dir *dirs,
                         cairo_surface_t *sf = icon_load_svg(path, target);
                         if (sf) return sf;
                     } else {
-                        cairo_surface_t *sf = png_load(path);
+                        cairo_surface_t *sf = png_load(path, target);
                         if (sf) return sf;
                     }
                 }
@@ -2071,7 +2155,7 @@ icon_load(const char *icon_name)
     }
 
     if (icon_name[0] == '/') {
-        cairo_surface_t *s = png_load(icon_name);
+        cairo_surface_t *s = png_load(icon_name, 64);
         if (s) return s;
         s = icon_load_svg(icon_name, 64);
         if (s) return s;
@@ -2144,11 +2228,11 @@ icon_load(const char *icon_name)
                     char path[1024];
                     snprintf(path, sizeof(path), "%.480s/%.12s/%.20s/%.200s.png",
                              dir, sizes[s], contexts[c], base);
-                    cairo_surface_t *sf = png_load(path);
+                    cairo_surface_t *sf = png_load(path, 64);
                     if (sf) return sf;
                     snprintf(path, sizeof(path), "%.480s/%.20s/%.12s/%.200s.png",
                              dir, contexts[c], sizes[s], base);
-                    sf = png_load(path);
+                    sf = png_load(path, 64);
                     if (sf) return sf;
                 }
                 {
@@ -2169,7 +2253,7 @@ icon_load(const char *icon_name)
             snprintf(path, sizeof(path), "%.500s/pixmaps/%s%s", roots[r],
                      base, ext == 0 ? ".png" : ".svg");
             if (ext == 0) {
-                cairo_surface_t *sf = png_load(path);
+                cairo_surface_t *sf = png_load(path, 64);
                 if (sf) return sf;
             } else {
                 cairo_surface_t *sf = icon_load_svg(path, 64);
@@ -2182,7 +2266,7 @@ icon_load(const char *icon_name)
         char path[512];
         snprintf(path, sizeof(path), "/usr/share/pixmaps/%s%s", base,
                  ext == 0 ? ".png" : "");
-        cairo_surface_t *sf = png_load(path);
+        cairo_surface_t *sf = png_load(path, 64);
         if (sf) return sf;
     }
 
@@ -2948,7 +3032,7 @@ tray_item_reload_icon(struct tray_item *it)
             char p[1024];
             snprintf(p, sizeof(p), "%.480s/%s.png", it->icon_theme_path,
                      it->icon_name);
-            cairo_surface_t *s = png_load(p);
+            cairo_surface_t *s = png_load(p, 64);
             if (s) {
                 it->icon = s;
                 render_request();
@@ -4402,6 +4486,50 @@ ctx_hit_test(double px, double py)
 }
 
 static void
+gpopup_preview_destroy(struct gpopup_preview *p)
+{
+    if (!p) return;
+    if (p->recapture_id) {
+        GSource *s = g_main_context_find_source_by_id(g_sni.glib_ctx, p->recapture_id);
+        if (s) g_source_destroy(s);
+        p->recapture_id = 0;
+    }
+    if (p->frame) { ext_image_copy_capture_frame_v1_destroy(p->frame); p->frame = NULL; }
+    if (p->session) { ext_image_copy_capture_session_v1_destroy(p->session); p->session = NULL; }
+    if (p->pool.buffer) { wl_buffer_destroy(p->pool.buffer); p->pool.buffer = NULL; }
+    if (p->pool.wl_pool) { wl_shm_pool_destroy(p->pool.wl_pool); p->pool.wl_pool = NULL; }
+    if (p->pool.data && p->pool.data != MAP_FAILED) { munmap(p->pool.data, p->pool.size); p->pool.data = NULL; }
+    if (p->pool.fd >= 0) { close(p->pool.fd); p->pool.fd = -1; }
+    p->pool.size = 0;
+    if (p->surface) { cairo_surface_destroy(p->surface); p->surface = NULL; }
+    free(p);
+}
+
+static void
+gpopup_previews_clear(void)
+{
+    for (int i = 0; i < MAX_WINDOWS_PER_GROUP; i++) {
+        if (g_gpopup.previews[i]) {
+            gpopup_preview_destroy(g_gpopup.previews[i]);
+            g_gpopup.previews[i] = NULL;
+        }
+    }
+}
+
+static struct gpopup_preview *
+gpopup_preview_ensure(int idx)
+{
+    if (idx < 0 || idx >= MAX_WINDOWS_PER_GROUP) return NULL;
+    if (!g_gpopup.previews[idx]) {
+        g_gpopup.previews[idx] = calloc(1, sizeof(struct gpopup_preview));
+        if (!g_gpopup.previews[idx]) return NULL;
+        g_gpopup.previews[idx]->ext_idx = -1;
+        g_gpopup.previews[idx]->pool.fd = -1;
+    }
+    return g_gpopup.previews[idx];
+}
+
+static void
 gpopup_clear_hover(void)
 {
     g_gpopup.hover_idx = -1;
@@ -4422,18 +4550,387 @@ popup_place_x(double anchor_x, double w, double edge)
     return snap_px(clampd(anchor_x - w / 2.0, lo, hi));
 }
 
-static void
-gpopup_fill(int count, const int *windows, double cx)
+static double
+gpopup_preview_inner_w(void)
 {
+    double max_w = g_bar.width - 2.0 * PPADDING - 2.0 * MENU_PADDING;
+    if (max_w < GPOPUP_PREVIEW_CARD_W) max_w = GPOPUP_PREVIEW_CARD_W;
+    return max_w;
+}
+
+static void gpopup_preview_start(int idx);
+
+static void gpopup_preview_request_frame(struct gpopup_preview *p);
+
+static gboolean
+gpopup_preview_recapture_cb(gpointer data)
+{
+    struct gpopup_preview *p = data;
+    int idx = -1;
+    for (int i = 0; i < g_gpopup.n_windows; i++) {
+        if (g_gpopup.previews[i] == p) { idx = i; break; }
+    }
+    if (!p || idx < 0) return G_SOURCE_REMOVE;
+    p->recapture_id = 0;
+    if (!g_gpopup.open || g_gpopup.mode != GPOPUP_PREVIEW) return G_SOURCE_REMOVE;
+    if (p->pending) return G_SOURCE_REMOVE;
+    if (p->session && p->pool.buffer)
+        gpopup_preview_request_frame(p);
+    else
+        gpopup_preview_start(idx);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+gpopup_preview_schedule_recapture(struct gpopup_preview *p)
+{
+    if (p->recapture_id) return;
+    GSource *s = g_timeout_source_new(1000);
+    g_source_set_callback(s, gpopup_preview_recapture_cb, p, NULL);
+    p->recapture_id = g_source_attach(s, g_sni.glib_ctx);
+    g_source_unref(s);
+}
+
+static void
+gpopup_preview_frame_ready(void *data, struct ext_image_copy_capture_frame_v1 *frame)
+{
+    struct gpopup_preview *p = data;
+    (void)frame;
+    if (p->frame) { ext_image_copy_capture_frame_v1_destroy(p->frame); p->frame = NULL; }
+    p->pending = 0;
+    p->failed = 0;
+
+    if (p->pool.data && p->width > 0 && p->height > 0) {
+        if (p->surface) cairo_surface_destroy(p->surface);
+        int stride = (int)p->width * 4;
+        p->surface = cairo_image_surface_create_for_data(
+            (unsigned char *)p->pool.data, CAIRO_FORMAT_ARGB32,
+            (int)p->width, (int)p->height, stride);
+        cairo_surface_mark_dirty(p->surface);
+    }
+    if (g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW)
+        render_request();
+    gpopup_preview_schedule_recapture(p);
+}
+
+static void
+gpopup_preview_frame_failed(void *data, struct ext_image_copy_capture_frame_v1 *frame,
+                            uint32_t reason)
+{
+    struct gpopup_preview *p = data;
+    (void)frame; (void)reason;
+    if (p->frame) { ext_image_copy_capture_frame_v1_destroy(p->frame); p->frame = NULL; }
+    p->pending = 0;
+    p->failed = 1;
+    gpopup_preview_schedule_recapture(p);
+}
+
+static void
+gpopup_preview_frame_transform(void *data, struct ext_image_copy_capture_frame_v1 *frame,
+                               uint32_t transform)
+{ (void)data; (void)frame; (void)transform; }
+static void
+gpopup_preview_frame_damage(void *data, struct ext_image_copy_capture_frame_v1 *frame,
+                            int32_t x, int32_t y, int32_t w, int32_t h)
+{ (void)data; (void)frame; (void)x; (void)y; (void)w; (void)h; }
+static void
+gpopup_preview_frame_presentation(void *data, struct ext_image_copy_capture_frame_v1 *frame,
+                                  uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec)
+{ (void)data; (void)frame; (void)tv_sec_hi; (void)tv_sec_lo; (void)tv_nsec; }
+
+static const struct ext_image_copy_capture_frame_v1_listener gpopup_preview_frame_listener = {
+    .transform = gpopup_preview_frame_transform,
+    .damage = gpopup_preview_frame_damage,
+    .presentation_time = gpopup_preview_frame_presentation,
+    .ready = gpopup_preview_frame_ready,
+    .failed = gpopup_preview_frame_failed,
+};
+
+static void
+gpopup_preview_request_frame(struct gpopup_preview *p)
+{
+    if (!p->session || !p->pool.buffer || p->pending) return;
+    if (p->frame) { ext_image_copy_capture_frame_v1_destroy(p->frame); p->frame = NULL; }
+    p->frame = ext_image_copy_capture_session_v1_create_frame(p->session);
+    ext_image_copy_capture_frame_v1_add_listener(p->frame, &gpopup_preview_frame_listener, p);
+    ext_image_copy_capture_frame_v1_attach_buffer(p->frame, p->pool.buffer);
+    ext_image_copy_capture_frame_v1_damage_buffer(p->frame, 0, 0, (int32_t)p->width, (int32_t)p->height);
+    ext_image_copy_capture_frame_v1_capture(p->frame);
+    p->pending = 1;
+}
+
+static void
+gpopup_preview_session_buffer_size(void *data, struct ext_image_copy_capture_session_v1 *session,
+                                   uint32_t w, uint32_t h)
+{
+    struct gpopup_preview *p = data;
+    (void)session;
+    p->width = w;
+    p->height = h;
+}
+
+static void
+gpopup_preview_session_shm_format(void *data, struct ext_image_copy_capture_session_v1 *session,
+                                  uint32_t format)
+{
+    struct gpopup_preview *p = data;
+    (void)session;
+    if (format == WL_SHM_FORMAT_ARGB8888 || format == WL_SHM_FORMAT_XRGB8888)
+        p->shm_format = format;
+}
+
+static void
+gpopup_preview_session_dmabuf_device(void *data, struct ext_image_copy_capture_session_v1 *session,
+                                     struct wl_array *device)
+{ (void)data; (void)session; (void)device; }
+static void
+gpopup_preview_session_dmabuf_format(void *data, struct ext_image_copy_capture_session_v1 *session,
+                                     uint32_t format, struct wl_array *modifiers)
+{ (void)data; (void)session; (void)format; (void)modifiers; }
+
+static void
+gpopup_preview_session_done(void *data, struct ext_image_copy_capture_session_v1 *session)
+{
+    struct gpopup_preview *p = data;
+    (void)session;
+    if (p->width == 0 || p->height == 0) return;
+    if (p->shm_format != WL_SHM_FORMAT_ARGB8888 && p->shm_format != WL_SHM_FORMAT_XRGB8888)
+        p->shm_format = WL_SHM_FORMAT_ARGB8888;
+
+    size_t stride = (size_t)p->width * 4;
+    size_t size = stride * p->height;
+    if (p->pool.size < size || !p->pool.buffer) {
+        if (p->surface) { cairo_surface_destroy(p->surface); p->surface = NULL; }
+        if (p->pool.buffer) { wl_buffer_destroy(p->pool.buffer); p->pool.buffer = NULL; }
+        if (p->pool.wl_pool) { wl_shm_pool_destroy(p->pool.wl_pool); p->pool.wl_pool = NULL; }
+        if (p->pool.data && p->pool.data != MAP_FAILED) { munmap(p->pool.data, p->pool.size); p->pool.data = NULL; }
+        if (p->pool.fd >= 0) { close(p->pool.fd); p->pool.fd = -1; }
+        if (shm_pool_init(&p->pool, size) < 0) { p->failed = 1; return; }
+        p->pool.buffer = shm_pool_create_buffer(&p->pool, (int)p->width, (int)p->height,
+                                                (int)stride, p->shm_format);
+        if (!p->pool.buffer) { p->failed = 1; return; }
+    }
+
+    p->failed = 0;
+    gpopup_preview_request_frame(p);
+}
+
+static void
+gpopup_preview_session_stopped(void *data, struct ext_image_copy_capture_session_v1 *session)
+{
+    struct gpopup_preview *p = data;
+    (void)session;
+    if (p->frame) { ext_image_copy_capture_frame_v1_destroy(p->frame); p->frame = NULL; }
+    if (p->session) { ext_image_copy_capture_session_v1_destroy(p->session); p->session = NULL; }
+    p->pending = 0;
+    p->failed = 1;
+    gpopup_preview_schedule_recapture(p);
+}
+
+static const struct ext_image_copy_capture_session_v1_listener gpopup_preview_session_listener = {
+    .buffer_size = gpopup_preview_session_buffer_size,
+    .shm_format = gpopup_preview_session_shm_format,
+    .dmabuf_device = gpopup_preview_session_dmabuf_device,
+    .dmabuf_format = gpopup_preview_session_dmabuf_format,
+    .done = gpopup_preview_session_done,
+    .stopped = gpopup_preview_session_stopped,
+};
+
+static int find_ext_toplevel_for_wlr(int tl_idx, const char *used_ext);
+
+static void
+gpopup_preview_start(int idx)
+{
+    if (idx < 0 || idx >= g_gpopup.n_windows) return;
+    struct gpopup_preview *p = gpopup_preview_ensure(idx);
+    if (!p) return;
+    if (p->pending) return;
+    if (p->session) { gpopup_preview_request_frame(p); return; }
+    if (!g_wl.ext_capture_mgr || !g_wl.ext_toplevel_capture_mgr) {
+        p->failed = 1;
+        gpopup_preview_schedule_recapture(p);
+        return;
+    }
+
+    int ext_idx = p->ext_idx;
+    if (ext_idx < 0 || ext_idx >= g_n_ext_toplevels) {
+        int tl = g_gpopup.windows[idx];
+        char used_ext[MAX_TOPLEVELS];
+        memset(used_ext, 0, sizeof(used_ext));
+        for (int j = 0; j < g_gpopup.n_windows; j++) {
+            if (j == idx) continue;
+            int ei = g_gpopup.previews[j] ? g_gpopup.previews[j]->ext_idx : -1;
+            if (ei >= 0 && ei < MAX_TOPLEVELS) used_ext[ei] = 1;
+        }
+        ext_idx = find_ext_toplevel_for_wlr(tl, used_ext);
+        if (ext_idx < 0) {
+            p->failed = 1;
+            p->ext_idx = -1;
+            gpopup_preview_schedule_recapture(p);
+            return;
+        }
+        p->ext_idx = ext_idx;
+    }
+
+    struct ext_image_capture_source_v1 *src =
+        ext_foreign_toplevel_image_capture_source_manager_v1_create_source(
+            g_wl.ext_toplevel_capture_mgr, g_ext_toplevels[ext_idx].handle);
+    if (!src) { p->failed = 1; return; }
+
+    p->shm_format = WL_SHM_FORMAT_ARGB8888;
+    p->session = ext_image_copy_capture_manager_v1_create_session(
+        g_wl.ext_capture_mgr, src, 0);
+    ext_image_capture_source_v1_destroy(src);
+    if (!p->session) { p->failed = 1; return; }
+    ext_image_copy_capture_session_v1_add_listener(p->session, &gpopup_preview_session_listener, p);
+}
+
+static void
+gpopup_preview_start_all(void)
+{
+    if (g_gpopup.mode != GPOPUP_PREVIEW) return;
+    for (int i = 0; i < g_gpopup.n_windows; i++)
+        gpopup_preview_start(i);
+}
+
+static void gpopup_anim_advance(void);
+static void gpopup_anim_start(double tx, double tw, double th, double ts);
+static void gpopup_anim_stop(void);
+static gboolean gpopup_anim_tick(gpointer data);
+
+static void
+gpopup_fill_preview(int count, const int *windows, const int *ext_windows, double cx, int focus_on_leave)
+{
+    int was_open = g_gpopup.open;
+    int old_n = g_gpopup.n_windows;
+    int old_windows[MAX_WINDOWS_PER_GROUP];
+    int old_ext[MAX_WINDOWS_PER_GROUP];
+    struct gpopup_preview *old_previews[MAX_WINDOWS_PER_GROUP];
+    int old_taken[MAX_WINDOWS_PER_GROUP];
+
+    if (old_n > MAX_WINDOWS_PER_GROUP) old_n = MAX_WINDOWS_PER_GROUP;
+    for (int i = 0; i < MAX_WINDOWS_PER_GROUP; i++) {
+        old_previews[i] = g_gpopup.previews[i];
+        old_taken[i] = 0;
+        g_gpopup.previews[i] = NULL;
+    }
+    for (int i = 0; i < old_n; i++) {
+        old_windows[i] = g_gpopup.windows[i];
+        old_ext[i] = old_previews[i] ? old_previews[i]->ext_idx : -1;
+    }
+
     g_gpopup.open = 1;
+    g_gpopup.mode = GPOPUP_PREVIEW;
     g_gpopup.n_windows = count;
-    for (int i = 0; i < count; i++)
-        g_gpopup.windows[i] = windows[i];
-    g_gpopup.x = popup_place_x(cx, GROUP_POPUP_W, PPADDING);
+    if (g_gpopup.n_windows > MAX_WINDOWS_PER_GROUP)
+        g_gpopup.n_windows = MAX_WINDOWS_PER_GROUP;
+
+    int old_idx_map[MAX_WINDOWS_PER_GROUP];
+    for (int i = 0; i < g_gpopup.n_windows; i++) {
+        int ext_idx = ext_windows ? ext_windows[i] : -1;
+        int wlr_idx = windows[i];
+        int old_i = -1;
+        if (ext_idx >= 0) {
+            for (int j = 0; j < old_n; j++) {
+                if (!old_taken[j] && old_ext[j] == ext_idx) { old_i = j; break; }
+            }
+        }
+        if (old_i < 0 && ext_idx < 0 && wlr_idx >= 0) {
+            for (int j = 0; j < old_n; j++) {
+                if (!old_taken[j] && old_windows[j] == wlr_idx) { old_i = j; break; }
+            }
+        }
+        old_idx_map[i] = old_i;
+        g_gpopup.windows[i] = wlr_idx;
+        if (old_i >= 0 && old_previews[old_i]) {
+            g_gpopup.previews[i] = old_previews[old_i];
+            old_taken[old_i] = 1;
+            g_gpopup.previews[i]->ext_idx = ext_idx;
+            /* Keep capture surface/session; anim_dx reset below after anim_start snapshot */
+        } else {
+            g_gpopup.previews[i] = calloc(1, sizeof(struct gpopup_preview));
+            if (g_gpopup.previews[i]) {
+                g_gpopup.previews[i]->ext_idx = ext_idx;
+                g_gpopup.previews[i]->pool.fd = -1;
+            }
+        }
+        if (g_gpopup.previews[i]) {
+            if (old_i < 0 && was_open) {
+                double stride = GPOPUP_PREVIEW_CARD_W + GPOPUP_PREVIEW_GAP;
+                g_gpopup.previews[i]->anim_dx = stride;
+                g_gpopup.previews[i]->anim_dx_start = stride;
+            } else {
+                g_gpopup.previews[i]->anim_dx = 0;
+                g_gpopup.previews[i]->anim_dx_start = 0;
+            }
+        }
+    }
+
+    for (int i = 0; i < MAX_WINDOWS_PER_GROUP; i++) {
+        if (old_previews[i] && !old_taken[i])
+            gpopup_preview_destroy(old_previews[i]);
+    }
+
+    double inner_w = gpopup_preview_inner_w();
+    double content_w = g_gpopup.n_windows * GPOPUP_PREVIEW_CARD_W +
+                       (g_gpopup.n_windows - 1) * GPOPUP_PREVIEW_GAP;
+    double view_w = content_w < inner_w ? content_w : inner_w;
+    double new_w = view_w + 2.0 * MENU_PADDING;
+    double new_x = popup_place_x(cx, new_w, PPADDING);
+    double new_h = PPADDING + MENU_PADDING * 2 + GPOPUP_PREVIEW_CARD_H + 10;
+    double new_scroll_max = content_w > view_w ? content_w - view_w : 0;
+    double new_scroll = was_open ? g_gpopup.scroll : 0;
+    if (new_scroll > new_scroll_max) new_scroll = new_scroll_max;
+    if (new_scroll < 0) new_scroll = 0;
+
+    if (was_open) {
+        gpopup_anim_start(new_x, new_w, new_h, new_scroll);
+    } else {
+        gpopup_anim_stop();
+        g_gpopup.anim_x = new_x;
+        g_gpopup.anim_w = new_w;
+        g_gpopup.anim_h = new_h;
+        g_gpopup.anim_scroll = new_scroll;
+        g_gpopup.anim_target_x = new_x;
+        g_gpopup.anim_target_w = new_w;
+        g_gpopup.anim_target_h = new_h;
+        g_gpopup.anim_target_scroll = new_scroll;
+    }
+
+    if (was_open) {
+        double stride = GPOPUP_PREVIEW_CARD_W + GPOPUP_PREVIEW_GAP;
+        int need = 0;
+        for (int i = 0; i < g_gpopup.n_windows; i++) {
+            int oi = old_idx_map[i];
+            struct gpopup_preview *pv = g_gpopup.previews[i];
+            if (oi >= 0 && pv) {
+                pv->anim_dx_start = (oi - i) * stride + pv->anim_dx_start;
+                pv->anim_dx = pv->anim_dx_start;
+                if (fabs(pv->anim_dx_start) >= 0.5) need = 1;
+            }
+        }
+        if (need && !g_gpopup.anim_src_id) {
+            g_gpopup.animating = 1;
+            g_gpopup.anim_start_us = g_get_monotonic_time();
+            GSource *s = g_timeout_source_new(16);
+            g_source_set_callback(s, gpopup_anim_tick, NULL, NULL);
+            g_gpopup.anim_src_id = g_source_attach(s, g_sni.glib_ctx);
+            g_source_unref(s);
+        }
+        if (need) g_bar.fly_needs_render = 1;
+    }
+
+    g_gpopup.w = (int)new_w;
+    g_gpopup.x = new_x;
     g_gpopup.y = 0;
-    g_gpopup.height = PPADDING + MENU_PADDING * 2 + count * MENU_ROW_HEIGHT;
+    g_gpopup.h = (int)new_h;
+    g_gpopup.scroll = new_scroll;
+    g_gpopup.scroll_max = new_scroll_max;
+    g_gpopup.focus_on_leave_idx = focus_on_leave ? 0 : -1;
+    g_gpopup.scroll_drag = 0;
     gpopup_clear_hover();
     popup_size_changed();
+    gpopup_preview_start_all();
 }
 
 static void close_sibling_popups(void);
@@ -4441,31 +4938,325 @@ static void close_sibling_popups_keep_osk(void);
 static void close_siblings_for_popup(void);
 static void close_all_popups(void);
 
+static void hover_delay_set(struct hover_delay *d, int target, unsigned delay_ms);
+
 static void
 gpopup_open(int group_idx, double x)
 {
     close_siblings_for_popup();
     struct taskbar_group *g = &g_box.taskbar_groups[group_idx];
-    gpopup_fill(g->n_windows, g->windows, x + g->w / 2.0);
+    gpopup_fill_preview(g->n_windows, g->windows, NULL, x + g->w / 2.0, 0);
+    hover_delay_set(&g_bar_app_tip, -1, 0);
 }
 
 static void
 gpopup_open_pinned(int pinned_idx, double x)
 {
     const struct app_entry *a = &g_app.apps[g_app.pinned[pinned_idx]];
-    int count = windows_of_app(a, g_gpopup.windows, MAX_WINDOWS_PER_GROUP);
+    int windows[MAX_WINDOWS_PER_GROUP];
+    int count = windows_of_app(a, windows, MAX_WINDOWS_PER_GROUP);
     if (count < 2) return;
     close_siblings_for_popup();
-    gpopup_fill(count, g_gpopup.windows, x + g_box.pl[pinned_idx].w / 2.0);
+    gpopup_fill_preview(count, windows, NULL, x + g_box.pl[pinned_idx].w / 2.0, 0);
+    hover_delay_set(&g_bar_app_tip, -1, 0);
+}
+
+static void
+gpopup_anim_advance(void)
+{
+    if (!g_gpopup.animating) return;
+    double elapsed = (double)(g_get_monotonic_time() - g_gpopup.anim_start_us) / 1000000.0;
+    double p = 1.0 - exp(-TRANS_RATE * elapsed);
+    g_gpopup.anim_x = g_gpopup.anim_start_x + (g_gpopup.anim_target_x - g_gpopup.anim_start_x) * p;
+    g_gpopup.anim_w = g_gpopup.anim_start_w + (g_gpopup.anim_target_w - g_gpopup.anim_start_w) * p;
+    g_gpopup.anim_h = g_gpopup.anim_start_h + (g_gpopup.anim_target_h - g_gpopup.anim_start_h) * p;
+    g_gpopup.anim_scroll = g_gpopup.anim_start_scroll + (g_gpopup.anim_target_scroll - g_gpopup.anim_start_scroll) * p;
+    if (g_gpopup.mode == GPOPUP_PREVIEW) {
+        for (int i = 0; i < g_gpopup.n_windows; i++) {
+            struct gpopup_preview *pv = g_gpopup.previews[i];
+            if (pv) pv->anim_dx = pv->anim_dx_start * (1.0 - p);
+        }
+    }
+}
+
+static void
+gpopup_anim_stop(void)
+{
+    if (g_gpopup.anim_src_id) {
+        GSource *s = g_main_context_find_source_by_id(g_sni.glib_ctx, g_gpopup.anim_src_id);
+        if (s) g_source_destroy(s);
+        g_gpopup.anim_src_id = 0;
+    }
+    g_gpopup.animating = 0;
+}
+
+static gboolean
+gpopup_anim_tick(gpointer data)
+{
+    (void)data;
+    if (!g_gpopup.animating || !g_gpopup.open) {
+        g_gpopup.anim_src_id = 0;
+        g_gpopup.animating = 0;
+        return G_SOURCE_REMOVE;
+    }
+    gpopup_anim_advance();
+    g_bar.fly_needs_render = 1;
+    int done = fabs(g_gpopup.anim_target_x - g_gpopup.anim_x) < 0.5 &&
+               fabs(g_gpopup.anim_target_w - g_gpopup.anim_w) < 0.5 &&
+               fabs(g_gpopup.anim_target_h - g_gpopup.anim_h) < 0.5 &&
+               fabs(g_gpopup.anim_target_scroll - g_gpopup.anim_scroll) < 0.5;
+    if (done && g_gpopup.mode == GPOPUP_PREVIEW) {
+        for (int i = 0; i < g_gpopup.n_windows; i++) {
+            struct gpopup_preview *pv = g_gpopup.previews[i];
+            if (pv && fabs(pv->anim_dx) >= 0.5) { done = 0; break; }
+        }
+    }
+    if (done) {
+        g_gpopup.anim_x = g_gpopup.anim_target_x;
+        g_gpopup.anim_w = g_gpopup.anim_target_w;
+        g_gpopup.anim_h = g_gpopup.anim_target_h;
+        g_gpopup.anim_scroll = g_gpopup.anim_target_scroll;
+        g_gpopup.scroll = g_gpopup.anim_target_scroll;
+        if (g_gpopup.mode == GPOPUP_PREVIEW) {
+            for (int i = 0; i < g_gpopup.n_windows; i++) {
+                struct gpopup_preview *pv = g_gpopup.previews[i];
+                if (pv) { pv->anim_dx = 0; pv->anim_dx_start = 0; }
+            }
+        }
+        g_gpopup.animating = 0;
+        g_gpopup.anim_src_id = 0;
+        popup_size_changed();
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static void
+gpopup_anim_start(double tx, double tw, double th, double ts)
+{
+    if (!g_gpopup.open) return;
+    if (!g_gpopup.animating) {
+        g_gpopup.anim_x = g_gpopup.x;
+        g_gpopup.anim_w = g_gpopup.w;
+        g_gpopup.anim_h = g_gpopup.h;
+        g_gpopup.anim_scroll = g_gpopup.scroll;
+        if (g_gpopup.mode == GPOPUP_PREVIEW) {
+            for (int i = 0; i < g_gpopup.n_windows; i++) {
+                struct gpopup_preview *pv = g_gpopup.previews[i];
+                if (pv) pv->anim_dx_start = pv->anim_dx;
+            }
+        }
+    } else {
+        gpopup_anim_advance();
+        if (g_gpopup.mode == GPOPUP_PREVIEW) {
+            for (int i = 0; i < g_gpopup.n_windows; i++) {
+                struct gpopup_preview *pv = g_gpopup.previews[i];
+                if (pv) pv->anim_dx_start = pv->anim_dx;
+            }
+        }
+    }
+    g_gpopup.anim_start_x = g_gpopup.anim_x;
+    g_gpopup.anim_start_w = g_gpopup.anim_w;
+    g_gpopup.anim_start_h = g_gpopup.anim_h;
+    g_gpopup.anim_start_scroll = g_gpopup.anim_scroll;
+    g_gpopup.anim_target_x = tx;
+    g_gpopup.anim_target_w = tw;
+    g_gpopup.anim_target_h = th;
+    g_gpopup.anim_target_scroll = ts;
+    g_gpopup.anim_start_us = g_get_monotonic_time();
+    g_gpopup.animating = 1;
+    int bounds_done = fabs(tx - g_gpopup.anim_x) < 0.5 &&
+                      fabs(tw - g_gpopup.anim_w) < 0.5 &&
+                      fabs(th - g_gpopup.anim_h) < 0.5 &&
+                      fabs(ts - g_gpopup.anim_scroll) < 0.5;
+    int cards_done = 1;
+    if (g_gpopup.mode == GPOPUP_PREVIEW) {
+        for (int i = 0; i < g_gpopup.n_windows; i++) {
+            struct gpopup_preview *pv = g_gpopup.previews[i];
+            if (pv && fabs(pv->anim_dx_start) >= 0.5) { cards_done = 0; break; }
+        }
+    }
+    if (bounds_done && cards_done) {
+        g_gpopup.anim_x = tx; g_gpopup.anim_w = tw; g_gpopup.anim_h = th;
+        g_gpopup.anim_scroll = ts; g_gpopup.scroll = ts;
+        if (g_gpopup.mode == GPOPUP_PREVIEW) {
+            for (int i = 0; i < g_gpopup.n_windows; i++) {
+                struct gpopup_preview *pv = g_gpopup.previews[i];
+                if (pv) { pv->anim_dx = 0; pv->anim_dx_start = 0; }
+            }
+        }
+        g_gpopup.animating = 0;
+        return;
+    }
+    if (!g_gpopup.anim_src_id) {
+        GSource *s = g_timeout_source_new(16);
+        g_source_set_callback(s, gpopup_anim_tick, NULL, NULL);
+        g_gpopup.anim_src_id = g_source_attach(s, g_sni.glib_ctx);
+        g_source_unref(s);
+    }
+    g_bar.fly_needs_render = 1;
 }
 
 static void
 gpopup_close(void)
 {
     if (!g_gpopup.open) return;
+    gpopup_anim_stop();
     g_gpopup.open = 0;
+    g_gpopup.scroll_drag = 0;
     gpopup_clear_hover();
+    gpopup_previews_clear();
     popup_size_changed();
+}
+
+static void
+gpopup_scroll_to(int idx)
+{
+    if (g_gpopup.mode != GPOPUP_PREVIEW || idx < 0) return;
+    double view_w = g_gpopup.w - MENU_PADDING * 2;
+    double card_x = idx * (GPOPUP_PREVIEW_CARD_W + GPOPUP_PREVIEW_GAP);
+    double cur = g_gpopup.animating ? g_gpopup.anim_target_scroll : g_gpopup.scroll;
+    double target = cur;
+    if (card_x < cur)
+        target = card_x;
+    else if (card_x + GPOPUP_PREVIEW_CARD_W > cur + view_w)
+        target = card_x + GPOPUP_PREVIEW_CARD_W - view_w;
+    if (target < 0) target = 0;
+    if (target > g_gpopup.scroll_max) target = g_gpopup.scroll_max;
+    if (fabs(target - cur) < 0.5) return;
+    gpopup_anim_start(g_gpopup.animating ? g_gpopup.anim_target_x : g_gpopup.x,
+                      g_gpopup.animating ? g_gpopup.anim_target_w : (double)g_gpopup.w,
+                      g_gpopup.animating ? g_gpopup.anim_target_h : (double)g_gpopup.h,
+                      target);
+}
+
+static void gpopup_open_jk_preview(void);
+
+static void
+gpopup_select_next(void)
+{
+    if (!g_gpopup.open || g_gpopup.focus_on_leave_idx < 0) {
+        gpopup_open_jk_preview();
+        return;
+    }
+    if (g_gpopup.n_windows <= 0) return;
+    int next = g_gpopup.hover_idx + 1;
+    if (next >= g_gpopup.n_windows) next = 0;
+    g_gpopup.hover_idx = next;
+    g_gpopup.hover_close = -1;
+    gpopup_scroll_to(next);
+    popup_size_changed();
+    render_request();
+}
+
+static void
+gpopup_select_prev(void)
+{
+    if (!g_gpopup.open || g_gpopup.focus_on_leave_idx < 0) {
+        gpopup_open_jk_preview();
+        return;
+    }
+    if (g_gpopup.n_windows <= 0) return;
+    int prev = g_gpopup.hover_idx - 1;
+    if (prev < 0) prev = g_gpopup.n_windows - 1;
+    g_gpopup.hover_idx = prev;
+    g_gpopup.hover_close = -1;
+    gpopup_scroll_to(prev);
+    popup_size_changed();
+    render_request();
+}
+
+static void
+gpopup_activate_selected(void)
+{
+    if (!g_gpopup.open || g_gpopup.n_windows <= 0) return;
+    int idx = g_gpopup.hover_idx;
+    if (idx < 0) idx = 0;
+    if (idx >= g_gpopup.n_windows) return;
+    int tl_idx = g_gpopup.windows[idx];
+    gpopup_close();
+    if (tl_idx >= 0 && tl_idx < g_n_toplevels)
+        zwlr_foreign_toplevel_handle_v1_activate(
+            g_toplevels[tl_idx].handle, g_wl.seat);
+    render_request();
+}
+
+static int find_wlr_toplevel_for_ext(int ext_idx, const char *used_wlr);
+
+static void
+gpopup_close_window(int idx)
+{
+    if (idx < 0 || idx >= g_gpopup.n_windows) return;
+    int tl_idx = g_gpopup.windows[idx];
+    if ((tl_idx < 0 || tl_idx >= g_n_toplevels) && g_gpopup.previews[idx]) {
+        int ext_idx = g_gpopup.previews[idx]->ext_idx;
+        if (ext_idx >= 0)
+            tl_idx = find_wlr_toplevel_for_ext(ext_idx, NULL);
+    }
+    if (tl_idx >= 0 && tl_idx < g_n_toplevels)
+        zwlr_foreign_toplevel_handle_v1_close(g_toplevels[tl_idx].handle);
+}
+
+static void
+gpopup_open_jk_preview(void)
+{
+    int windows[MAX_WINDOWS_PER_GROUP];
+    int ext_windows[MAX_WINDOWS_PER_GROUP];
+    int count = 0;
+    int prev_wlr = -1, prev_ext = -1;
+    int was_open_all = g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW &&
+                       g_gpopup.focus_on_leave_idx >= 0;
+    if (was_open_all && g_gpopup.hover_idx >= 0 && g_gpopup.hover_idx < g_gpopup.n_windows) {
+        prev_wlr = g_gpopup.windows[g_gpopup.hover_idx];
+        prev_ext = g_gpopup.previews[g_gpopup.hover_idx] ?
+                   g_gpopup.previews[g_gpopup.hover_idx]->ext_idx : -1;
+    }
+    int active_tl = -1;
+    for (int i = 0; i < g_n_toplevels; i++) {
+        if (g_toplevels[i].activated) { active_tl = i; break; }
+    }
+    if (g_n_ext_toplevels > 0) {
+        char used_wlr[MAX_TOPLEVELS];
+        memset(used_wlr, 0, sizeof(used_wlr));
+        for (int i = 0; i < g_n_ext_toplevels && count < MAX_WINDOWS_PER_GROUP; i++) {
+            int wlr = find_wlr_toplevel_for_ext(i, used_wlr);
+            if (wlr >= 0 && wlr < MAX_TOPLEVELS) used_wlr[wlr] = 1;
+            ext_windows[count] = i;
+            windows[count] = wlr;
+            count++;
+        }
+    } else {
+        for (int i = 0; i < g_n_toplevels && count < MAX_WINDOWS_PER_GROUP; i++) {
+            windows[count] = i;
+            ext_windows[count] = -1;
+            count++;
+        }
+    }
+    if (count == 0) return;
+    if (!(g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW &&
+          g_gpopup.focus_on_leave_idx >= 0))
+        close_siblings_for_popup();
+    gpopup_fill_preview(count, windows, ext_windows, g_bar.width / 2.0, 1);
+    g_gpopup.hover_idx = 0;
+    int sel = -1;
+    if (prev_ext >= 0) {
+        for (int i = 0; i < count; i++) {
+            if (ext_windows[i] == prev_ext) { sel = i; break; }
+        }
+    }
+    if (sel < 0 && prev_wlr >= 0) {
+        for (int i = 0; i < count; i++) {
+            if (windows[i] == prev_wlr) { sel = i; break; }
+        }
+    }
+    if (sel < 0 && active_tl >= 0) {
+        for (int i = 0; i < count; i++) {
+            if (windows[i] == active_tl) { sel = i; break; }
+        }
+    }
+    if (sel >= 0) g_gpopup.hover_idx = sel;
+    gpopup_scroll_to(g_gpopup.hover_idx);
+    render_request();
 }
 
 static const char *
@@ -8888,14 +9679,19 @@ avatar_load(void)
     if (!g_profile.photo[0]) return;
 
     /* The portal can hand us any format GdkPixbuf understands (PNG, JPEG,
-     * WebP...), so try that first. PNG/SVG remain as fallbacks. */
-    GdkPixbuf *pb = gdk_pixbuf_new_from_file(g_profile.photo, NULL);
+     * WebP...). Load at a bounded size: the avatar is PROFILE_PHOTO_SIZE with
+     * max zoom 4.0, so 512px is plenty and avoids holding a multi-megapixel
+     * photo as a 40-60MB ARGB32 surface. */
+    int max_dim = PROFILE_PHOTO_SIZE * 8;
+    if (max_dim < 256) max_dim = 256;
+    GdkPixbuf *pb = gdk_pixbuf_new_from_file_at_scale(g_profile.photo,
+                                                       max_dim, max_dim, TRUE, NULL);
     if (pb) {
         g_avatar = surface_from_pixbuf(pb);
         g_object_unref(pb);
         return;
     }
-    cairo_surface_t *sf = png_load(g_profile.photo);
+    cairo_surface_t *sf = png_load(g_profile.photo, PROFILE_PHOTO_SIZE);
     if (!sf) sf = icon_load_svg(g_profile.photo, PROFILE_PHOTO_SIZE);
     g_avatar = sf;
 }
@@ -10617,6 +11413,7 @@ static const size_t osk_row_counts[OSK_ROWS] = {
     sizeof(osk_row4) / sizeof(osk_row4[0]),
 };
 
+
 static const char *
 bar_app_tip_label(double *cx)
 {
@@ -10655,7 +11452,14 @@ bar_app_tip_popup_h(void)
 static int
 flyout_other_height(void)
 {
-    int ph = g_gpopup.open ? g_gpopup.height : 0;
+    int ph = 0;
+    if (g_gpopup.open) {
+        if (g_gpopup.animating) {
+            double mh = ceil(fmax(g_gpopup.anim_start_h, g_gpopup.anim_target_h));
+            ph = (int)mh;
+        } else
+            ph = g_gpopup.h;
+    }
     int cph = g_cpop.open ? (int)g_cpop.h : 0;
     int vh = g_volpop.open ? volpop_height() : 0;
     int th = g_tm.open ? g_tm.height : 0;
@@ -11212,51 +12016,194 @@ static void
 flyout_draw(cairo_t *cr, PangoLayout *pl)
 {
     if (g_gpopup.open) {
-        double pw = GROUP_POPUP_W;
-        double ph = g_gpopup.height - PPADDING;
-        double px = g_gpopup.x;
-        double py = g_gpopup.y;
+        if (g_gpopup.animating) gpopup_anim_advance();
+        double cur_h = g_gpopup.animating ? g_gpopup.anim_h : (double)g_gpopup.h;
+        double pw = g_gpopup.animating ? g_gpopup.anim_w : (double)g_gpopup.w;
+        double ph = cur_h - PPADDING;
+        double px = g_gpopup.animating ? g_gpopup.anim_x : g_gpopup.x;
+        double py = g_gpopup.y + bar_y_offset() - cur_h;
+        double cur_scroll = g_gpopup.animating ? g_gpopup.anim_scroll : g_gpopup.scroll;
         double r = PRADIUS;
 
         panel_begin(cr, px, py, pw, ph, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
 
-        for (int i = 0; i < g_gpopup.n_windows; i++) {
-            double row_y = py + MENU_PADDING + i * MENU_ROW_HEIGHT;
-            if (g_gpopup.hover_idx == i) {
-                draw_hover_row(cr, px, row_y, pw, MENU_ROW_HEIGHT,
-                               0, MENU_HOVER_A);
-            }
-            int tl_idx = g_gpopup.windows[i];
-            struct toplevel_entry *t = &g_toplevels[tl_idx];
-            double text_x = px + MENU_PADDING;
-            text_x += draw_icon_fit(cr, t->icon, text_x, row_y,
-                                    0, MENU_ROW_HEIGHT, MENU_ROW_ICON, 0);
-            double xc = px + pw - MENU_PADDING - 8;
-            double yc = row_y + MENU_ROW_HEIGHT / 2.0;
+        if (g_gpopup.mode == GPOPUP_PREVIEW) {
+            double view_x = px + MENU_PADDING;
+            double view_w = pw - MENU_PADDING * 2;
+            double card_h = GPOPUP_PREVIEW_CARD_H;
+            double card_y = py + MENU_PADDING;
+            cairo_save(cr);
+            cairo_new_path(cr);
+            cairo_rectangle(cr, view_x, card_y, view_w, card_h);
+            cairo_clip(cr);
+            for (int i = 0; i < g_gpopup.n_windows; i++) {
+                struct gpopup_preview *pv = g_gpopup.previews[i];
+                double card_x = view_x + i * (GPOPUP_PREVIEW_CARD_W + GPOPUP_PREVIEW_GAP)
+                                - cur_scroll + (pv ? pv->anim_dx : 0.0);
+                if (card_x + GPOPUP_PREVIEW_CARD_W < view_x - 1) continue;
+                if (card_x > view_x + view_w + 1) break;
+                int tl_idx = g_gpopup.windows[i];
+                const char *title = NULL;
+                if (tl_idx >= 0 && tl_idx < g_n_toplevels) {
+                    title = g_toplevels[tl_idx].title;
+                } else {
+                    int ei = pv ? pv->ext_idx : -1;
+                    if (ei >= 0 && ei < g_n_ext_toplevels)
+                        title = g_ext_toplevels[ei].title;
+                }
 
-            const char *title = t->title;
-            double max_text_w = xc - text_x - 10;
-            draw_vcenter_text(cr, pl, title && title[0] ? title : "(untitled)",
-                              text_x, row_y, MENU_ROW_HEIGHT,
-                              COLOR(MENU_FG_HEX), 1.0,
-                              max_text_w, 1);
-            if (g_gpopup.hover_close == i) {
-                cairo_set_source_rgba(cr, 0.85, 0.2, 0.2, 0.9);
+                if (g_gpopup.hover_idx == i) {
+                    draw_hover_row(cr, card_x, card_y, GPOPUP_PREVIEW_CARD_W, card_h, PRADIUS, MENU_HOVER_A);
+                }
+
+                /* Preview image or placeholder */
+                double pv_x = card_x + 6;
+                double pv_y = card_y + 6;
+                double pv_w = GPOPUP_PREVIEW_CARD_W - 12;
+                double pv_h = card_h - 36;
+                if (pv && pv->surface && cairo_surface_status(pv->surface) == CAIRO_STATUS_SUCCESS) {
+                    int sw = cairo_image_surface_get_width(pv->surface);
+                    int sh = cairo_image_surface_get_height(pv->surface);
+                    if (sw > 0 && sh > 0) {
+                        double scale = fmin(pv_w / sw, pv_h / sh);
+                        double dw = sw * scale;
+                        double dh = sh * scale;
+                        double dx = pv_x + (pv_w - dw) / 2.0;
+                        double dy = pv_y + (pv_h - dh) / 2.0;
+                        cairo_save(cr);
+                        cairo_rectangle(cr, pv_x, pv_y, pv_w, pv_h);
+                        cairo_clip(cr);
+                        cairo_translate(cr, dx, dy);
+                        cairo_scale(cr, scale, scale);
+                        cairo_set_source_surface(cr, pv->surface, 0, 0);
+                        cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+                        cairo_paint(cr);
+                        cairo_restore(cr);
+                    }
+                } else {
+                    /* No preview yet: keep area blank to avoid icon artifacts behind preview. */
+                    cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 0.06);
+                    rounded_rect(cr, pv_x, pv_y, pv_w, pv_h, 6);
+                    cairo_fill(cr);
+                }
+
+                /* Title */
+                double text_y = card_y + card_h - 28;
+                draw_vcenter_text(cr, pl, title && title[0] ? title : "(untitled)",
+                                  card_x + 8, text_y, 20,
+                                  COLOR(MENU_FG_HEX), 1.0,
+                                  GPOPUP_PREVIEW_CARD_W - 16, 1);
+
+                /* Close button */
+                double xc = card_x + GPOPUP_PREVIEW_CARD_W - 14;
+                double yc = card_y + 12;
+                if (g_gpopup.hover_close == i) {
+                    cairo_set_source_rgba(cr, 0.85, 0.2, 0.2, 0.9);
+                    cairo_new_path(cr);
+                    cairo_arc(cr, xc, yc, 8, 0, 2 * M_PI);
+                    cairo_fill(cr);
+                    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
+                } else {
+                    cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 0.55);
+                }
+                cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+                cairo_set_line_width(cr, 1.5);
+                cairo_move_to(cr, xc - 3, yc - 3);
+                cairo_line_to(cr, xc + 3, yc + 3);
+                cairo_stroke(cr);
+                cairo_move_to(cr, xc + 3, yc - 3);
+                cairo_line_to(cr, xc - 3, yc + 3);
+                cairo_stroke(cr);
+
+                {
+                    int is_active = (tl_idx >= 0 && tl_idx < g_n_toplevels &&
+                                     g_toplevels[tl_idx].activated);
+                    if (!is_active && pv && pv->ext_idx >= 0) {
+                        int mi = find_wlr_toplevel_for_ext(pv->ext_idx, NULL);
+                        is_active = (mi >= 0 && mi < g_n_toplevels &&
+                                     g_toplevels[mi].activated);
+                    }
+                    if (is_active)
+                        cairo_set_source_rgba(cr, COLOR(g_theme.accent), 0.95);
+                    else
+                        cairo_set_source_rgba(cr, COLOR(PBCOLOR), PBALPHA * 0.7);
+                }
+                cairo_set_line_width(cr, 1);
+                cairo_set_line_cap(cr, CAIRO_LINE_CAP_BUTT);
                 cairo_new_path(cr);
-                cairo_arc(cr, xc, yc, 8, 0, 2 * M_PI);
-                cairo_fill(cr);
-                cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
-            } else {
-                cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 0.55);
+                rounded_rect(cr, card_x + 0.5, card_y + 0.5,
+                             GPOPUP_PREVIEW_CARD_W - 1, card_h - 1, PRADIUS - 0.5);
+                cairo_stroke(cr);
             }
-            cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-            cairo_set_line_width(cr, 1.5);
-            cairo_move_to(cr, xc - 3, yc - 3);
-            cairo_line_to(cr, xc + 3, yc + 3);
-            cairo_stroke(cr);
-            cairo_move_to(cr, xc + 3, yc - 3);
-            cairo_line_to(cr, xc - 3, yc + 3);
-            cairo_stroke(cr);
+            cairo_restore(cr);
+
+            /* Scrollbar */
+            {
+                double track_x = view_x;
+                double track_y = py + ph - MENU_PADDING - 3;
+                double track_w = view_w;
+                double thumb_w = track_w;
+                double thumb_x = track_x;
+                if (g_gpopup.scroll_max > 0) {
+                    thumb_w = track_w * (view_w / (view_w + g_gpopup.scroll_max));
+                    if (thumb_w < 20) thumb_w = 20;
+                    if (thumb_w > track_w) thumb_w = track_w;
+                    thumb_x = track_x + (track_w - thumb_w) *
+                              (cur_scroll / g_gpopup.scroll_max);
+                }
+                cairo_set_source_rgba(cr, COLOR(g_theme.accent), 0.20);
+                rounded_rect(cr, track_x, track_y, track_w, 3, 1.5);
+                cairo_fill(cr);
+                cairo_set_source_rgba(cr, COLOR(g_theme.accent), 0.85);
+                rounded_rect(cr, thumb_x, track_y, thumb_w, 3, 1.5);
+                cairo_fill(cr);
+            }
+        } else {
+            for (int i = 0; i < g_gpopup.n_windows; i++) {
+                double row_y = py + MENU_PADDING + i * MENU_ROW_HEIGHT;
+                if (g_gpopup.hover_idx == i) {
+                    draw_hover_row(cr, px, row_y, pw, MENU_ROW_HEIGHT,
+                                   0, MENU_HOVER_A);
+                }
+                int tl_idx = g_gpopup.windows[i];
+                cairo_surface_t *icon = NULL;
+                const char *title = NULL;
+                if (tl_idx >= 0 && tl_idx < g_n_toplevels) {
+                    icon = g_toplevels[tl_idx].icon;
+                    title = g_toplevels[tl_idx].title;
+                } else {
+                    int ei = g_gpopup.previews[i] ? g_gpopup.previews[i]->ext_idx : -1;
+                    if (ei >= 0 && ei < g_n_ext_toplevels)
+                        title = g_ext_toplevels[ei].title;
+                }
+                double text_x = px + MENU_PADDING;
+                text_x += draw_icon_fit(cr, icon, text_x, row_y,
+                                        0, MENU_ROW_HEIGHT, MENU_ROW_ICON, 0);
+                double xc = px + pw - MENU_PADDING - 8;
+                double yc = row_y + MENU_ROW_HEIGHT / 2.0;
+                double max_text_w = xc - text_x - 10;
+                draw_vcenter_text(cr, pl, title && title[0] ? title : "(untitled)",
+                                  text_x, row_y, MENU_ROW_HEIGHT,
+                                  COLOR(MENU_FG_HEX), 1.0,
+                                  max_text_w, 1);
+                if (g_gpopup.hover_close == i) {
+                    cairo_set_source_rgba(cr, 0.85, 0.2, 0.2, 0.9);
+                    cairo_new_path(cr);
+                    cairo_arc(cr, xc, yc, 8, 0, 2 * M_PI);
+                    cairo_fill(cr);
+                    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
+                } else {
+                    cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 0.55);
+                }
+                cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+                cairo_set_line_width(cr, 1.5);
+                cairo_move_to(cr, xc - 3, yc - 3);
+                cairo_line_to(cr, xc + 3, yc + 3);
+                cairo_stroke(cr);
+                cairo_move_to(cr, xc + 3, yc - 3);
+                cairo_line_to(cr, xc - 3, yc + 3);
+                cairo_stroke(cr);
+            }
         }
 
         cairo_restore(cr);
@@ -11944,7 +12891,7 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
         double cx = 0;
         const char *tip = bar_app_tip_label(&cx);
         int tip_h = bar_app_tip_popup_h();
-        int base = (g_gpopup.open ? g_gpopup.height : 0) +
+        int base = (g_gpopup.open ? g_gpopup.h : 0) +
                    (g_cpop.open ? (int)g_cpop.h : 0) +
                    (g_volpop.open ? volpop_height() : 0) +
                    (g_tm.open ? g_tm.height : 0) +
@@ -11953,7 +12900,14 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
                    (g_calpop.open ? calpop_height() : 0) +
                    (g_wlp.open ? wlp_height() : 0) +
                    (g_wxpop.open ? wxpop_height() : 0);
-        if (tip && *tip && tip_h > 0 && base == 0) {
+        if (tip && *tip && tip_h > 0) {
+            double anim_t = 1.0;
+            if (g_bar_app_tip.show_us > 0) {
+                anim_t = (double)(g_get_monotonic_time() - g_bar_app_tip.show_us) / 150000.0;
+                if (anim_t < 0.0) anim_t = 0.0;
+                if (anim_t > 1.0) anim_t = 1.0;
+            }
+            double ease = 1.0 - (1.0 - anim_t) * (1.0 - anim_t);
             pango_layout_set_width(pl, -1);
             pango_layout_set_alignment(pl, PANGO_ALIGN_LEFT);
             pango_layout_set_ellipsize(pl, PANGO_ELLIPSIZE_END);
@@ -11965,15 +12919,18 @@ flyout_draw(cairo_t *cr, PangoLayout *pl)
             double bw = tw + pad_x * 2;
             double bh = th + pad_y * 2;
             double bx = cx - bw / 2.0;
-            double by = (double)(tip_h + 5) - 5 - bh; /* 5px above bar */
+            double by = (double)bar_y_offset() - 5 - bh + (1.0 - ease) * 4.0; /* 5px above bar */
             if (bx < PPADDING) bx = PPADDING;
             if (bx + bw > g_bar.width - PPADDING) bx = g_bar.width - PPADDING - bw;
             cairo_new_path(cr);
             cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
             rounded_rect(cr, bx, by, bw, bh, 4);
-            cairo_set_source_rgba(cr, 0.13, 0.13, 0.13, 0.95);
-            cairo_fill(cr);
-            cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), 1.0);
+            cairo_set_source_rgba(cr, 0.13, 0.13, 0.13, 0.95 * ease);
+            cairo_fill_preserve(cr);
+            cairo_set_source_rgba(cr, COLOR(PBCOLOR), PBALPHA * ease);
+            cairo_set_line_width(cr, PBWIDTH);
+            cairo_stroke(cr);
+            cairo_set_source_rgba(cr, COLOR(MENU_FG_HEX), ease);
             cairo_move_to(cr, bx + pad_x, by + pad_y);
             pango_cairo_show_layout(cr, pl);
         }
@@ -12935,6 +13892,7 @@ flyout_surface_create(struct bar *b, int width, int height)
                        !g_gpopup.open && !g_cpop.open && !g_volpop.open &&
                        !g_tm.open && !g_wspop.open && !g_npop.open &&
                        !g_calpop.open && !g_wlp.open && !g_wxpop.open;
+        b->fly_grabbed = !tip_only;
         if (!tip_only && g_pointer.last_serial && g_wl.seat)
             xdg_popup_grab(b->fly_popup, g_wl.seat, g_pointer.last_serial);
     }
@@ -12969,6 +13927,7 @@ flyout_surface_destroy(struct bar *b)
     b->fly_req_height = 0;
     b->fly_cfg_width = 0;
     b->fly_cfg_height = 0;
+    b->fly_grabbed = 0;
     flyout_surface_free(b);
 }
 
@@ -13453,6 +14412,20 @@ flyout_update_size(struct bar *b)
          * This used to fall out of bar_reinit_shm() running on every open. */
         g_box.resize_at_ms = now_ms();
         return;
+    }
+
+    {
+        int tip_only = bar_app_tip_popup_h() > 0 &&
+                       !g_gpopup.open && !g_cpop.open && !g_volpop.open &&
+                       !g_tm.open && !g_wspop.open && !g_npop.open &&
+                       !g_calpop.open && !g_wlp.open && !g_wxpop.open;
+        int need_grab = !tip_only;
+        if (need_grab != b->fly_grabbed) {
+            flyout_surface_destroy(b);
+            flyout_surface_create(b, b->width, h);
+            g_box.resize_at_ms = now_ms();
+            return;
+        }
     }
 
     if (b->fly_req_width != b->width || b->fly_req_height != h) {
@@ -13973,24 +14946,126 @@ static int
 group_popup_hit_test(double px, double py)
 {
     if (!g_gpopup.open) return -1;
-    double cw = GROUP_POPUP_W;
-    double ch = g_gpopup.height - PPADDING;
-    if (!in_rect(px, py, g_gpopup.x, g_gpopup.y, cw, ch)) return -1;
-    int idx = (int)((py - g_gpopup.y - MENU_PADDING) / MENU_ROW_HEIGHT);
+    double cur_h = g_gpopup.animating ? g_gpopup.anim_h : (double)g_gpopup.h;
+    double cw = g_gpopup.animating ? g_gpopup.anim_w : (double)g_gpopup.w;
+    double ch = cur_h - PPADDING;
+    double ox = g_gpopup.animating ? g_gpopup.anim_x : g_gpopup.x;
+    double oy = g_gpopup.y + bar_y_offset() - cur_h;
+    double cur_scroll = g_gpopup.animating ? g_gpopup.anim_scroll : g_gpopup.scroll;
+    if (!in_rect(px, py, ox, oy, cw, ch)) return -1;
+    if (g_gpopup.mode == GPOPUP_PREVIEW) {
+        double view_x = ox + MENU_PADDING;
+        double view_w = cw - MENU_PADDING * 2;
+        double card_y = oy + MENU_PADDING;
+        if (!in_rect(px, py, view_x, card_y, view_w, GPOPUP_PREVIEW_CARD_H))
+            return -1;
+        for (int i = 0; i < g_gpopup.n_windows; i++) {
+            struct gpopup_preview *pv = g_gpopup.previews[i];
+            double card_x = view_x + i * (GPOPUP_PREVIEW_CARD_W + GPOPUP_PREVIEW_GAP)
+                            - cur_scroll + (pv ? pv->anim_dx : 0.0);
+            if (in_rect(px, py, card_x, card_y, GPOPUP_PREVIEW_CARD_W, GPOPUP_PREVIEW_CARD_H))
+                return i;
+        }
+        return -1;
+    }
+    int idx = (int)((py - oy - MENU_PADDING) / MENU_ROW_HEIGHT);
     if (idx >= 0 && idx < g_gpopup.n_windows) return idx;
     return -1;
+}
+
+static int
+group_popup_inside(double px, double py)
+{
+    if (!g_gpopup.open) return 0;
+    double cur_h = g_gpopup.animating ? g_gpopup.anim_h : (double)g_gpopup.h;
+    double pw = g_gpopup.animating ? g_gpopup.anim_w : (double)g_gpopup.w;
+    double ox = g_gpopup.animating ? g_gpopup.anim_x : g_gpopup.x;
+    double oy = g_gpopup.y + bar_y_offset() - cur_h;
+    return in_rect(px, py, ox, oy, pw, cur_h - PPADDING);
+}
+
+static int
+gpopup_scrollbar_metrics(double *track_x, double *track_y, double *track_w,
+                         double *thumb_w, double *thumb_x)
+{
+    if (!g_gpopup.open || g_gpopup.mode != GPOPUP_PREVIEW)
+        return 0;
+    double cur_h = g_gpopup.animating ? g_gpopup.anim_h : (double)g_gpopup.h;
+    double pw = g_gpopup.animating ? g_gpopup.anim_w : (double)g_gpopup.w;
+    double ox = g_gpopup.animating ? g_gpopup.anim_x : g_gpopup.x;
+    double oy = g_gpopup.y + bar_y_offset() - cur_h;
+    double ph = cur_h - PPADDING;
+    double view_x = ox + MENU_PADDING;
+    double view_w = pw - MENU_PADDING * 2;
+    double cur_scroll = g_gpopup.animating ? g_gpopup.anim_scroll : g_gpopup.scroll;
+    double tw = view_w;
+    double tx = view_x;
+    if (g_gpopup.scroll_max > 0) {
+        tw = view_w * (view_w / (view_w + g_gpopup.scroll_max));
+        if (tw < 20) tw = 20;
+        if (tw > view_w) tw = view_w;
+        tx = view_x + (view_w - tw) * (cur_scroll / g_gpopup.scroll_max);
+    }
+    if (track_x) *track_x = view_x;
+    if (track_y) *track_y = oy + ph - MENU_PADDING - 3;
+    if (track_w) *track_w = view_w;
+    if (thumb_w) *thumb_w = tw;
+    if (thumb_x) *thumb_x = tx;
+    return 1;
+}
+
+static int
+gpopup_scrollbar_hit_test(double px, double py)
+{
+    double track_x, track_y, track_w, thumb_w, thumb_x;
+    if (!gpopup_scrollbar_metrics(&track_x, &track_y, &track_w, &thumb_w, &thumb_x))
+        return 0;
+    return in_rect(px, py, track_x, track_y - 5, track_w, 12);
+}
+
+static void
+gpopup_scrollbar_set_from_x(double px, double grab_off)
+{
+    double track_x, track_y, track_w, thumb_w, thumb_x;
+    (void)track_y; (void)thumb_x;
+    if (!gpopup_scrollbar_metrics(&track_x, &track_y, &track_w, &thumb_w, &thumb_x))
+        return;
+    double travel = track_w - thumb_w;
+    if (travel <= 0) return;
+    double new_thumb_x = px - grab_off;
+    double t = (new_thumb_x - track_x) / travel;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    g_gpopup.scroll = t * g_gpopup.scroll_max;
+    g_gpopup.anim_scroll = g_gpopup.scroll;
+    g_gpopup.anim_target_scroll = g_gpopup.scroll;
+    g_bar.fly_needs_render = 1;
 }
 
 static int
 group_popup_close_hit_test(double px, double py)
 {
     if (!g_gpopup.open) return -1;
-    double pw = GROUP_POPUP_W;
+    double cur_h = g_gpopup.animating ? g_gpopup.anim_h : (double)g_gpopup.h;
+    double pw = g_gpopup.animating ? g_gpopup.anim_w : (double)g_gpopup.w;
+    double ox = g_gpopup.animating ? g_gpopup.anim_x : g_gpopup.x;
+    double oy = g_gpopup.y + bar_y_offset() - cur_h;
+    double cur_scroll = g_gpopup.animating ? g_gpopup.anim_scroll : g_gpopup.scroll;
     double r = 9;
     for (int i = 0; i < g_gpopup.n_windows; i++) {
-        double row_y = g_gpopup.y + MENU_PADDING + i * MENU_ROW_HEIGHT;
-        double cx = g_gpopup.x + pw - MENU_PADDING - 8;
-        double cy = row_y + MENU_ROW_HEIGHT / 2.0;
+        double cx, cy;
+        if (g_gpopup.mode == GPOPUP_PREVIEW) {
+            double view_x = ox + MENU_PADDING;
+            struct gpopup_preview *pv = g_gpopup.previews[i];
+            double card_x = view_x + i * (GPOPUP_PREVIEW_CARD_W + GPOPUP_PREVIEW_GAP)
+                            - cur_scroll + (pv ? pv->anim_dx : 0.0);
+            cx = card_x + GPOPUP_PREVIEW_CARD_W - 14;
+            cy = oy + MENU_PADDING + 12;
+        } else {
+            double row_y = oy + MENU_PADDING + i * MENU_ROW_HEIGHT;
+            cx = ox + pw - MENU_PADDING - 8;
+            cy = row_y + MENU_ROW_HEIGHT / 2.0;
+        }
         if (in_rect(px, py, cx - r, cy - r, 2 * r, 2 * r))
             return i;
     }
@@ -14105,6 +15180,12 @@ gpopup_hover_refresh(int on_bar)
     if (g_gpopup.open) {
         g_gpopup.hover_idx = on_bar ? group_popup_hit_test(g_pointer.x, g_pointer.y) : -1;
         g_gpopup.hover_close = on_bar ? group_popup_close_hit_test(g_pointer.x, g_pointer.y) : -1;
+        if (g_gpopup.focus_on_leave_idx >= 0 && old_idx >= 0 &&
+            g_gpopup.hover_idx < 0 && g_gpopup.hover_close < 0) {
+            /* All-windows preview: keep popup open on mouse leave;
+             * activation happens via jtlabctl activate on key release. */
+            g_gpopup.hover_idx = old_idx;
+        }
     } else {
         gpopup_clear_hover();
     }
@@ -14168,8 +15249,26 @@ hover_delay_clear(struct hover_delay *d)
         if (s) g_source_destroy(s);
         d->timer = 0;
     }
+    if (d->anim_src_id) {
+        GSource *s = g_sni.glib_ctx ?
+            g_main_context_find_source_by_id(g_sni.glib_ctx, d->anim_src_id) : NULL;
+        if (s) g_source_destroy(s);
+        d->anim_src_id = 0;
+    }
     d->target = -1;
     d->shown = 0;
+    d->show_us = 0;
+}
+
+static gboolean
+hover_delay_anim_tick(void *data)
+{
+    struct hover_delay *d = data;
+    if (!d->shown) { d->anim_src_id = 0; return G_SOURCE_REMOVE; }
+    double t = (double)(g_get_monotonic_time() - d->show_us) / 150000.0;
+    if (t >= 1.0) { d->anim_src_id = 0; render_request(); return G_SOURCE_REMOVE; }
+    render_request();
+    return G_SOURCE_CONTINUE;
 }
 
 static gboolean
@@ -14178,6 +15277,19 @@ hover_delay_fire(void *data)
     struct hover_delay *d = data;
     d->timer = 0;
     d->shown = 1;
+    d->show_us = g_get_monotonic_time();
+    if (d->anim_src_id) {
+        GSource *s = g_sni.glib_ctx ?
+            g_main_context_find_source_by_id(g_sni.glib_ctx, d->anim_src_id) : NULL;
+        if (s) g_source_destroy(s);
+        d->anim_src_id = 0;
+    }
+    if (g_sni.glib_ctx) {
+        GSource *src = g_timeout_source_new(16);
+        g_source_set_callback(src, hover_delay_anim_tick, d, NULL);
+        d->anim_src_id = g_source_attach(src, g_sni.glib_ctx);
+        g_source_unref(src);
+    }
     popup_size_changed();
     render_request();
     return G_SOURCE_REMOVE;
@@ -14194,8 +15306,15 @@ hover_delay_set(struct hover_delay *d, int target, unsigned delay_ms)
         if (s) g_source_destroy(s);
         d->timer = 0;
     }
+    if (d->anim_src_id) {
+        GSource *s = g_sni.glib_ctx ?
+            g_main_context_find_source_by_id(g_sni.glib_ctx, d->anim_src_id) : NULL;
+        if (s) g_source_destroy(s);
+        d->anim_src_id = 0;
+    }
     d->target = target;
     d->shown = 0;
+    d->show_us = 0;
     popup_size_changed();
     if (target < 0) {
         render_request();
@@ -14272,6 +15391,29 @@ bar_hover_refresh(int on_bar, int on_fly)
             tip_target = g_pointer.hover_pinned_idx;
         else if (g_pointer.hover_taskbar_idx >= 0)
             tip_target = 10000 + g_pointer.hover_taskbar_idx;
+        if (tip_target >= 0 && g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW &&
+            g_gpopup.focus_on_leave_idx < 0) {
+            int same = 0;
+            if (tip_target < 10000) {
+                int pi = tip_target;
+                if (pi < g_app.n_pinned && g_app.pinned[pi] < g_app.n_apps) {
+                    int wins[MAX_WINDOWS_PER_GROUP];
+                    int count = windows_of_app(&g_app.apps[g_app.pinned[pi]], wins,
+                                               MAX_WINDOWS_PER_GROUP);
+                    same = (count == g_gpopup.n_windows &&
+                            memcmp(wins, g_gpopup.windows, (size_t)count * sizeof(int)) == 0);
+                }
+            } else {
+                int gi = tip_target - 10000;
+                if (gi >= 0 && gi < g_box.n_taskbar_groups) {
+                    struct taskbar_group *g = &g_box.taskbar_groups[gi];
+                    same = (g->n_windows == g_gpopup.n_windows &&
+                            memcmp(g->windows, g_gpopup.windows,
+                                   (size_t)g->n_windows * sizeof(int)) == 0);
+                }
+            }
+            if (same) tip_target = -1;
+        }
         hover_delay_set(&g_bar_app_tip, tip_target, HOVER_TIP_DELAY_MS);
     }
     return changed;
@@ -14307,7 +15449,12 @@ pointer_refresh_hover(void)
     changed |= bar_hover_refresh(on_bar, on_fly);
     if (g_wspop.blue_dragging)
         blue_set_from_x(g_pointer.x);
+    if (g_gpopup.scroll_drag) {
+        gpopup_scrollbar_set_from_x(g_pointer.x, g_gpopup.scroll_drag_off);
+        changed = 1;
+    }
 
+#ifdef JTLAB_DEBUG
     if (trace_on()) {
         static unsigned long last_log;
         unsigned long t = (unsigned long)now_ms();
@@ -14324,6 +15471,7 @@ pointer_refresh_hover(void)
                     g_box.n_taskbar_groups > 1 ? g_box.taskbar_groups[1].x : -1.0);
         }
     }
+#endif
 
     if (changed)
         render_request();
@@ -14397,6 +15545,7 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
         if (button == BTN_LEFT) {
             osk_key_release();
             g_volpop.dragging = 0;
+            g_gpopup.scroll_drag = 0;
             if (g_wspop.blue_dragging) {
                 /* The filter already tracked every motion event, so the
                  * release only has to persist the final value. */
@@ -14408,6 +15557,7 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
         return;
     }
 
+#ifdef JTLAB_DEBUG
     if (trace_on())
         fprintf(stderr,
                 "[trace] click b=%u x=%.0f y=%.0f on_bar=%d on_fly=%d "
@@ -14418,6 +15568,7 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
                 g_box.n_taskbar_groups,
                 g_box.n_taskbar_groups > 0 ? g_box.taskbar_groups[0].x : -1.0,
                 g_box.n_taskbar_groups > 1 ? g_box.taskbar_groups[1].x : -1.0);
+#endif
 
     if (button == BTN_LEFT && popup_coords_safe(time) && g_osk.open &&
         on_osk_surface()) {
@@ -14542,17 +15693,32 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
     if (popup_coords_safe(time) && g_gpopup.open && on_flyout_surface()) {
         int cidx = group_popup_close_hit_test(g_pointer.x, g_pointer.y);
         if (cidx >= 0) {
-            int tl_idx = g_gpopup.windows[cidx];
-            zwlr_foreign_toplevel_handle_v1_close(g_toplevels[tl_idx].handle);
+            gpopup_close_window(cidx);
+            return;
+        }
+        if (gpopup_scrollbar_hit_test(g_pointer.x, g_pointer.y)) {
+            double track_x, track_y, track_w, thumb_w, thumb_x;
+            if (gpopup_scrollbar_metrics(&track_x, &track_y, &track_w, &thumb_w, &thumb_x)) {
+                g_gpopup.scroll_drag = 1;
+                if (g_pointer.x >= thumb_x && g_pointer.x <= thumb_x + thumb_w)
+                    g_gpopup.scroll_drag_off = g_pointer.x - thumb_x;
+                else {
+                    g_gpopup.scroll_drag_off = thumb_w / 2.0;
+                    gpopup_scrollbar_set_from_x(g_pointer.x, g_gpopup.scroll_drag_off);
+                }
+            }
             return;
         }
         int idx = group_popup_hit_test(g_pointer.x, g_pointer.y);
         if (idx >= 0) {
             int tl_idx = g_gpopup.windows[idx];
-            zwlr_foreign_toplevel_handle_v1_activate(g_toplevels[tl_idx].handle, g_wl.seat);
+            if (tl_idx >= 0 && tl_idx < g_n_toplevels)
+                zwlr_foreign_toplevel_handle_v1_activate(g_toplevels[tl_idx].handle, g_wl.seat);
             gpopup_close();
             return;
         }
+        if (group_popup_inside(g_pointer.x, g_pointer.y))
+            return;
         gpopup_close();
     }
 
@@ -14722,7 +15888,11 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
             int count = windows_of_app(a, wins, MAX_WINDOWS_PER_GROUP);
             if (count > 1) {
                 if (g_bar.menu_open) menu_close(&g_bar);
-                gpopup_open_pinned(idx, g_box.pl[idx].x);
+                if (g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW) {
+                    gpopup_close();
+                } else {
+                    gpopup_open_pinned(idx, g_box.pl[idx].x);
+                }
                 return;
             }
             if (g_bar.menu_open) menu_close(&g_bar);
@@ -14768,7 +15938,11 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
                     zwlr_foreign_toplevel_handle_v1_activate(g_toplevels[g->windows[0]].handle, g_wl.seat);
                 } else {
                     if (g_bar.menu_open) menu_close(&g_bar);
-                    gpopup_open(gidx, g->x);
+                    if (g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW) {
+                        gpopup_close();
+                    } else {
+                        gpopup_open(gidx, g->x);
+                    }
                 }
             }
             return;
@@ -14992,7 +16166,11 @@ dnd_activate_target(void)
                 g_toplevels[wins[0]].handle, g_wl.seat);
         } else if (count > 1) {
             if (g_bar.menu_open) menu_close(&g_bar);
-            gpopup_open_pinned(p, g_box.pl[p].x);
+            if (g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW) {
+                gpopup_close();
+            } else {
+                gpopup_open_pinned(p, g_box.pl[p].x);
+            }
         }
         return;
     }
@@ -15007,7 +16185,11 @@ dnd_activate_target(void)
                 g_toplevels[g->windows[0]].handle, g_wl.seat);
         } else if (g->n_windows > 1) {
             if (g_bar.menu_open) menu_close(&g_bar);
-            gpopup_open(gidx, g->x);
+            if (g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW) {
+                gpopup_close();
+            } else {
+                gpopup_open(gidx, g->x);
+            }
         }
         return;
     }
@@ -15347,6 +16529,24 @@ pointer_handle_axis(void *d, struct wl_pointer *p, uint32_t t,
         return;
     }
 
+    int over_gpopup = on_fly && popup_coords_safe(t) && g_gpopup.open &&
+                      g_gpopup.mode == GPOPUP_PREVIEW &&
+                      group_popup_inside(g_pointer.x, g_pointer.y);
+    if (over_gpopup) {
+        double target = g_gpopup.animating ? g_gpopup.anim_target_scroll : g_gpopup.scroll;
+        target += delta;
+        if (target < 0) target = 0;
+        if (target > g_gpopup.scroll_max) target = g_gpopup.scroll_max;
+        if (fabs(target - (g_gpopup.animating ? g_gpopup.anim_target_scroll : g_gpopup.scroll)) >= 0.5) {
+            gpopup_anim_start(g_gpopup.animating ? g_gpopup.anim_target_x : g_gpopup.x,
+                              g_gpopup.animating ? g_gpopup.anim_target_w : (double)g_gpopup.w,
+                              g_gpopup.animating ? g_gpopup.anim_target_h : (double)g_gpopup.h,
+                              target);
+            render_request();
+        }
+        return;
+    }
+
     int over_menu = on_menu_surface() && popup_coords_safe(t) &&
                     g_bar.menu_open && !g_ctx.open &&
                     menu_hit_test(g_pointer.x, g_pointer.y) >= 0;
@@ -15540,6 +16740,234 @@ find_toplevel(struct zwlr_foreign_toplevel_handle_v1 *handle)
     return -1;
 }
 
+static int
+find_ext_toplevel(struct ext_foreign_toplevel_handle_v1 *handle)
+{
+    for (int i = 0; i < g_n_ext_toplevels; i++)
+        if (g_ext_toplevels[i].handle == handle) return i;
+    return -1;
+}
+
+static int
+find_ext_toplevel_for_wlr(int tl_idx, const char *used_ext)
+{
+    if (tl_idx < 0 || tl_idx >= g_n_toplevels) return -1;
+    const char *app_id = g_toplevels[tl_idx].app_id;
+    const char *title = g_toplevels[tl_idx].title;
+    for (int i = 0; i < g_n_ext_toplevels; i++) {
+        if (used_ext && used_ext[i]) continue;
+        const char *ea = g_ext_toplevels[i].app_id;
+        const char *et = g_ext_toplevels[i].title;
+        if (app_id && ea && strcmp(app_id, ea) == 0 &&
+            title && et && strcmp(title, et) == 0)
+            return i;
+    }
+    /* Fallback: match by app_id only when no other preview already claimed it.
+     * Avoid reusing the same ext handle so two windows don't show the same capture. */
+    for (int i = 0; i < g_n_ext_toplevels; i++) {
+        if (used_ext && used_ext[i]) continue;
+        const char *ea = g_ext_toplevels[i].app_id;
+        const char *et = g_ext_toplevels[i].title;
+        if (app_id && ea && strcmp(app_id, ea) == 0 &&
+            (!title || !et || strcmp(title, et) == 0))
+            return i;
+    }
+    /* Last resort: unique app_id match, ignore title mismatch. */
+    for (int i = 0; i < g_n_ext_toplevels; i++) {
+        if (used_ext && used_ext[i]) continue;
+        const char *ea = g_ext_toplevels[i].app_id;
+        if (app_id && ea && strcmp(app_id, ea) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static int
+find_wlr_toplevel_for_ext(int ext_idx, const char *used_wlr)
+{
+    if (ext_idx < 0 || ext_idx >= g_n_ext_toplevels) return -1;
+    const char *app_id = g_ext_toplevels[ext_idx].app_id;
+    const char *title = g_ext_toplevels[ext_idx].title;
+    for (int i = 0; i < g_n_toplevels; i++) {
+        if (used_wlr && used_wlr[i]) continue;
+        const char *wa = g_toplevels[i].app_id;
+        const char *wt = g_toplevels[i].title;
+        if (app_id && wa && strcmp(app_id, wa) == 0 &&
+            title && wt && strcmp(title, wt) == 0)
+            return i;
+    }
+    for (int i = 0; i < g_n_toplevels; i++) {
+        if (used_wlr && used_wlr[i]) continue;
+        const char *wa = g_toplevels[i].app_id;
+        const char *wt = g_toplevels[i].title;
+        if (app_id && wa && strcmp(app_id, wa) == 0 &&
+            (!title || !wt || strcmp(title, wt) == 0))
+            return i;
+    }
+    for (int i = 0; i < g_n_toplevels; i++) {
+        if (used_wlr && used_wlr[i]) continue;
+        const char *wa = g_toplevels[i].app_id;
+        if (app_id && wa && strcmp(app_id, wa) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static void ext_toplevel_handle_closed(void *data, struct ext_foreign_toplevel_handle_v1 *h);
+static void ext_toplevel_handle_done(void *data, struct ext_foreign_toplevel_handle_v1 *h);
+static void ext_toplevel_handle_title(void *data, struct ext_foreign_toplevel_handle_v1 *h, const char *title);
+static void ext_toplevel_handle_app_id(void *data, struct ext_foreign_toplevel_handle_v1 *h, const char *app_id);
+static void ext_toplevel_handle_identifier(void *data, struct ext_foreign_toplevel_handle_v1 *h, const char *identifier);
+
+static const struct ext_foreign_toplevel_handle_v1_listener ext_toplevel_handle_listener = {
+    .closed = ext_toplevel_handle_closed,
+    .done = ext_toplevel_handle_done,
+    .title = ext_toplevel_handle_title,
+    .app_id = ext_toplevel_handle_app_id,
+    .identifier = ext_toplevel_handle_identifier,
+};
+
+static void
+ext_toplevel_handle_closed(void *data, struct ext_foreign_toplevel_handle_v1 *h)
+{
+    (void)data;
+    int idx = find_ext_toplevel(h);
+    if (idx < 0) return;
+    int popup_affected = 0;
+    if (g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW) {
+        for (int i = 0; i < g_gpopup.n_windows; i++) {
+            struct gpopup_preview *pv = g_gpopup.previews[i];
+            if (pv && pv->ext_idx == idx) { popup_affected = 1; break; }
+        }
+    }
+    int surv_wlr[MAX_WINDOWS_PER_GROUP];
+    int surv_ext[MAX_WINDOWS_PER_GROUP];
+    int surv_count = 0;
+    double surv_cx = (g_gpopup.animating ? g_gpopup.anim_x : g_gpopup.x) +
+                     (g_gpopup.animating ? g_gpopup.anim_w : g_gpopup.w) / 2.0;
+    int surv_focus = g_gpopup.focus_on_leave_idx >= 0 ? 1 : 0;
+    if (popup_affected && g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW &&
+        g_gpopup.focus_on_leave_idx < 0) {
+        for (int i = 0; i < g_gpopup.n_windows && surv_count < MAX_WINDOWS_PER_GROUP; i++) {
+            struct gpopup_preview *pv = g_gpopup.previews[i];
+            if (pv && pv->ext_idx == idx) continue;
+            surv_wlr[surv_count] = g_gpopup.windows[i];
+            surv_ext[surv_count] = pv ? pv->ext_idx : -1;
+            surv_count++;
+        }
+    }
+    for (int i = 0; i < MAX_WINDOWS_PER_GROUP; i++) {
+        struct gpopup_preview *p = g_gpopup.previews[i];
+        if (!p) continue;
+        if (p->ext_idx == idx) {
+            if (p->frame) { ext_image_copy_capture_frame_v1_destroy(p->frame); p->frame = NULL; }
+            if (p->session) { ext_image_copy_capture_session_v1_destroy(p->session); p->session = NULL; }
+            p->pending = 0;
+            p->failed = 1;
+            p->ext_idx = -1;
+        } else if (p->ext_idx > idx) {
+            p->ext_idx--;
+        }
+    }
+    ext_foreign_toplevel_handle_v1_destroy(h);
+    free(g_ext_toplevels[idx].app_id);
+    free(g_ext_toplevels[idx].title);
+    for (int j = idx; j < g_n_ext_toplevels - 1; j++)
+        g_ext_toplevels[j] = g_ext_toplevels[j + 1];
+    g_n_ext_toplevels--;
+    if (popup_affected && g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW) {
+        if (g_gpopup.focus_on_leave_idx >= 0) {
+            gpopup_open_jk_preview();
+        } else {
+            for (int i = 0; i < surv_count; i++) {
+                if (surv_ext[i] > idx) surv_ext[i]--;
+            }
+            if (surv_count > 0)
+                gpopup_fill_preview(surv_count, surv_wlr, surv_ext, surv_cx, surv_focus);
+            else
+                gpopup_close();
+        }
+    }
+}
+
+static void
+ext_toplevel_handle_done(void *data, struct ext_foreign_toplevel_handle_v1 *h)
+{
+    (void)data; (void)h;
+    if (g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW &&
+        g_gpopup.focus_on_leave_idx >= 0)
+        gpopup_open_jk_preview();
+}
+
+static void
+ext_toplevel_handle_title(void *data, struct ext_foreign_toplevel_handle_v1 *h, const char *title)
+{
+    (void)data;
+    int idx = find_ext_toplevel(h);
+    if (idx < 0) return;
+    free(g_ext_toplevels[idx].title);
+    g_ext_toplevels[idx].title = strdup(title ? title : "");
+}
+
+static void
+ext_toplevel_handle_app_id(void *data, struct ext_foreign_toplevel_handle_v1 *h, const char *app_id)
+{
+    (void)data;
+    int idx = find_ext_toplevel(h);
+    if (idx < 0) return;
+    free(g_ext_toplevels[idx].app_id);
+    g_ext_toplevels[idx].app_id = strdup(app_id ? app_id : "");
+}
+
+static void
+ext_toplevel_handle_identifier(void *data, struct ext_foreign_toplevel_handle_v1 *h, const char *identifier)
+{ (void)data; (void)h; (void)identifier; }
+
+static void
+ext_toplevel_list_handle_toplevel(void *data, struct ext_foreign_toplevel_list_v1 *list,
+                                  struct ext_foreign_toplevel_handle_v1 *handle)
+{
+    (void)data; (void)list;
+    if (g_n_ext_toplevels >= MAX_TOPLEVELS) {
+        ext_foreign_toplevel_handle_v1_destroy(handle);
+        return;
+    }
+    struct ext_toplevel_entry *e = &g_ext_toplevels[g_n_ext_toplevels++];
+    memset(e, 0, sizeof(*e));
+    e->handle = handle;
+    e->app_id = strdup("");
+    e->title = strdup("");
+    ext_foreign_toplevel_handle_v1_add_listener(handle, &ext_toplevel_handle_listener, NULL);
+}
+
+static void
+ext_toplevels_clear(void)
+{
+    for (int i = 0; i < g_n_ext_toplevels; i++) {
+        if (g_ext_toplevels[i].handle)
+            ext_foreign_toplevel_handle_v1_destroy(g_ext_toplevels[i].handle);
+        free(g_ext_toplevels[i].app_id);
+        free(g_ext_toplevels[i].title);
+    }
+    g_n_ext_toplevels = 0;
+}
+
+static void
+ext_toplevel_list_handle_finished(void *data, struct ext_foreign_toplevel_list_v1 *list)
+{
+    (void)data;
+    gpopup_previews_clear();
+    ext_toplevels_clear();
+    ext_foreign_toplevel_list_v1_destroy(list);
+    if (g_wl.ext_toplevel_list == list)
+        g_wl.ext_toplevel_list = NULL;
+}
+
+static const struct ext_foreign_toplevel_list_v1_listener ext_toplevel_list_listener = {
+    .toplevel = ext_toplevel_list_handle_toplevel,
+    .finished = ext_toplevel_list_handle_finished,
+};
+
 static void toplevel_handle_title(void *data, struct zwlr_foreign_toplevel_handle_v1 *h, const char *title);
 static void toplevel_handle_app_id(void *data, struct zwlr_foreign_toplevel_handle_v1 *h, const char *app_id);
 static void toplevel_handle_closed(void *data, struct zwlr_foreign_toplevel_handle_v1 *h);
@@ -15629,6 +17057,28 @@ toplevel_handle_done(void *data, struct zwlr_foreign_toplevel_handle_v1 *h)
             g_toplevels[idx].icon = icon_load(g_toplevels[idx].app_id);
     }
     toplevel_recalc_layout();
+    if (g_gpopup.open && g_gpopup.mode == GPOPUP_PREVIEW) {
+        if (g_gpopup.focus_on_leave_idx >= 0) {
+            gpopup_open_jk_preview();
+        } else if (g_gpopup.n_windows > 0) {
+            int ref = g_gpopup.windows[0];
+            const char *ref_app = (ref >= 0 && ref < g_n_toplevels) ? g_toplevels[ref].app_id : NULL;
+            const char *new_app = g_toplevels[idx].app_id;
+            if (ref_app && new_app && app_match(ref_app, new_app)) {
+                int windows[MAX_WINDOWS_PER_GROUP];
+                int n = 0;
+                for (int i = 0; i < g_n_toplevels && n < MAX_WINDOWS_PER_GROUP; i++) {
+                    if (g_toplevels[i].app_id && app_match(g_toplevels[i].app_id, ref_app))
+                        windows[n++] = i;
+                }
+                if (n > 0) {
+                    double cx = (g_gpopup.animating ? g_gpopup.anim_x : g_gpopup.x) +
+                                (g_gpopup.animating ? g_gpopup.anim_w : g_gpopup.w) / 2.0;
+                    gpopup_fill_preview(n, windows, NULL, cx, 0);
+                }
+            }
+        }
+    }
     render_request();
 }
 
@@ -15636,23 +17086,62 @@ static void
 toplevel_remap_popups(int closed_idx, int old_last)
 {
     if (g_gpopup.open) {
-        int w = 0;
-        for (int i = 0; i < g_gpopup.n_windows; i++) {
-            int t = g_gpopup.windows[i];
-            if (t == closed_idx) continue;
-            if (t == old_last) t = closed_idx;
-            if (t < 0 || t >= g_n_toplevels) { gpopup_close(); return; }
-            g_gpopup.windows[w++] = t;
-        }
-        int old_h = g_gpopup.height;
-        g_gpopup.n_windows = w;
-        g_gpopup.height = PPADDING + MENU_PADDING * 2 +
-                          g_gpopup.n_windows * MENU_ROW_HEIGHT;
-        if (g_gpopup.hover_idx >= g_gpopup.n_windows) g_gpopup.hover_idx = -1;
-        if (g_gpopup.n_windows == 0) {
-            gpopup_close();
-        } else if (g_gpopup.height != old_h && g_bar.configured) {
-            flyout_update_size(&g_bar);
+        if (g_gpopup.mode == GPOPUP_PREVIEW) {
+            int needs_rebuild = 0;
+            int surv_wlr[MAX_WINDOWS_PER_GROUP];
+            int surv_ext[MAX_WINDOWS_PER_GROUP];
+            int surv_count = 0;
+            double surv_cx = (g_gpopup.animating ? g_gpopup.anim_x : g_gpopup.x) +
+                     (g_gpopup.animating ? g_gpopup.anim_w : g_gpopup.w) / 2.0;
+            int surv_focus = g_gpopup.focus_on_leave_idx >= 0 ? 1 : 0;
+            for (int i = 0; i < g_gpopup.n_windows; i++) {
+                int t = g_gpopup.windows[i];
+                if (t == closed_idx) {
+                    struct gpopup_preview *pv = g_gpopup.previews[i];
+                    if (!pv || pv->ext_idx < 0) {
+                        needs_rebuild = 1;
+                        continue;
+                    }
+                    g_gpopup.windows[i] = -1;
+                } else if (t == old_last) {
+                    g_gpopup.windows[i] = closed_idx;
+                }
+                if (surv_count < MAX_WINDOWS_PER_GROUP) {
+                    surv_wlr[surv_count] = g_gpopup.windows[i];
+                    surv_ext[surv_count] = g_gpopup.previews[i] ? g_gpopup.previews[i]->ext_idx : -1;
+                    surv_count++;
+                }
+            }
+            if (g_gpopup.hover_idx >= g_gpopup.n_windows) g_gpopup.hover_idx = -1;
+            if (needs_rebuild) {
+                if (g_gpopup.focus_on_leave_idx >= 0) {
+                    gpopup_open_jk_preview();
+                } else if (surv_count > 0) {
+                    gpopup_fill_preview(surv_count, surv_wlr, surv_ext, surv_cx, surv_focus);
+                } else {
+                    gpopup_close();
+                }
+                return;
+            }
+        } else {
+            int w = 0;
+            for (int i = 0; i < g_gpopup.n_windows; i++) {
+                int t = g_gpopup.windows[i];
+                if (t == closed_idx) continue;
+                if (t == old_last) t = closed_idx;
+                if (t >= 0 && t >= g_n_toplevels) { gpopup_close(); return; }
+                g_gpopup.windows[w++] = t;
+            }
+            int old_h = g_gpopup.h;
+            g_gpopup.n_windows = w;
+            g_gpopup.h = PPADDING + MENU_PADDING * 2 +
+                              g_gpopup.n_windows * MENU_ROW_HEIGHT;
+            if (g_gpopup.hover_idx >= g_gpopup.n_windows) g_gpopup.hover_idx = -1;
+            if (g_gpopup.n_windows == 0) {
+                gpopup_close();
+            } else if (g_gpopup.h != old_h && g_bar.configured) {
+                flyout_update_size(&g_bar);
+            }
         }
     }
     if (g_cpop.open) {
@@ -15781,6 +17270,11 @@ cleanup(void)
     if (g_wl.vk) zwp_virtual_keyboard_v1_destroy(g_wl.vk);
     if (g_wl.vk_mgr) zwp_virtual_keyboard_manager_v1_destroy(g_wl.vk_mgr);
     if (g_wl.screencopy_mgr) zwlr_screencopy_manager_v1_destroy(g_wl.screencopy_mgr);
+    gpopup_previews_clear();
+    ext_toplevels_clear();
+    if (g_wl.ext_capture_mgr) ext_image_copy_capture_manager_v1_destroy(g_wl.ext_capture_mgr);
+    if (g_wl.ext_toplevel_capture_mgr) ext_foreign_toplevel_image_capture_source_manager_v1_destroy(g_wl.ext_toplevel_capture_mgr);
+    if (g_wl.ext_toplevel_list) ext_foreign_toplevel_list_v1_destroy(g_wl.ext_toplevel_list);
     if (g_wl.cursor_surface) wl_surface_destroy(g_wl.cursor_surface);
     if (g_wl.cursor_theme) wl_cursor_theme_destroy(g_wl.cursor_theme);
     toplevels_clear();
@@ -15907,6 +17401,26 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name,
         g_wl.screencopy_mgr = wl_registry_bind(reg, name,
             &zwlr_screencopy_manager_v1_interface, 1);
         g_wl.screencopy_mgr_name = name;
+    } else if (strcmp(interface, ext_image_copy_capture_manager_v1_interface.name) == 0) {
+        if (g_wl.ext_capture_mgr) return;
+        uint32_t v = version < 1 ? version : 1;
+        g_wl.ext_capture_mgr = wl_registry_bind(reg, name,
+            &ext_image_copy_capture_manager_v1_interface, v);
+        g_wl.ext_capture_mgr_name = name;
+    } else if (strcmp(interface, ext_foreign_toplevel_image_capture_source_manager_v1_interface.name) == 0) {
+        if (g_wl.ext_toplevel_capture_mgr) return;
+        uint32_t v = version < 1 ? version : 1;
+        g_wl.ext_toplevel_capture_mgr = wl_registry_bind(reg, name,
+            &ext_foreign_toplevel_image_capture_source_manager_v1_interface, v);
+        g_wl.ext_toplevel_capture_mgr_name = name;
+    } else if (strcmp(interface, ext_foreign_toplevel_list_v1_interface.name) == 0) {
+        if (g_wl.ext_toplevel_list) return;
+        uint32_t v = version < 1 ? version : 1;
+        g_wl.ext_toplevel_list = wl_registry_bind(reg, name,
+            &ext_foreign_toplevel_list_v1_interface, v);
+        g_wl.ext_toplevel_list_name = name;
+        ext_foreign_toplevel_list_v1_add_listener(g_wl.ext_toplevel_list,
+            &ext_toplevel_list_listener, NULL);
     } else if (strcmp(interface, zwp_virtual_keyboard_manager_v1_interface.name) == 0) {
         if (g_wl.vk_mgr) return;
         uint32_t v = version < 1 ? version : 1;
@@ -15981,6 +17495,18 @@ registry_global_remove(void *data, struct wl_registry *reg, uint32_t name)
     } else if (g_wl.screencopy_mgr && g_wl.screencopy_mgr_name == name) {
         zwlr_screencopy_manager_v1_destroy(g_wl.screencopy_mgr);
         g_wl.screencopy_mgr = NULL;
+    } else if (g_wl.ext_capture_mgr && g_wl.ext_capture_mgr_name == name) {
+        gpopup_previews_clear();
+        ext_image_copy_capture_manager_v1_destroy(g_wl.ext_capture_mgr);
+        g_wl.ext_capture_mgr = NULL;
+    } else if (g_wl.ext_toplevel_capture_mgr && g_wl.ext_toplevel_capture_mgr_name == name) {
+        ext_foreign_toplevel_image_capture_source_manager_v1_destroy(g_wl.ext_toplevel_capture_mgr);
+        g_wl.ext_toplevel_capture_mgr = NULL;
+    } else if (g_wl.ext_toplevel_list && g_wl.ext_toplevel_list_name == name) {
+        gpopup_previews_clear();
+        ext_toplevels_clear();
+        ext_foreign_toplevel_list_v1_destroy(g_wl.ext_toplevel_list);
+        g_wl.ext_toplevel_list = NULL;
     } else if (g_wl.vk_mgr && g_wl.vk_mgr_name == name) {
         if (g_wl.vk) {
             zwp_virtual_keyboard_v1_destroy(g_wl.vk);
@@ -16060,7 +17586,9 @@ wayland_init(void)
 {
     g_wl.display = wl_display_connect(NULL);
     if (!g_wl.display) {
+#ifdef JTLAB_DEBUG
         fprintf(stderr, "jtlab: cannot connect to wayland display\n");
+#endif
         return 0;
     }
 
@@ -16075,7 +17603,9 @@ wayland_init(void)
     dnd_init();
 
     if (!g_wl.compositor || !g_wl.shm || !g_wl.layer_shell) {
+#ifdef JTLAB_DEBUG
         fprintf(stderr, "jtlab: missing wayland globals\n");
+#endif
         return 0;
     }
 
@@ -16083,8 +17613,11 @@ wayland_init(void)
      * the background surfaces could not be made in output_add(); do it now. */
     output_bg_surface_create_all();
 
-    if (!g_wl.gamma_mgr)
+    if (!g_wl.gamma_mgr) {
+#ifdef JTLAB_DEBUG
         fprintf(stderr, "jtlab: compositor lacks wlr-gamma-control; night light disabled\n");
+#endif
+    }
 
     if (!g_wl.ext_ws_mgr)
         workspaces_placeholder_init();
@@ -16187,14 +17720,19 @@ main_loop(void)
                                                   &perr_obj);
         int err = wl_display_get_error(g_wl.display);
         if (perr_code || err) {
-            if (perr_code)
+            if (perr_code) {
+#ifdef JTLAB_DEBUG
                 fprintf(stderr,
                         "jtlab: fatal protocol error %u on %s (object %u)\n",
                         perr_code, perr_iface ? perr_iface->name : "unknown",
                         perr_obj);
-            else
+#endif
+            } else {
+#ifdef JTLAB_DEBUG
                 fprintf(stderr, "jtlab: wayland connection lost: %s\n",
                         strerror(err));
+#endif
+            }
             g_app.running = 0;
         }
     }
@@ -16342,6 +17880,12 @@ ctl_read_buf_done(GObject *src, GAsyncResult *res, gpointer data)
             shot_begin();
         else if (g_str_has_prefix(ctx->buf, "reload"))
             profile_config_reload();
+        else if (g_str_has_prefix(ctx->buf, "next"))
+            gpopup_select_next();
+        else if (g_str_has_prefix(ctx->buf, "previous"))
+            gpopup_select_prev();
+        else if (g_str_has_prefix(ctx->buf, "focus"))
+            gpopup_activate_selected();
         else if (g_str_has_prefix(ctx->buf, "quit"))
             g_app.running = 0;
     }
@@ -16384,8 +17928,10 @@ ctl_init(void)
                                        G_SOCKET_TYPE_STREAM,
                                        G_SOCKET_PROTOCOL_DEFAULT,
                                        NULL, &effective, &err)) {
+#ifdef JTLAB_DEBUG
         fprintf(stderr, "jtlab: control socket %s: %s\n", path,
                 err ? err->message : "unknown error");
+#endif
         g_clear_error(&err);
         g_object_unref(addr);
         g_object_unref(g_sni.ctl_service);
@@ -16445,6 +17991,7 @@ main(int argc, char *argv[])
     init_signals();
     state_init();
     profile_config_load();
+    avatar_load();
     services_init();
 
     if (!wayland_init()) {

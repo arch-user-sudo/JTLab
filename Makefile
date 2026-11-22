@@ -77,6 +77,9 @@ TOPLEVEL_XML = $(PROTOCOL_DIR)/wlr-foreign-toplevel-management-unstable-v1.xml
 WORKSPACE_XML = $(PROTOCOL_DIR)/ext-workspace-v1.xml
 GAMMA_XML = $(PROTOCOL_DIR)/wlr-gamma-control-unstable-v1.xml
 SCREENCOPY_XML = $(PROTOCOL_DIR)/wlr-screencopy-unstable-v1.xml
+EXT_FOREIGN_TOPLEVEL_LIST_XML = $(PROTOCOL_DIR)/ext-foreign-toplevel-list-v1.xml
+EXT_IMAGE_CAPTURE_SOURCE_XML = $(PROTOCOL_DIR)/ext-image-capture-source-v1.xml
+EXT_IMAGE_COPY_CAPTURE_XML = $(PROTOCOL_DIR)/ext-image-copy-capture-v1.xml
 VKEYBOARD_XML = $(PROTOCOL_DIR)/virtual-keyboard-unstable-v1.xml
 
 all: jtlab jtlabctl wallpaper
@@ -135,6 +138,24 @@ $(BUILD_DIR)/wlr-screencopy-unstable-v1-client-protocol.h: $(SCREENCOPY_XML) | $
 $(BUILD_DIR)/wlr-screencopy-unstable-v1-protocol.c: $(SCREENCOPY_XML) | $(BUILD_DIR)
 	wayland-scanner private-code $< $@
 
+$(BUILD_DIR)/ext-foreign-toplevel-list-v1-client-protocol.h: $(EXT_FOREIGN_TOPLEVEL_LIST_XML) | $(BUILD_DIR)
+	wayland-scanner client-header $< $@
+
+$(BUILD_DIR)/ext-foreign-toplevel-list-v1-protocol.c: $(EXT_FOREIGN_TOPLEVEL_LIST_XML) | $(BUILD_DIR)
+	wayland-scanner private-code $< $@
+
+$(BUILD_DIR)/ext-image-capture-source-v1-client-protocol.h: $(EXT_IMAGE_CAPTURE_SOURCE_XML) | $(BUILD_DIR)
+	wayland-scanner client-header $< $@
+
+$(BUILD_DIR)/ext-image-capture-source-v1-protocol.c: $(EXT_IMAGE_CAPTURE_SOURCE_XML) | $(BUILD_DIR)
+	wayland-scanner private-code $< $@
+
+$(BUILD_DIR)/ext-image-copy-capture-v1-client-protocol.h: $(EXT_IMAGE_COPY_CAPTURE_XML) | $(BUILD_DIR)
+	wayland-scanner client-header $< $@
+
+$(BUILD_DIR)/ext-image-copy-capture-v1-protocol.c: $(EXT_IMAGE_COPY_CAPTURE_XML) | $(BUILD_DIR)
+	wayland-scanner private-code $< $@
+
 $(BUILD_DIR)/virtual-keyboard-unstable-v1-client-protocol.h: $(VKEYBOARD_XML) | $(BUILD_DIR)
 	wayland-scanner client-header $< $@
 
@@ -147,6 +168,9 @@ PROTO_HDRS = $(BUILD_DIR)/wlr-layer-shell-unstable-v1-client-protocol.h \
              $(BUILD_DIR)/ext-workspace-v1-client-protocol.h \
              $(BUILD_DIR)/wlr-gamma-control-unstable-v1-client-protocol.h \
              $(BUILD_DIR)/wlr-screencopy-unstable-v1-client-protocol.h \
+             $(BUILD_DIR)/ext-foreign-toplevel-list-v1-client-protocol.h \
+             $(BUILD_DIR)/ext-image-capture-source-v1-client-protocol.h \
+             $(BUILD_DIR)/ext-image-copy-capture-v1-client-protocol.h \
              $(BUILD_DIR)/virtual-keyboard-unstable-v1-client-protocol.h
 
 PROTO_SRCS = $(BUILD_DIR)/wlr-layer-shell-unstable-v1-client-protocol.c \
@@ -155,6 +179,9 @@ PROTO_SRCS = $(BUILD_DIR)/wlr-layer-shell-unstable-v1-client-protocol.c \
              $(BUILD_DIR)/ext-workspace-v1-client-protocol.c \
              $(BUILD_DIR)/wlr-gamma-control-unstable-v1-protocol.c \
              $(BUILD_DIR)/wlr-screencopy-unstable-v1-protocol.c \
+             $(BUILD_DIR)/ext-foreign-toplevel-list-v1-protocol.c \
+             $(BUILD_DIR)/ext-image-capture-source-v1-protocol.c \
+             $(BUILD_DIR)/ext-image-copy-capture-v1-protocol.c \
              $(BUILD_DIR)/virtual-keyboard-unstable-v1-protocol.c
 
 # Defined after PROTO_HDRS so the prerequisite list is not expanded while the
