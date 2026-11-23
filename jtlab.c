@@ -6,6 +6,7 @@
 #include <spawn.h>
 #include <stdatomic.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -258,6 +259,9 @@ pool_cairo_init(struct shm_pool *pool, cairo_surface_t **sf, cairo_t **cr,
     cairo_scale(*cr, scale, scale);
 }
 
+/* Opaque handle for an animation ticked on the compositor frame clock. */
+typedef struct anim_src AnimSrc;
+
 /* The bar proper and the flyout strip above it are separate layer surfaces.
  * They used to be one tall buffer, which meant opening a flyout reallocated
  * the bar's shm pool and made every flyout animation frame re-upload the full
@@ -299,7 +303,7 @@ struct bar {
     int menu_scroll;
     double menu_anim_px;
     double menu_scroll_target_px;
-    GSource *menu_anim_src;
+    AnimSrc *menu_anim_src;
     int prev_height;
 
     struct wl_surface *menu_surface;
@@ -373,8 +377,8 @@ render_request(void)
 struct hover_delay {
     int target;
     int shown;
-    guint timer;
-    guint anim_src_id;
+    guint timer;            /* delayed show, still a real GLib timeout */
+    AnimSrc *anim_src;      /* 150ms reveal, ticked on the frame clock */
     int64_t show_us;
 };
 
@@ -490,7 +494,7 @@ struct group_popup {
     double anim_start_x, anim_start_w, anim_start_h, anim_start_scroll;
     gint64 anim_start_us;
     int animating;
-    guint anim_src_id;
+    AnimSrc *anim_src;
     int scroll_drag;
     double scroll_drag_off;
 };
@@ -2588,13 +2592,87 @@ static struct {
     .clock_fd = -1,
 };
 
+/* ---- frame-clocked animation driver -------------------------------------
+ * Animation values used to be stepped by 16ms GLib timers, which land at
+ * arbitrary phases relative to vblank. Instead, register every animation
+ * here and tick them all from the bar surface's wl_surface.frame callback.
+ * render_request() keeps the bar committing while anything is active, so the
+ * frame callbacks keep coming at the compositor's real presentation rate. */
+typedef gboolean (*anim_tick_fn)(gpointer);
+
+struct anim_src {
+    anim_tick_fn fn;
+    gpointer data;
+    struct anim_src *next;
+    int pending_free;
+};
+
+static AnimSrc *g_anim_srcs;
+static int g_anim_iterating;
+
+static void anim_tick_all(void);
+
+static AnimSrc *
+anim_src_new(anim_tick_fn fn, gpointer data)
+{
+    AnimSrc *s = g_malloc0(sizeof *s);
+    s->fn = fn;
+    s->data = data;
+    s->next = g_anim_srcs;
+    g_anim_srcs = s;
+    render_request();
+    return s;
+}
+
+static void
+anim_src_destroy(AnimSrc *s)
+{
+    if (!s) return;
+    if (g_anim_iterating) {
+        /* A tick may close a menu/transition and free sibling animations.
+         * Defer the actual unlink until the sweep in anim_tick_all(). */
+        s->fn = NULL;
+        s->pending_free = 1;
+        return;
+    }
+    AnimSrc **pp = &g_anim_srcs;
+    while (*pp && *pp != s) pp = &(*pp)->next;
+    if (*pp) *pp = s->next;
+    g_free(s);
+}
+
+static void
+anim_tick_all(void)
+{
+    if (!g_anim_srcs) return;
+    g_anim_iterating++;
+    for (AnimSrc *s = g_anim_srcs; s; s = s->next) {
+        if (s->pending_free || !s->fn) continue;
+        gboolean again = s->fn(s->data);
+        if (!again) s->pending_free = 1;
+    }
+    g_anim_iterating--;
+
+    AnimSrc **pp = &g_anim_srcs;
+    while (*pp) {
+        AnimSrc *s = *pp;
+        if (s->pending_free) {
+            *pp = s->next;
+            g_free(s);
+        } else {
+            pp = &s->next;
+        }
+    }
+    if (g_anim_srcs) render_request();
+}
+
 /* Generic exponential-approach scroll animation, shared by the menu, wallpaper
  * and notification popups. Holds pointers into the owner's state so the tick
  * drives that popup's own scroll/current value. */
 struct scroll_anim {
     double *current;        /* value currently displayed */
     double *target;         /* value animating toward */
-    GSource **src;          /* active timeout source (NULL when idle) */
+    AnimSrc **src;          /* active frame-clocked source (NULL when idle) */
     void (*on_frame)(void); /* called after each value update (if set) */
     int (*wants_render)(void); /* if set, render only while it returns 1 */
 };
@@ -2623,18 +2701,14 @@ static void
 scroll_anim_start(struct scroll_anim *a)
 {
     if (*a->src) return;
-    GSource *src = g_timeout_source_new(16);
-    g_source_set_callback(src, scroll_anim_tick, a, NULL);
-    g_source_attach(src, g_sni.glib_ctx);
-    *a->src = src;
-    g_source_unref(src);
+    *a->src = anim_src_new(scroll_anim_tick, a);
 }
 
 static void
 scroll_anim_cancel(struct scroll_anim *a)
 {
     if (*a->src) {
-        g_source_destroy(*a->src);
+        anim_src_destroy(*a->src);
         *a->src = NULL;
     }
 }
@@ -2652,19 +2726,15 @@ scroll_anim_cancel(struct scroll_anim *a)
  * would be blank; the snapshot is what lets the content slide away instead of
  * vanishing.
  *
- * The animation is driven by elapsed time, not by a fixed number of timer
- * ticks. A 16ms timeout pokes the surface's needs_render flag, but every
- * position is computed from the monotonic clock. This matters because the
- * timeout and the compositor's frame callbacks are not in phase: a 16ms timer
- * against a 16.67ms refresh occasionally fires twice between two frames, and a
- * fixed 25%-per-tick step would then jump twice as far on that frame. Time
- * based easing makes each presented frame advance by the real elapsed time, so
- * the motion stays smooth (and keeps its duration) regardless of refresh rate
- * or scheduling jitter.
+ * The animation is driven by elapsed time and ticked from the compositor's
+ * wl_surface.frame callback, not from a free-running 16ms timer. Every
+ * position is computed from the monotonic clock, so each presented frame
+ * advances by the real elapsed time and stays smooth regardless of refresh
+ * rate or scheduling jitter.
  * ------------------------------------------------------------------------- */
 
 struct transition {
-    GSource *src;
+    AnimSrc *src;
     int active;             /* a transition is in progress */
     int closing;            /* running toward hidden */
     int pending_open;       /* a freshly created surface should ease in */
@@ -2694,6 +2764,10 @@ transition_free_snapshot(struct transition *t)
     if (t->snapshot) {
         cairo_surface_destroy(t->snapshot);
         t->snapshot = NULL;
+        /* The close animation copies the whole flyout into a fresh malloc'd
+         * surface. Without a trim its pages stay in glibc's free lists, so the
+         * munmap of the flyout shm pool appears to have freed nothing. */
+        heap_return_pages();
     }
 }
 
@@ -2741,17 +2815,13 @@ static void
 transition_start(struct transition *t)
 {
     if (t->src) return;
-    GSource *src = g_timeout_source_new(16);
-    g_source_set_callback(src, transition_tick, t, NULL);
-    g_source_attach(src, g_sni.glib_ctx);
-    t->src = src;
-    g_source_unref(src);
+    t->src = anim_src_new(transition_tick, t);
 }
 
 static void
 transition_stop(struct transition *t)
 {
-    if (t->src) { g_source_destroy(t->src); t->src = NULL; }
+    if (t->src) { anim_src_destroy(t->src); t->src = NULL; }
     transition_free_snapshot(t);
 }
 
@@ -3844,6 +3914,21 @@ clock_rearm(void)
     timerfd_settime(g_sni.clock_fd, 0, &its, NULL);
 }
 
+/* True when at least one surface is configured, dirty and not waiting on a
+ * frame callback. A poll that returns with this true lets the main loop draw
+ * immediately instead of parking on GLib's next timeout with a frame pending. */
+static int
+render_due(void)
+{
+    return (g_bar.needs_render && g_bar.configured && !g_bar.frame_pending) ||
+           (g_bar.fly_needs_render && g_bar.fly_surf_configured &&
+            !g_bar.fly_frame_pending) ||
+           (g_bar.menu_needs_render && g_bar.menu_surf_configured &&
+            !g_bar.menu_frame_pending) ||
+           (g_bar.osk_needs_render && g_bar.osk_surf_configured &&
+            !g_bar.osk_frame_pending);
+}
+
 static gint
 glib_epoll_poll(GPollFD *ufds, guint nfds, gint timeout_ms)
 {
@@ -3865,6 +3950,12 @@ glib_epoll_poll(GPollFD *ufds, guint nfds, gint timeout_ms)
     while (wl_display_prepare_read(g_wl.display) != 0)
         wl_display_dispatch_pending(g_wl.display);
     wl_display_flush(g_wl.display);
+
+    /* prepare_read() above may have dispatched a Wayland callback that marked
+     * a surface dirty after the main loop's render pass. Don't let that frame
+     * sit behind a long GLib timeout; come straight back and draw it. */
+    if (render_due())
+        timeout_ms = 0;
 
     struct epoll_event evs[8];
     int n = epoll_wait(g_sni.main_epoll_fd, evs, 8, timeout_ms);
@@ -4166,6 +4257,7 @@ theme_update_open_apps(void)
     theme_send_accent("jtupdate");
     theme_send_accent("jtwpi");
     theme_send_accent("jtsettings");
+    theme_send_accent("jtfiles");
     /* The compositor uses the same line protocol for the SSD close button and
      * the snap overlay, so a missing socket just means jtlabwc is not up yet. */
     theme_send_accent("jtlabwc");
@@ -4926,13 +5018,10 @@ gpopup_fill_preview(int count, const int *windows, const int *ext_windows, doubl
                 if (fabs(pv->anim_dx_start) >= 0.5) need = 1;
             }
         }
-        if (need && !g_gpopup.anim_src_id) {
+        if (need && !g_gpopup.anim_src) {
             g_gpopup.animating = 1;
             g_gpopup.anim_start_us = g_get_monotonic_time();
-            GSource *s = g_timeout_source_new(16);
-            g_source_set_callback(s, gpopup_anim_tick, NULL, NULL);
-            g_gpopup.anim_src_id = g_source_attach(s, g_sni.glib_ctx);
-            g_source_unref(s);
+            g_gpopup.anim_src = anim_src_new(gpopup_anim_tick, NULL);
         }
         if (need) g_bar.fly_needs_render = 1;
     }
@@ -4999,10 +5088,9 @@ gpopup_anim_advance(void)
 static void
 gpopup_anim_stop(void)
 {
-    if (g_gpopup.anim_src_id) {
-        GSource *s = g_main_context_find_source_by_id(g_sni.glib_ctx, g_gpopup.anim_src_id);
-        if (s) g_source_destroy(s);
-        g_gpopup.anim_src_id = 0;
+    if (g_gpopup.anim_src) {
+        anim_src_destroy(g_gpopup.anim_src);
+        g_gpopup.anim_src = NULL;
     }
     g_gpopup.animating = 0;
 }
@@ -5012,7 +5100,7 @@ gpopup_anim_tick(gpointer data)
 {
     (void)data;
     if (!g_gpopup.animating || !g_gpopup.open) {
-        g_gpopup.anim_src_id = 0;
+        g_gpopup.anim_src = NULL;
         g_gpopup.animating = 0;
         return G_SOURCE_REMOVE;
     }
@@ -5041,7 +5129,7 @@ gpopup_anim_tick(gpointer data)
             }
         }
         g_gpopup.animating = 0;
-        g_gpopup.anim_src_id = 0;
+        g_gpopup.anim_src = NULL;
         popup_size_changed();
         return G_SOURCE_REMOVE;
     }
@@ -5105,12 +5193,8 @@ gpopup_anim_start(double tx, double tw, double th, double ts)
         g_gpopup.animating = 0;
         return;
     }
-    if (!g_gpopup.anim_src_id) {
-        GSource *s = g_timeout_source_new(16);
-        g_source_set_callback(s, gpopup_anim_tick, NULL, NULL);
-        g_gpopup.anim_src_id = g_source_attach(s, g_sni.glib_ctx);
-        g_source_unref(s);
-    }
+    if (!g_gpopup.anim_src)
+        g_gpopup.anim_src = anim_src_new(gpopup_anim_tick, NULL);
     g_bar.fly_needs_render = 1;
 }
 
@@ -6692,7 +6776,7 @@ struct osk_state {
     double x_target;    /* where the panel is sliding to, for the menu shift */
     double x_from;      /* panel position when the current slide began */
     gint64 x_start_us;  /* monotonic start of the current slide */
-    GSource *x_src;     /* menu-shift animation timer */
+    AnimSrc *x_src;     /* menu-shift animation, frame-clocked */
     double w, h;
 };
 
@@ -6814,7 +6898,7 @@ struct notif_popup {
     double clear_x, clear_y, clear_w, clear_h;
     double max_scroll, scroll;
     double target_scroll;
-    GSource *anim_src;
+    AnimSrc *anim_src;
     int hover_row;
     int hover_trash;
     int hover_clear;
@@ -6848,7 +6932,7 @@ struct wall_popup {
     double max_scroll;
     double anim_px;
     double target_px;
-    GSource *anim_src;
+    AnimSrc *anim_src;
     int hover_idx;
     int enabled;
     int hover_power;
@@ -7376,34 +7460,142 @@ wlp_scan(void)
     qsort(g_wlp.entries, (size_t)g_wlp.n_entries, sizeof(struct wall_entry), wlp_cmp_mtime);
 }
 
+/* Wallpaper caches live under ~/.cache/jt/JTLab/wallpapers. Rendered images
+ * are keyed by source + output geometry, so adding a monitor creates a new
+ * entry without evicting the one already cached for the old geometry. */
 static void
-wlp_cache_path(const char *name, char *out, size_t sz)
+wlp_cache_root(char *out, size_t sz)
 {
     const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
-    snprintf(out, sz, "%s/.cache/wallpaper-browser/%s.png", home, name);
+    if (!home || !home[0]) home = g_get_home_dir();
+    snprintf(out, sz, "%s/.cache/jt/JTLab/wallpapers", home ? home : "/tmp");
+    g_mkdir_with_parents(out, 0700);
+}
+
+/* FNV-1a, same as the album-art cache. The key bundles the source path with
+ * its mtime and size so editing a wallpaper in place cannot reuse stale data. */
+static uint64_t
+wlp_cache_hash(const char *key)
+{
+    uint64_t h = 1469598103934665603ULL;
+    for (const unsigned char *p = (const unsigned char *)key; *p; p++) {
+        h ^= *p;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void
+wlp_source_key(const char *path, char *out, size_t sz)
+{
+    long long sec = 0, nsec = 0, size = 0;
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        sec = (long long)st.st_mtim.tv_sec;
+        nsec = (long long)st.st_mtim.tv_nsec;
+        size = (long long)st.st_size;
+    }
+    snprintf(out, sz, "%s|%lld.%09lld|%lld", path, sec, nsec, size);
+}
+
+static int
+wlp_cache_fresh(const char *cache, const char *src)
+{
+    struct stat sc, ss;
+    return stat(cache, &sc) == 0 && stat(src, &ss) == 0 &&
+           sc.st_mtime >= ss.st_mtime;
+}
+
+/* Raw rendered-wallpaper format: a fixed header followed by the ARGB8888 rows
+ * exactly as they sit in the shm buffer. A hit is then just a byte copy, with
+ * no PNG decode and no full-resolution temporary allocation. */
+#define BG_CACHE_MAGIC 0x4A575250u  /* "JWRP" */
+struct bg_cache_header {
+    uint32_t magic;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t scale;
+    uint32_t reserved;
+};
+
+static void
+wlp_rendered_cache_path(const char *src, int w, int h, int scale,
+                        char *out, size_t sz)
+{
+    char root[512], dir[600], key[1024], full[1200];
+    wlp_cache_root(root, sizeof(root));
+    snprintf(dir, sizeof(dir), "%s/rendered", root);
+    g_mkdir_with_parents(dir, 0700);
+    wlp_source_key(src, key, sizeof(key));
+    snprintf(full, sizeof(full), "%s|%dx%d@%d", key, w, h, scale);
+    snprintf(out, sz, "%s/rendered-%016llx-%dx%d@%d.raw", dir,
+             (unsigned long long)wlp_cache_hash(full), w, h, scale);
+}
+
+static void
+wlp_thumbnail_cache_path(const char *src, char *out, size_t sz)
+{
+    char root[512], dir[600], key[1024], full[1200];
+    wlp_cache_root(root, sizeof(root));
+    snprintf(dir, sizeof(dir), "%s/thumbnails", root);
+    g_mkdir_with_parents(dir, 0700);
+    wlp_source_key(src, key, sizeof(key));
+    snprintf(full, sizeof(full), "%s|%dx%d", key, WALL_THUMB_W, WALL_THUMB_H);
+    snprintf(out, sz, "%s/thumb-%016llx.png", dir,
+             (unsigned long long)wlp_cache_hash(full));
+}
+
+/* A tiny side cache for the accent colour lets startup reuse the result
+ * without decoding the full-resolution image just to sample it. */
+static void
+wlp_accent_cache_path(const char *src, char *out, size_t sz)
+{
+    char root[512], key[1024];
+    wlp_cache_root(root, sizeof(root));
+    wlp_source_key(src, key, sizeof(key));
+    snprintf(out, sz, "%s/accent-%016llx.txt", root,
+             (unsigned long long)wlp_cache_hash(key));
+}
+
+static int
+wlp_accent_cache_read(const char *path, unsigned *accent)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned v = 0;
+    int ok = fscanf(f, "%x", &v) == 1;
+    fclose(f);
+    if (ok) *accent = v & 0xffffff;
+    return ok;
+}
+
+static void
+wlp_accent_cache_write(const char *path, unsigned accent)
+{
+    char tmp[768];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f, "%08x\n", accent & 0xffffff);
+    fclose(f);
+    if (rename(tmp, path) != 0)
+        unlink(tmp);
 }
 
 static gpointer
 wlp_loader_thread(gpointer data)
 {
     (void)data;
-    char cache_dir[512];
-    const char *home = getenv("HOME");
-    if (!home) home = "/tmp";
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/wallpaper-browser", home);
-    g_mkdir_with_parents(cache_dir, 0755);
-
     int n = g_wlp.n_entries;
     for (int i = 0; i < n; i++) {
         struct wall_entry *we = &g_wlp.entries[i];
-        char cpath[512];
-        wlp_cache_path(we->name, cpath, sizeof(cpath));
+        char cpath[768];
+        wlp_thumbnail_cache_path(we->path, cpath, sizeof(cpath));
 
-        struct stat st_src, st_cache;
+        struct stat st_src;
         int src_ok = stat(we->path, &st_src) == 0;
-        int cache_ok = stat(cpath, &st_cache) == 0 &&
-                       st_cache.st_mtime >= st_src.st_mtime;
+        int cache_ok = src_ok && wlp_cache_fresh(cpath, we->path);
 
         GdkPixbuf *pb = NULL;
         if (cache_ok)
@@ -7646,15 +7838,20 @@ bg_paint_output(struct output_entry *o, cairo_surface_t *wall)
 }
 
 static cairo_surface_t *bg_image_load(const char *path);
+static int bg_paint_from_cache(struct output_entry *o, const char *src);
+static void bg_cache_save(struct output_entry *o, const char *src);
 
-/* Repaint one output from the cached wallpaper state. The decoded image is
- * normally dropped after painting to save RAM, so a reconfigure reloads it
- * from disk - rare, and cheaper than keeping the full-resolution image
- * resident at all times. */
+/* Repaint one output from the cached wallpaper state. The first time a given
+ * geometry is seen we decode and cover-fit the source, then store the raw
+ * pixels; later runs (and other outputs with the same size) copy those bytes
+ * straight into the shm buffer. */
 static void
 bg_repaint_output(struct output_entry *o)
 {
+    if (!o->bg_configured) return;
     if (g_wlp.enabled && g_wlp.cur_wallpaper[0]) {
+        if (bg_paint_from_cache(o, g_wlp.cur_wallpaper))
+            return;
         if (g_wlp.wall_image) {
             bg_paint_output(o, g_wlp.wall_image);
         } else {
@@ -7665,6 +7862,7 @@ bg_repaint_output(struct output_entry *o)
                 heap_return_pages();
             }
         }
+        bg_cache_save(o, g_wlp.cur_wallpaper);
     } else {
         bg_paint_output(o, NULL);
     }
@@ -7685,6 +7883,99 @@ bg_image_load(const char *path)
      * now rather than leaving them in the allocator's free lists. */
     heap_return_pages();
     return sf;
+}
+
+static int
+bg_paint_from_cache(struct output_entry *o, const char *src)
+{
+    if (!o->bg_configured || !o->bg_cairo || !src || !src[0]) return 0;
+    int scale = o->bg_scale > 0 ? o->bg_scale : 1;
+    char cpath[768];
+    wlp_rendered_cache_path(src, o->bg_width, o->bg_height, scale,
+                            cpath, sizeof(cpath));
+    if (!wlp_cache_fresh(cpath, src)) return 0;
+
+    int fd = open(cpath, O_RDONLY);
+    if (fd < 0) return 0;
+    struct bg_cache_header hdr;
+    ssize_t n = read(fd, &hdr, sizeof(hdr));
+    int phys_w = o->bg_width * scale, phys_h = o->bg_height * scale;
+    int stride = cairo_image_surface_get_stride(o->bg_cairo);
+    if (n != (ssize_t)sizeof(hdr) || hdr.magic != BG_CACHE_MAGIC ||
+        hdr.width != (uint32_t)phys_w || hdr.height != (uint32_t)phys_h ||
+        hdr.stride != (uint32_t)stride) {
+        close(fd);
+        return 0;
+    }
+
+    size_t need = (size_t)stride * (size_t)phys_h;
+    unsigned char *dst = cairo_image_surface_get_data(o->bg_cairo);
+    size_t got = 0;
+    while (dst && got < need) {
+        ssize_t r = read(fd, dst + got, need - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    close(fd);
+    if (!dst || got != need) return 0;
+
+    cairo_surface_mark_dirty(o->bg_cairo);
+    bg_commit(o);
+    return 1;
+}
+
+/* Store the already-painted shm pixels verbatim. Cheaper than a PNG encode,
+ * and it means a later hit never has to decode anything at all. */
+static void
+bg_cache_save(struct output_entry *o, const char *src)
+{
+    struct stat st;
+    if (!o->bg_cairo || !o->bg_configured || !src || !src[0] ||
+        stat(src, &st) != 0)
+        return;
+
+    int scale = o->bg_scale > 0 ? o->bg_scale : 1;
+    char path[768], tmp[800];
+    wlp_rendered_cache_path(src, o->bg_width, o->bg_height, scale,
+                            path, sizeof(path));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    cairo_surface_flush(o->bg_cairo);
+    unsigned char *data = cairo_image_surface_get_data(o->bg_cairo);
+    int stride = cairo_image_surface_get_stride(o->bg_cairo);
+    int phys_w = o->bg_width * scale, phys_h = o->bg_height * scale;
+    if (!data || stride <= 0 || phys_w <= 0 || phys_h <= 0) return;
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return;
+    struct bg_cache_header hdr = {
+        .magic    = BG_CACHE_MAGIC,
+        .width    = (uint32_t)phys_w,
+        .height   = (uint32_t)phys_h,
+        .stride   = (uint32_t)stride,
+        .scale    = (uint32_t)scale,
+        .reserved = 0,
+    };
+    int ok = write(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr);
+    if (ok) {
+        size_t total = (size_t)stride * (size_t)phys_h, done = 0;
+        while (done < total) {
+            ssize_t w = write(fd, data + done, total - done);
+            if (w <= 0) { ok = 0; break; }
+            done += (size_t)w;
+        }
+    }
+    if (close(fd) != 0)
+        ok = 0;
+    if (ok && rename(tmp, path) == 0) {
+        /* Remove the PNG an older build left under the same key. */
+        char png[800];
+        snprintf(png, sizeof(png), "%.*s.png",
+                 (int)(strlen(path) - strlen(".raw")), path);
+        unlink(png);
+        return;
+    }
+    unlink(tmp);
 }
 
 /* (Re)build the shm pool and cairo context for the geometry the compositor
@@ -8442,28 +8733,40 @@ static void
 wlp_set_wallpaper_bg(const char *path)
 {
     if (!path || !path[0]) return;
-    /* Decode, paint every output, then keep the image only briefly for
-     * theme_update_from_wallpaper() to derive the accent from.  The per-output
-     * shm buffers already hold the painted result, so the decoded image is
-     * dropped afterwards; reconfigures reload from disk via bg_repaint_output(). */
-    cairo_surface_t *img = bg_image_load(path);
-    for (int i = 0; i < g_n_outputs; i++)
-        bg_paint_output(g_outputs[i], img);
+    /* Drop the previous full-resolution decode before allocating a new one,
+     * so two wallpapers are never resident at the same time. */
     if (g_wlp.wall_image) {
         cairo_surface_destroy(g_wlp.wall_image);
         g_wlp.wall_image = NULL;
+        heap_return_pages();
     }
-    g_wlp.wall_image = img;
     g_wlp.wall_image_path[0] = '\0';
     g_wlp.wall_image_mtime = 0;
+
+    /* Reuse each output's rendered cache where possible. A miss decodes the
+     * source once for all misses in this call and immediately stores the
+     * per-output result, so a later monitor with the same geometry can skip
+     * the decode entirely. */
+    cairo_surface_t *img = NULL;
+    for (int i = 0; i < g_n_outputs; i++) {
+        struct output_entry *o = g_outputs[i];
+        if (!o->bg_configured) continue;
+        if (bg_paint_from_cache(o, path))
+            continue;
+        if (!img)
+            img = bg_image_load(path);
+        bg_paint_output(o, img);
+        bg_cache_save(o, path);
+    }
+    g_wlp.wall_image = img;
 }
 
 static void
 wlp_set_wallpaper(const char *path)
 {
-    wlp_set_wallpaper_bg(path);
     strncpy(g_wlp.cur_wallpaper, path, sizeof(g_wlp.cur_wallpaper) - 1);
     g_wlp.cur_wallpaper[sizeof(g_wlp.cur_wallpaper) - 1] = '\0';
+    wlp_set_wallpaper_bg(path);
 }
 
 static double
@@ -8651,18 +8954,26 @@ static void
 theme_update_from_wallpaper(void)
 {
     unsigned accent = ACCENT_HEX;
-    if (g_wlp.enabled) {
-        cairo_surface_t *img = g_wlp.wall_image;
-        cairo_surface_t *tmp = NULL;
-        if (!img && g_wlp.cur_wallpaper[0]) {
-            tmp = bg_image_load(g_wlp.cur_wallpaper);
-            img = tmp;
-        }
-        if (img)
-            theme_accent_from_surface(img, &accent);
-        if (tmp) {
-            cairo_surface_destroy(tmp);
-            heap_return_pages();
+    if (g_wlp.enabled && g_wlp.cur_wallpaper[0]) {
+        char apath[768];
+        wlp_accent_cache_path(g_wlp.cur_wallpaper, apath, sizeof(apath));
+        if (!wlp_cache_fresh(apath, g_wlp.cur_wallpaper) ||
+            !wlp_accent_cache_read(apath, &accent)) {
+            accent = ACCENT_HEX;
+            cairo_surface_t *img = g_wlp.wall_image;
+            cairo_surface_t *tmp = NULL;
+            if (!img) {
+                tmp = bg_image_load(g_wlp.cur_wallpaper);
+                img = tmp;
+            }
+            if (img && theme_accent_from_surface(img, &accent))
+                wlp_accent_cache_write(apath, accent);
+            else
+                accent = ACCENT_HEX;
+            if (tmp) {
+                cairo_surface_destroy(tmp);
+                heap_return_pages();
+            }
         }
     }
     if (g_wlp.wall_image) {
@@ -13381,6 +13692,8 @@ bar_frame_done(void *data, struct wl_callback *cb, uint32_t time)
         b->size_dirty = 0;
         bar_update_size(b);
     }
+    /* Advance every eased value on the compositor's presentation clock. */
+    anim_tick_all();
 }
 
 static const struct wl_callback_listener frame_listener = {
@@ -14202,7 +14515,7 @@ static void
 osk_x_anim_stop(void)
 {
     if (g_osk.x_src) {
-        g_source_destroy(g_osk.x_src);
+        anim_src_destroy(g_osk.x_src);
         g_osk.x_src = NULL;
     }
 }
@@ -14224,11 +14537,7 @@ osk_x_anim_start(void)
     g_osk.x_from = g_osk.x;
     g_osk.x_start_us = g_get_monotonic_time();
     if (g_osk.x_src) return;
-    GSource *src = g_timeout_source_new(16);
-    g_source_set_callback(src, osk_x_tick, NULL, NULL);
-    g_source_attach(src, g_sni.glib_ctx);
-    g_osk.x_src = src;
-    g_source_unref(src);
+    g_osk.x_src = anim_src_new(osk_x_tick, NULL);
 }
 
 static void
@@ -15286,11 +15595,9 @@ hover_delay_clear(struct hover_delay *d)
         if (s) g_source_destroy(s);
         d->timer = 0;
     }
-    if (d->anim_src_id) {
-        GSource *s = g_sni.glib_ctx ?
-            g_main_context_find_source_by_id(g_sni.glib_ctx, d->anim_src_id) : NULL;
-        if (s) g_source_destroy(s);
-        d->anim_src_id = 0;
+    if (d->anim_src) {
+        anim_src_destroy(d->anim_src);
+        d->anim_src = NULL;
     }
     d->target = -1;
     d->shown = 0;
@@ -15301,9 +15608,9 @@ static gboolean
 hover_delay_anim_tick(void *data)
 {
     struct hover_delay *d = data;
-    if (!d->shown) { d->anim_src_id = 0; return G_SOURCE_REMOVE; }
+    if (!d->shown) { d->anim_src = NULL; return G_SOURCE_REMOVE; }
     double t = (double)(g_get_monotonic_time() - d->show_us) / 150000.0;
-    if (t >= 1.0) { d->anim_src_id = 0; render_request(); return G_SOURCE_REMOVE; }
+    if (t >= 1.0) { d->anim_src = NULL; render_request(); return G_SOURCE_REMOVE; }
     render_request();
     return G_SOURCE_CONTINUE;
 }
@@ -15315,18 +15622,11 @@ hover_delay_fire(void *data)
     d->timer = 0;
     d->shown = 1;
     d->show_us = g_get_monotonic_time();
-    if (d->anim_src_id) {
-        GSource *s = g_sni.glib_ctx ?
-            g_main_context_find_source_by_id(g_sni.glib_ctx, d->anim_src_id) : NULL;
-        if (s) g_source_destroy(s);
-        d->anim_src_id = 0;
+    if (d->anim_src) {
+        anim_src_destroy(d->anim_src);
+        d->anim_src = NULL;
     }
-    if (g_sni.glib_ctx) {
-        GSource *src = g_timeout_source_new(16);
-        g_source_set_callback(src, hover_delay_anim_tick, d, NULL);
-        d->anim_src_id = g_source_attach(src, g_sni.glib_ctx);
-        g_source_unref(src);
-    }
+    d->anim_src = anim_src_new(hover_delay_anim_tick, d);
     popup_size_changed();
     render_request();
     return G_SOURCE_REMOVE;
@@ -15343,11 +15643,9 @@ hover_delay_set(struct hover_delay *d, int target, unsigned delay_ms)
         if (s) g_source_destroy(s);
         d->timer = 0;
     }
-    if (d->anim_src_id) {
-        GSource *s = g_sni.glib_ctx ?
-            g_main_context_find_source_by_id(g_sni.glib_ctx, d->anim_src_id) : NULL;
-        if (s) g_source_destroy(s);
-        d->anim_src_id = 0;
+    if (d->anim_src) {
+        anim_src_destroy(d->anim_src);
+        d->anim_src = NULL;
     }
     d->target = target;
     d->shown = 0;
@@ -17746,6 +18044,15 @@ static void
 main_loop(void)
 {
     while (g_app.running) {
+        /* Drain Wayland before deciding what to draw. On startup the layer
+         * configure is already queued here, so dispatching it first commits
+         * the first buffer in this pass instead of after a blocking poll
+         * cycle. Events read by glib_epoll_poll() during the previous
+         * iteration are handled here too. */
+        wl_display_dispatch_pending(g_wl.display);
+        if (!g_app.running)
+            break;
+
         if (g_bar.needs_render && g_bar.configured && !g_bar.frame_pending) {
             bar_render(&g_bar);
             g_bar.needs_render = 0;
@@ -17765,8 +18072,11 @@ main_loop(void)
             osk_surface_render(&g_bar);
             g_bar.osk_needs_render = 0;
         }
+        /* Normally glib_epoll_poll() flushes before it waits. Flush here as
+         * well so a ready GLib source can't defer this commit by an iteration. */
+        wl_display_flush(g_wl.display);
+
         g_main_context_iteration(g_sni.glib_ctx, TRUE);
-        wl_display_dispatch_pending(g_wl.display);
 
         uint32_t perr_code = 0, perr_obj = 0;
         const struct wl_interface *perr_iface = NULL;
