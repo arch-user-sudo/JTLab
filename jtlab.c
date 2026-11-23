@@ -579,6 +579,17 @@ layout_set_font_size(PangoLayout *pl, double pt)
     pango_font_description_free(fd);
 }
 
+/* Explicit Pango font options override anything derived from the target
+ * surface, so every glyph renders without antialiasing. */
+static void
+pango_context_no_antialias(PangoContext *ctx)
+{
+    cairo_font_options_t *opts = cairo_font_options_create();
+    cairo_font_options_set_antialias(opts, CAIRO_ANTIALIAS_NONE);
+    pango_cairo_context_set_font_options(ctx, opts);
+    cairo_font_options_destroy(opts);
+}
+
 static PangoContext *g_pango_ctx;
 static PangoLayout *g_clock_layout;
 static cairo_t *g_clock_bound_cr;
@@ -587,8 +598,11 @@ static char g_clock_prev[24] = "";
 static PangoLayout *
 pango_ctx_layout(cairo_t *cr)
 {
-    if (!g_pango_ctx)
+    if (!g_pango_ctx) {
         g_pango_ctx = pango_cairo_create_context(cr);
+        if (g_pango_ctx)
+            pango_context_no_antialias(g_pango_ctx);
+    }
     if (!g_pango_ctx) return NULL;
     PangoLayout *pl = pango_layout_new(g_pango_ctx);
     if (!pl) return NULL;
@@ -599,8 +613,11 @@ pango_ctx_layout(cairo_t *cr)
 static PangoLayout *
 clock_layout(cairo_t *cr)
 {
-    if (!g_pango_ctx)
+    if (!g_pango_ctx) {
         g_pango_ctx = pango_cairo_create_context(cr);
+        if (g_pango_ctx)
+            pango_context_no_antialias(g_pango_ctx);
+    }
     if (!g_pango_ctx) return NULL;
     if (!g_clock_layout) {
         g_clock_layout = pango_layout_new(g_pango_ctx);
@@ -6958,6 +6975,7 @@ notif_time_text_w(void)
             cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
         cairo_t *cr = cairo_create(surf);
         PangoContext *ctx = pango_cairo_create_context(cr);
+        pango_context_no_antialias(ctx);
         PangoLayout *tl = pango_layout_new(ctx);
         pango_layout_set_font_description(tl, clock_font());
         pango_layout_set_text(tl, "00:00 AM", -1);
@@ -6981,6 +6999,7 @@ notif_clear_text_w(void)
             cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
         cairo_t *cr = cairo_create(surf);
         PangoContext *ctx = pango_cairo_create_context(cr);
+        pango_context_no_antialias(ctx);
         PangoLayout *tl = pango_layout_new(ctx);
         pango_layout_set_font_description(tl, clock_font());
         pango_layout_set_text(tl, "Clear all", -1);
