@@ -290,7 +290,7 @@
 #define WALL_THUMB_W    130
 #define WALL_THUMB_H    80
 #define WALL_THUMB_GAP  8
-#define WALL_THUMB_COLS 4
+#define WALL_THUMB_COLS 5
 #define WALL_LABEL_H    16
 #define WALL_HEADER_H   32
 

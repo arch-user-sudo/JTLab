@@ -7676,10 +7676,25 @@ wlp_open(void)
     g_wlp.h = ph;
 
     int rows = wlp_rows();
-    int content = WALL_HEADER_H + MENU_PADDING +
-                  rows * (WALL_THUMB_H + WALL_LABEL_H + WALL_THUMB_GAP);
+    int step = WALL_THUMB_H + WALL_LABEL_H + WALL_THUMB_GAP;
+    int content = WALL_HEADER_H + MENU_PADDING + rows * step;
     int vis = wlp_visible_h();
     g_wlp.max_scroll = content > vis ? content - vis : 0;
+
+    /* Open on the row holding the active wallpaper instead of always starting
+     * at the top. Entries are sorted newest-first, so the current image can be
+     * well down the list. Keep the row at the top of the viewport where
+     * possible, clamping so the last rows remain reachable. */
+    if (g_wlp.cur_wallpaper[0]) {
+        for (int i = 0; i < g_wlp.n_entries; i++) {
+            if (strcmp(g_wlp.entries[i].path, g_wlp.cur_wallpaper) != 0)
+                continue;
+            double target = (double)(i / WALL_THUMB_COLS) * step;
+            if (target > g_wlp.max_scroll) target = g_wlp.max_scroll;
+            g_wlp.scroll = g_wlp.anim_px = g_wlp.target_px = target;
+            break;
+        }
+    }
 
     if (g_wlp.n_entries > 0)
         g_wlp.loader = g_thread_new("wlp-load", wlp_loader_thread, NULL);
@@ -9172,7 +9187,7 @@ wlp_draw(cairo_t *cr, PangoLayout *pl)
         /* Thumbnail border */
         int active = (strcmp(g_wlp.cur_wallpaper, g_wlp.entries[i].path) == 0);
         if (active) {
-            cairo_set_source_rgba(cr, 0.4, 0.6, 0.9, 0.9);
+            cairo_set_source_rgba(cr, COLOR(g_theme.accent), 0.9);
             cairo_set_line_width(cr, 2);
         } else {
             cairo_set_source_rgba(cr, COLOR(FG_HEX), hover ? 0.6 : 0.2);
