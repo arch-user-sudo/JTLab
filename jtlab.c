@@ -180,11 +180,16 @@ struct toplevel_entry {
     char *title;
     cairo_surface_t *icon;
     int activated;
+    /* No Wayland protocol exposes focus history. Stamp every 0->1 activation
+     * transition with a monotonic counter so the preview panel can order by
+     * last focus. Zero means the window has never been seen focused. */
+    uint64_t focus_seq;
 };
 
 #define MAX_TOPLEVELS 128
 static struct toplevel_entry g_toplevels[MAX_TOPLEVELS];
 static int g_n_toplevels = 0;
+static uint64_t g_toplevel_focus_seq = 0;
 
 struct ext_toplevel_entry {
     struct ext_foreign_toplevel_handle_v1 *handle;
@@ -5065,9 +5070,45 @@ static void gpopup_anim_start(double tx, double tw, double th, double ts);
 static void gpopup_anim_stop(void);
 static gboolean gpopup_anim_tick(gpointer data);
 
-static void
-gpopup_fill_preview(int count, const int *windows, const int *ext_windows, double cx, int focus_on_leave)
+static uint64_t
+toplevel_focus_seq(int idx)
 {
+    if (idx < 0 || idx >= g_n_toplevels) return 0;
+    return g_toplevels[idx].focus_seq;
+}
+
+/* Sort parallel wlr/ext index arrays most-recently-focused first. Insertion
+ * sort is stable, so windows that have never been focused keep their original
+ * announcement order and sit at the right-hand end. */
+static void
+toplevel_sort_preview(int *wlr, int *ext, int n)
+{
+    for (int i = 1; i < n; i++) {
+        int w = wlr[i], e = ext ? ext[i] : -1;
+        int j = i - 1;
+        while (j >= 0 && toplevel_focus_seq(wlr[j]) < toplevel_focus_seq(w)) {
+            wlr[j + 1] = wlr[j];
+            if (ext) ext[j + 1] = ext[j];
+            j--;
+        }
+        wlr[j + 1] = w;
+        if (ext) ext[j + 1] = e;
+    }
+}
+
+static void
+gpopup_fill_preview(int count, int *windows, int *ext_windows, double cx, int focus_on_leave)
+{
+    /* Sort the caller's arrays in place so the final slot order is visible to
+     * them too. Callers that map a slot back to a window (selection, close and
+     * remap bookkeeping) need windows[i]/ext_windows[i] to describe slot i
+     * exactly as it is stored in g_gpopup below. Sorting copies here used to
+     * leave those callers working from the old order, which sent hover_idx to
+     * the wrong card and paired the wrong capture buffer with a window. */
+    int n = count < MAX_WINDOWS_PER_GROUP ? count : MAX_WINDOWS_PER_GROUP;
+    if (n < 0) n = 0;
+    toplevel_sort_preview(windows, ext_windows, n);
+
     int was_open = g_gpopup.open;
     int old_n = g_gpopup.n_windows;
     int old_windows[MAX_WINDOWS_PER_GROUP];
@@ -5209,7 +5250,12 @@ gpopup_open(int group_idx, double x)
 {
     close_siblings_for_popup();
     struct taskbar_group *g = &g_box.taskbar_groups[group_idx];
-    gpopup_fill_preview(g->n_windows, g->windows, NULL, x + g->w / 2.0, 0);
+    /* gpopup_fill_preview() sorts its array in place; don't reorder the
+     * taskbar group's persistent window list. */
+    int windows[MAX_WINDOWS_PER_GROUP];
+    int n = g->n_windows < MAX_WINDOWS_PER_GROUP ? g->n_windows : MAX_WINDOWS_PER_GROUP;
+    for (int i = 0; i < n; i++) windows[i] = g->windows[i];
+    gpopup_fill_preview(g->n_windows, windows, NULL, x + g->w / 2.0, 0);
     hover_delay_set(&g_bar_app_tip, -1, 0);
 }
 
@@ -17561,13 +17607,22 @@ toplevel_handle_state(void *data, struct zwlr_foreign_toplevel_handle_v1 *h, str
     (void)data;
     int idx = find_toplevel(h);
     if (idx < 0) return;
-    g_toplevels[idx].activated = 0;
+    int was = g_toplevels[idx].activated;
+    int now = 0;
     uint32_t *s;
     wl_array_for_each(s, state) {
         if (*s == ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_ACTIVATED) {
-            g_toplevels[idx].activated = 1;
+            now = 1;
             break;
         }
+    }
+    g_toplevels[idx].activated = now;
+    if (now && !was) {
+        g_toplevels[idx].focus_seq = ++g_toplevel_focus_seq;
+        /* The compositor normally deactivates the old handle too, but keep our
+         * own view consistent in case state events arrive out of order. */
+        for (int i = 0; i < g_n_toplevels; i++)
+            if (i != idx) g_toplevels[i].activated = 0;
     }
 }
 
