@@ -4206,24 +4206,40 @@ run_cmd(const char *cmd, int terminal)
     posix_spawnattr_destroy(&attr);
 }
 
+/* Rainbow timer state; declared here so launch helpers can tell whether the
+ * apps they start should open in rainbow mode. */
+static guint rainbow_timer_id;
+
 /* Launch one of the companion GUIs with the current wallpaper accent. The
- * color is quoted because run_cmd() hands the string to /bin/sh. */
+ * color is quoted because run_cmd() hands the string to /bin/sh. When JTLab is
+ * in rainbow mode the app is started with the same flag, so a freshly launched
+ * window does not briefly show the static accent. The locker uses the plain
+ * form below: it reads the shared boot config itself. */
 static void
-theme_run_app(const char *cmd)
+theme_run_app_ex(const char *cmd, int rainbow)
 {
     if (!cmd || !cmd[0])
         return;
     char with_accent[768];
-    snprintf(with_accent, sizeof(with_accent), "%s '#%06X'",
-             cmd, g_theme.accent & 0xFFFFFF);
+    int n = snprintf(with_accent, sizeof(with_accent), "%s '#%06X'",
+                     cmd, g_theme.accent & 0xFFFFFF);
+    if (n < 0 || (size_t)n >= sizeof(with_accent))
+        return;
+    if (rainbow && (size_t)n + sizeof(" rainbow") <= sizeof(with_accent))
+        memcpy(with_accent + n, " rainbow", sizeof(" rainbow"));
     run_cmd(with_accent, 0);
 }
 
-/* Send the live accent to a running companion window. The apps listen on a
- * per-app Unix socket in XDG_RUNTIME_DIR; a missing socket simply means that
- * window is not running. */
 static void
-theme_send_accent(const char *app)
+theme_run_app(const char *cmd)
+{
+    theme_run_app_ex(cmd, 0);
+}
+
+/* Send one line to a companion app's Unix socket in XDG_RUNTIME_DIR; a missing
+ * socket simply means that app is not running. */
+static void
+theme_send_line(const char *app, const char *msg)
 {
     char path[256];
     const char *rt = getenv("XDG_RUNTIME_DIR");
@@ -4239,24 +4255,34 @@ theme_send_accent(const char *app)
     if (fd < 0)
         return;
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-        char cmd[64];
-        int n = snprintf(cmd, sizeof(cmd), "accent #%06X\n",
-                         g_theme.accent & 0xFFFFFF);
-        if (n > 0)
-            (void)send(fd, cmd, (size_t)n, MSG_NOSIGNAL);
+        size_t len = strlen(msg);
+        if (len)
+            (void)send(fd, msg, len, MSG_NOSIGNAL);
     }
     close(fd);
 }
 
+/* Send the live accent to a running companion window. */
 static void
-theme_update_open_apps(void)
+theme_send_accent(const char *app)
+{
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "accent #%06X\n", g_theme.accent & 0xFFFFFF);
+    theme_send_line(app, cmd);
+}
+
+static void
+theme_send_wallpaper_accent(int include_settings)
 {
     theme_send_accent("jtnetworks");
     theme_send_accent("jtpolkit");
     theme_send_accent("jtspeedtest");
     theme_send_accent("jtupdate");
     theme_send_accent("jtwpi");
-    theme_send_accent("jtsettings");
+    /* jtsettings normally triggers the toggle; feeding the accent back to it
+     * here would make it call jtlabctl again. */
+    if (include_settings)
+        theme_send_accent("jtsettings");
     theme_send_accent("jtfiles");
     /* The compositor uses the same line protocol for the SSD close button and
      * the snap overlay, so a missing socket just means jtlabwc is not up yet. */
@@ -4267,6 +4293,138 @@ theme_update_open_apps(void)
     snprintf(jtgreeterctl, sizeof(jtgreeterctl),
              "/usr/local/bin/jtgreeterctl '#%06X'", g_theme.accent & 0xFFFFFF);
     run_cmd(jtgreeterctl, 0);
+}
+
+static void
+theme_update_open_apps(void)
+{
+    theme_send_wallpaper_accent(1);
+}
+
+/* Mirror a rainbow toggle to every companion that receives accents from the
+ * bar. jtsettings is deliberately excluded: it is the usual source of the
+ * toggle and would echo it straight back to jtlabctl. */
+static void
+theme_broadcast_rainbow(int on)
+{
+    const char *msg = on ? "rainbow on\n" : "rainbow off\n";
+    theme_send_line("jtnetworks", msg);
+    theme_send_line("jtpolkit", msg);
+    theme_send_line("jtspeedtest", msg);
+    theme_send_line("jtupdate", msg);
+    theme_send_line("jtwpi", msg);
+    theme_send_line("jtfiles", msg);
+    theme_send_line("jtlabwc", msg);
+    /* jtgreeter reads /etc/jt/rainbow.conf, which jtsettings owns. */
+}
+
+/* ------------------------------------------------------------------ */
+/*  Rainbow accent mode (jtlabctl rainbow)                            */
+/* ------------------------------------------------------------------ */
+
+static int64_t rainbow_start_us;
+static unsigned theme_pick_wallpaper_accent(void);
+
+static unsigned
+rainbow_color(double t)
+{
+    double phase = fmod(t, 8.0);
+    if (phase < 0.0)
+        phase += 8.0;
+    double h = phase * 0.75;
+    int i = (int)h;
+    double f = h - i, q = 1.0 - f;
+    double r = 0.0, g = 0.0, b = 0.0;
+    switch (i) {
+    case 0: r = 1.0; g = f;   b = 0.0; break;
+    case 1: r = q;   g = 1.0; b = 0.0; break;
+    case 2: r = 0.0; g = 1.0; b = f;   break;
+    case 3: r = 0.0; g = q;   b = 1.0; break;
+    case 4: r = f;   g = 0.0; b = 1.0; break;
+    default:r = 1.0; g = 0.0; b = q;   break;
+    }
+    return ((unsigned)lround(r * 255.0) << 16) |
+           ((unsigned)lround(g * 255.0) << 8) |
+           (unsigned)lround(b * 255.0);
+}
+
+static gboolean
+rainbow_tick(gpointer data)
+{
+    (void)data;
+    double t = (double)(g_get_monotonic_time() - rainbow_start_us) / 1000000.0;
+    unsigned rgb = rainbow_color(t);
+    /* Avoid dirtying the bar, flyout, menu and OSK when the quantized hue did
+     * not actually change. */
+    if (g_theme.accent == rgb)
+        return G_SOURCE_CONTINUE;
+    theme_set_accent(rgb);
+    render_request();
+    return G_SOURCE_CONTINUE;
+}
+
+static void
+rainbow_set(int on)
+{
+    int was_on = rainbow_timer_id != 0;
+    if (!on) {
+        if (!was_on)
+            return;
+        if (rainbow_timer_id && g_sni.glib_ctx) {
+            GSource *s = g_main_context_find_source_by_id(g_sni.glib_ctx,
+                                                           rainbow_timer_id);
+            if (s)
+                g_source_destroy(s);
+        }
+        rainbow_timer_id = 0;
+        /* Wallpaper changes are ignored while rainbow owns the accent, so run
+         * the wallpaper picker again here. The control handler pushes the
+         * freshly picked colour to the same client list used for wallpaper
+         * changes (excluding jtsettings) after broadcasting rainbow off. */
+        theme_set_accent(theme_pick_wallpaper_accent());
+        render_request();
+        return;
+    }
+    /* A repeated "on" must not restart the hue wheel. */
+    if (was_on)
+        return;
+    rainbow_start_us = g_get_monotonic_time();
+    if (g_sni.glib_ctx) {
+        GSource *src = g_timeout_source_new(100);
+        g_source_set_callback(src, rainbow_tick, NULL, NULL);
+        rainbow_timer_id = g_source_attach(src, g_sni.glib_ctx);
+        g_source_unref(src);
+    }
+    rainbow_tick(NULL);
+}
+
+/* jtsettings writes this at boot/shared runtime so all JTLab companions start
+ * in the same rainbow state. Call after the wallpaper accent has been loaded;
+ * rainbow off re-runs the wallpaper picker from the same state. */
+static void
+rainbow_load_system(void)
+{
+    FILE *f = fopen("/etc/jt/rainbow.conf", "r");
+    if (!f)
+        return;
+    char line[128];
+    int on = 0;
+    if (fgets(line, sizeof line, f)) {
+        char *nl = strpbrk(line, "\r\n");
+        if (nl)
+            *nl = '\0';
+        static const char prefix[] = "rainbow=";
+        if (!strncmp(line, prefix, sizeof(prefix) - 1))
+            on = !strcmp(line + sizeof(prefix) - 1, "on");
+    }
+    fclose(f);
+    if (on) {
+        rainbow_set(1);
+        /* Clients may already be running from before the bar restarted, so
+         * push the persisted rainbow state out at startup too. Newly launched
+         * clients also receive it via their command line. */
+        theme_broadcast_rainbow(1);
+    }
 }
 
 /* The scrollable app list region for a given menu body height. Single source of
@@ -8965,8 +9123,8 @@ theme_accent_from_surface(cairo_surface_t *wall, unsigned *out)
     return 1;
 }
 
-static void
-theme_update_from_wallpaper(void)
+static unsigned
+theme_pick_wallpaper_accent(void)
 {
     unsigned accent = ACCENT_HEX;
     if (g_wlp.enabled && g_wlp.cur_wallpaper[0]) {
@@ -8996,7 +9154,20 @@ theme_update_from_wallpaper(void)
         g_wlp.wall_image = NULL;
         heap_return_pages();
     }
+    return accent;
+}
 
+static void
+theme_update_from_wallpaper(void)
+{
+    unsigned accent = theme_pick_wallpaper_accent();
+
+    /* Rainbow mode owns the accent; a wallpaper change must not replace its
+     * colour or broadcast a new accent to the companion apps. */
+    if (rainbow_timer_id) {
+        render_request();
+        return;
+    }
     theme_set_accent(accent);
     theme_update_open_apps();
     render_request();
@@ -11630,13 +11801,14 @@ focus_app_window(const char *app_id)
     return 0;
 }
 
-/* Focus an existing app window, otherwise launch it with the live accent.
- * Debounces launches to avoid double-spawns on rapid clicks. */
+/* Focus an existing app window, otherwise launch it with the live accent and
+ * rainbow flag when rainbow mode is active. Debounces launches to avoid
+ * double-spawns on rapid clicks. */
 static void
 launch_or_focus_app(const char *app_id, const char *cmd, int64_t *launched_at_ms)
 {
     if (!focus_app_window(app_id) && now_ms() - *launched_at_ms > 1500) {
-        theme_run_app(cmd);
+        theme_run_app_ex(cmd, rainbow_timer_id != 0);
         *launched_at_ms = now_ms();
     }
 }
@@ -18253,6 +18425,11 @@ ctl_read_buf_done(GObject *src, GAsyncResult *res, gpointer data)
     gssize n = g_input_stream_read_finish(G_INPUT_STREAM(src), res, &err);
     if (n > 0 && !g_ctl_stopping) {
         ctx->buf[n] = '\0';
+        /* ctl clients terminate commands with a newline. Strip it before
+         * comparing whole arguments such as "rainbow on/off". */
+        char *nl = strpbrk(ctx->buf, "\r\n");
+        if (nl)
+            *nl = '\0';
         if (g_str_has_prefix(ctx->buf, "menu"))
             menu_toggle_ctl();
         else if (g_str_has_prefix(ctx->buf, "screenshot"))
@@ -18265,6 +18442,30 @@ ctl_read_buf_done(GObject *src, GAsyncResult *res, gpointer data)
             gpopup_select_prev();
         else if (g_str_has_prefix(ctx->buf, "focus"))
             gpopup_activate_selected();
+        else if (g_str_has_prefix(ctx->buf, "rainbow")) {
+            const char *arg = ctx->buf + 7;
+            while (*arg == ' ' || *arg == '\t' || *arg == '\r' || *arg == '\n')
+                arg++;
+            int on = !rainbow_timer_id;
+            if (*arg) {
+                if (!strcmp(arg, "off"))
+                    on = 0;
+                else if (!strcmp(arg, "toggle"))
+                    on = !rainbow_timer_id;
+                else if (strcmp(arg, "on"))
+                    on = -1;
+            }
+            if (on >= 0) {
+                rainbow_set(on);
+                theme_broadcast_rainbow(on);
+                /* On off, rainbow_set() has re-picked the current wallpaper
+                 * accent. Push that concrete colour out through the wallpaper
+                 * client list (jtsettings excluded) so every client ends on
+                 * the exact same accent instead of just stopping its cycle. */
+                if (!on)
+                    theme_send_wallpaper_accent(0);
+            }
+        }
         else if (g_str_has_prefix(ctx->buf, "quit"))
             g_app.running = 0;
     }
@@ -18382,6 +18583,7 @@ main(int argc, char *argv[])
 
     bar_init();
     wlp_load_wallpaper();
+    rainbow_load_system();
     blue_load();
     poll_init();
     ctl_init();

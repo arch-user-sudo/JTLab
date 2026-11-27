@@ -6,6 +6,7 @@
  *   next        select next window in preview
  *   previous    select previous window in preview
  *   focus       focus selected preview window
+ *   rainbow     cycle accent colours (on|off|toggle)
  *   quit        exit the bar
  */
 #include <stdio.h>
@@ -27,7 +28,7 @@ int
 main(int argc, char *argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <command> (menu|screenshot|next|previous|focus|quit)\n", argv[0]);
+        fprintf(stderr, "usage: %s <command> (menu|screenshot|next|previous|focus|rainbow|quit)\n", argv[0]);
         return 1;
     }
 
@@ -46,8 +47,9 @@ main(int argc, char *argv[])
         return 1;
     }
 
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%s\n", argv[1]);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s%s%s\n", argv[1],
+             argc > 2 ? " " : "", argc > 2 ? argv[2] : "");
     ssize_t n = write(fd, buf, strlen(buf));
     close(fd);
     return n < 0 ? 1 : 0;
