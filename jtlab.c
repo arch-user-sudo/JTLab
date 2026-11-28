@@ -4284,6 +4284,7 @@ theme_send_wallpaper_accent(int include_settings)
     theme_send_accent("jtspeedtest");
     theme_send_accent("jtupdate");
     theme_send_accent("jtwpi");
+    theme_send_accent("jtimv");
     /* jtsettings normally triggers the toggle; feeding the accent back to it
      * here would make it call jtlabctl again. */
     if (include_settings)
@@ -4318,6 +4319,7 @@ theme_broadcast_rainbow(int on)
     theme_send_line("jtspeedtest", msg);
     theme_send_line("jtupdate", msg);
     theme_send_line("jtwpi", msg);
+    theme_send_line("jtimv", msg);
     theme_send_line("jtfiles", msg);
     theme_send_line("jtlabwc", msg);
     /* jtgreeter reads /etc/jt/rainbow.conf, which jtsettings owns. */
