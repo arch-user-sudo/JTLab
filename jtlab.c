@@ -10146,44 +10146,51 @@ draw_power_icon(int action, cairo_t *cr, double cx, double cy)
     cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
     double r = 5.0;
     switch (action) {
-    case 0:
-        cairo_arc(cr, cx, cy, r, 2 * M_PI / 3, M_PI / 3);
-        cairo_stroke(cr);
-        cairo_move_to(cr, cx, cy - r);
-        cairo_line_to(cr, cx, cy - r - 3.2);
-        cairo_stroke(cr);
-        break;
-    case 1:
-        cairo_arc(cr, cx, cy, r, 2 * M_PI / 3, 3 * M_PI / 2);
-        cairo_stroke(cr);
-        cairo_arc(cr, cx, cy, r, 3 * M_PI / 2, M_PI / 3);
-        cairo_stroke(cr);
-        {
-            double ax = cx;
-            double ay = cy - r;
-            cairo_move_to(cr, ax, ay);
-            cairo_line_to(cr, ax + 4.5, ay - 2.2);
-            cairo_move_to(cr, ax, ay);
-            cairo_line_to(cr, ax + 4.5, ay + 2.2);
-            cairo_stroke(cr);
-        }
-        break;
-    case 2:
-        cairo_rectangle(cr, cx - r - 1, cy - r, r + 1.5, 2 * r);
-        cairo_stroke(cr);
-        cairo_move_to(cr, cx - 1, cy);
-        cairo_line_to(cr, cx + r + 2, cy);
-        cairo_move_to(cr, cx + r - 1, cy - 2.5);
-        cairo_line_to(cr, cx + r + 2, cy);
-        cairo_line_to(cr, cx + r - 1, cy + 2.5);
-        cairo_stroke(cr);
-        break;
-    case 3:
+    case 0: /* suspend */
         cairo_new_path(cr);
         cairo_arc(cr, cx, cy, r, 0.5 * M_PI, 1.5 * M_PI);
         cairo_arc_negative(cr, cx + r * 0.8, cy, r * 0.9, 1.5 * M_PI, 0.5 * M_PI);
         cairo_close_path(cr);
         cairo_fill(cr);
+        break;
+    case 1: /* log out */
+        /* Nudged 2px right so the door and arrow sit centred in the box. */
+        cairo_rectangle(cr, cx - r + 1, cy - r, r + 1.5, 2 * r);
+        cairo_stroke(cr);
+        cairo_move_to(cr, cx + 1, cy);
+        cairo_line_to(cr, cx + r + 2, cy);
+        cairo_move_to(cr, cx + r + 1, cy - 2.5);
+        cairo_line_to(cr, cx + r + 2, cy);
+        cairo_line_to(cr, cx + r + 1, cy + 2.5);
+        cairo_stroke(cr);
+        break;
+    case 2: /* reboot */
+        /* Wider gap at the top than the power icon so the arrowhead has room
+         * to sit clear of the ring. */
+        cairo_arc(cr, cx, cy, r, 7 * M_PI / 4, 5 * M_PI / 4);
+        cairo_stroke(cr);
+        /* Chevron in the gap, pointing right — clockwise at the top of the
+         * ring. Keep the arms far enough apart that they read as two strokes
+         * at menu-pixel scale, but inside the gap so they never touch the
+         * ring. */
+        cairo_new_path(cr);
+        cairo_set_line_width(cr, 1.3);
+        cairo_move_to(cr, cx - 1.2, cy - r - 3.5);
+        cairo_line_to(cr, cx + 1.5, cy - r - 1.0);
+        cairo_move_to(cr, cx - 1.2, cy - r + 1.5);
+        cairo_line_to(cr, cx + 1.5, cy - r - 1.0);
+        cairo_stroke(cr);
+        break;
+    case 3: /* power off */
+        /* cairo_arc walks in increasing angles, so start on the upper-right
+         * and end on the upper-left to leave the opening straight up. */
+        cairo_arc(cr, cx, cy, r, 5 * M_PI / 3, 4 * M_PI / 3);
+        cairo_stroke(cr);
+        /* Stem crosses the opening and ends just inside the ring. */
+        cairo_new_path(cr);
+        cairo_move_to(cr, cx, cy - r - 2.2);
+        cairo_line_to(cr, cx, cy - r + 1.5);
+        cairo_stroke(cr);
         break;
     default:
         break;
@@ -11490,7 +11497,7 @@ menu_draw(cairo_t *cr, PangoLayout *pl, double mh)
         panel_begin(cr, mx, my, mw, mh_body, r, MENU_SHADOW_W, MENU_SHADOW_A, 1);
 
     static const char *power_labels[POWER_ACTION_COUNT + 2] = {
-        "Power off", "Reboot", "Log out", "Suspend", "Settings", "Lock",
+        "Suspend", "Log out", "Reboot", "Power off", "Settings", "Lock",
     };
     double apad = menu_vert_pad() * 2;
     double row_base = menu_power_row_base(mh_body);
@@ -16408,16 +16415,16 @@ pointer_handle_button(void *data, struct wl_pointer *pointer,
                  * OpenRC + elogind: no systemctl, but loginctl exposes the
                  * same login1 verbs (and already handles logout for both). */
                 static const char *power_cmds_systemd[POWER_ACTION_COUNT] = {
-                    "systemctl poweroff",
-                    "systemctl reboot",
-                    "loginctl terminate-user $USER",
                     "systemctl suspend",
+                    "loginctl terminate-user $USER",
+                    "systemctl reboot",
+                    "systemctl poweroff",
                 };
                 static const char *power_cmds_elogind[POWER_ACTION_COUNT] = {
-                    "loginctl poweroff",
-                    "loginctl reboot",
-                    "loginctl terminate-user $USER",
                     "loginctl suspend",
+                    "loginctl terminate-user $USER",
+                    "loginctl reboot",
+                    "loginctl poweroff",
                 };
                 const char *const *power_cmds = power_systemd_init()
                     ? power_cmds_systemd : power_cmds_elogind;
