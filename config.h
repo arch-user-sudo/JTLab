@@ -324,7 +324,7 @@
 
 /* Notification popup (bell click). Solid fixed height; the list scrolls
  * internally with a thin scrollbar when it overflows. */
-#define NOTIF_POPUP_WIDTH   360
+#define NOTIF_POPUP_WIDTH   500
 #define NOTIF_VISIBLE_ROWS  5
 #define NOTIF_LIST_BOTTOM_PAD (MENU_PADDING - NOTIF_BOX_GAP / 2)
 #define NOTIF_HEADER_H      40
